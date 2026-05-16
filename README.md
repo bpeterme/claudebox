@@ -109,7 +109,7 @@ Create `~/.cbox.env` to override defaults. See [`cbox.env.example`](cbox.env.exa
 | `CBOX_DATA_DIR` | `~/.cbox` | Per-project container config files (`.claude-<name>.json`), one per project |
 | `CBOX_CLAUDE_DIR` | `~/.claude` | Claude Code config, mounted as `~/.claude` in container |
 | `CBOX_HOST_CONFIG_DIR` | `~/.config` | Host config dir, mounted as `~/.config` in container (normal mode) |
-| `CBOX_SHARE_DIR` | `~/.cbox/share` | Share folder, mounted as `~/share` in container; cleared on exit |
+| `CBOX_SHARE_DIR` | `/tmp/cbox-<user>` | Share folder, mounted as `~/share` in container; cleared on exit |
 | `CBOX_SSH_DIR` | *(unset)* | SSH dir to mount as `~/.ssh` in container (normal mode); unset = no SSH mount |
 | `CBOX_ZSHRC` | *(unset)* | Path to a `.zshrc` to source as `~/.zshrc.global` inside the container |
 | `CBOX_DOTFILES_DIR` | *(unset)* | Directory to mount read-only inside the container at the same path |
@@ -123,7 +123,6 @@ CBOX_SSH_DIR="$HOME/.ssh/my-ssh-dir"
 CBOX_ZSHRC="$HOME/.config/dotfiles/zshrc.global"
 CBOX_DOTFILES_DIR="$HOME/.config/dotfiles"
 CBOX_CLAUDE_DIR="$HOME/.claude"
-CBOX_SHARE_DIR="$HOME/.cbox/share"
 ```
 
 ## Container Image

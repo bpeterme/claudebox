@@ -4,7 +4,7 @@ A shell utility that runs [Claude Code](https://github.com/anthropics/claude-cod
 
 Each project gets its own container, named after the directory. Two modes are available: **normal** (full access to your Claude config and SSH keys) and **safe** (sandboxed with dropped capabilities, memory/CPU limits, and an isolated network).
 
-**Machine independent by design.** Conversation history and project memory live in `~/.claude/projects/` with path names scoped to the container — not the host machine. Point any machine at the same git remote and your full history follows you. Authentication is automatic: credentials are mounted from the host, so no re-authentication is needed inside the container.
+**Machine independent by design.** Conversation history and project memory live in `CBOX_CLAUDE_DIR/projects/` with path names scoped to the container — not the host machine. Point any machine at the same git remote and your full history follows you. Authentication is automatic: credentials are mounted from the host, so no re-authentication is needed inside the container.
 
 ## Prerequisites
 
@@ -59,9 +59,9 @@ cbox shell     # open a zsh shell instead of Claude Code
 
 ## Cross-Machine Sync
 
-claudebox stores conversation history and project memory in `~/.claude/projects/`. The folder names are derived from the container workspace path (e.g. `-Workspace-myproject`), which is the same on every machine — making the directory portable without any path translation.
+claudebox stores conversation history and project memory in `CBOX_CLAUDE_DIR/projects/`. The folder names are derived from the container workspace path (e.g. `-Workspace-myproject`), which is the same on every machine — making the directory portable without any path translation.
 
-To sync across machines, point `~/.claude/projects/` at a git remote. claudebox will pull before each session and push after it exits.
+To sync across machines, point `CBOX_CLAUDE_DIR/projects/` at a git remote. claudebox will pull before each session and push after it exits.
 
 ### Setup
 

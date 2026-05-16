@@ -118,13 +118,19 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_BUILD_DIR` | cbox.sh directory | Build context for `cbox rebuild` |
 | `BUILD_PLAYWRIGHT` | `0` | Set to `1` to include Playwright + Chromium in the image |
 
-### Example `~/.config/claudebox/cbox.env`
+### `~/.config/claudebox/cbox.env` template
 
 ```bash
-CBOX_SSH_DIR="$HOME/.ssh/my-ssh-dir"
-CBOX_ZSHRC="$HOME/.config/dotfiles/zshrc.global"
-CBOX_DOTFILES_DIR="$HOME/.config/dotfiles"
-CBOX_CLAUDE_DIR="$HOME/.claude"
+# CBOX_IMAGE="claudebox"
+# CBOX_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/cbox"
+# CBOX_CLAUDE_DIR="$HOME/.claude"
+# CBOX_HOST_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
+# CBOX_SHARE_DIR="/tmp/cbox-$USER"
+# CBOX_SSH_DIR="$HOME/.ssh"              # unset = no SSH mount
+# CBOX_ZSHRC="$HOME/.config/dotfiles/zshrc.global"   # unset = none
+# CBOX_DOTFILES_DIR="$HOME/.config/dotfiles"          # unset = none
+# CBOX_BUILD_DIR="$HOME/claudebox"
+# BUILD_PLAYWRIGHT=0
 ```
 
 ## Container Image

@@ -4,7 +4,7 @@
 
 `screenshot.sh` captures an interactive screenshot (drag to select a region, or click a window — same as ⇧⌘4) and saves it directly into the cbox share folder. The running container sees it immediately at `~/share/`.
 
-The script reads `~/.cbox.env` automatically, so it picks up your `CBOX_SHARE_DIR` without any extra configuration.
+The script reads `~/.config/claudebox/cbox.env` automatically, so it picks up your `CBOX_SHARE_DIR` without any extra configuration.
 
 ### Assigning a keyboard shortcut
 

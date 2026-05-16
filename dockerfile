@@ -58,7 +58,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh -s -- --no-modify-path
 ENV PATH="/home/claude/.local/bin:$PATH"
 
 # playwright — installs Python package and its own Chromium binary
-# Enable with: cbox rebuild (after setting BUILD_PLAYWRIGHT=1 in ~/.cbox.env)
+# Enable with: cbox rebuild (after setting BUILD_PLAYWRIGHT=1 in ~/.config/claudebox/cbox.env)
 ARG BUILD_PLAYWRIGHT=0
 RUN if [ "$BUILD_PLAYWRIGHT" = "1" ]; then \
       uv tool install playwright && \

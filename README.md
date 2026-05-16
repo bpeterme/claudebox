@@ -101,7 +101,9 @@ That's it. From this point on, sync is automatic — no extra steps on your othe
 
 ## Configuration
 
-Create `~/.cbox.env` to override defaults. See [`cbox.env.example`](cbox.env.example) for all options.
+Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.example`](cbox.env.example) for all options. If `$XDG_CONFIG_HOME` is set, the file goes in `$XDG_CONFIG_HOME/claudebox/cbox.env` instead.
+
+> **Migrating from `~/.cbox.env`?** Run: `mkdir -p ~/.config/claudebox && mv ~/.cbox.env ~/.config/claudebox/cbox.env`
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -116,7 +118,7 @@ Create `~/.cbox.env` to override defaults. See [`cbox.env.example`](cbox.env.exa
 | `CBOX_BUILD_DIR` | cbox.sh directory | Build context for `cbox rebuild` |
 | `BUILD_PLAYWRIGHT` | `0` | Set to `1` to include Playwright + Chromium in the image |
 
-### Example `~/.cbox.env`
+### Example `~/.config/claudebox/cbox.env`
 
 ```bash
 CBOX_SSH_DIR="$HOME/.ssh/my-ssh-dir"
@@ -140,7 +142,7 @@ The container user is `claude` (UID matches your host UID to avoid permission is
 
 ## macOS: Screenshot Script
 
-[`macos/screenshot.sh`](macos/screenshot.sh) captures an interactive screenshot (drag to select a region, same as ⇧⌘4) and saves it directly to the container's `~/share/` folder. It reads `~/.cbox.env` automatically so no path configuration is needed. See [`macos/README.md`](macos/README.md) for how to assign a keyboard shortcut via Automator, Hammerspoon, or Raycast.
+[`macos/screenshot.sh`](macos/screenshot.sh) captures an interactive screenshot (drag to select a region, same as ⇧⌘4) and saves it directly to the container's `~/share/` folder. It reads `~/.config/claudebox/cbox.env` automatically so no path configuration is needed. See [`macos/README.md`](macos/README.md) for how to assign a keyboard shortcut via Automator, Hammerspoon, or Raycast.
 
 ## How It Works
 

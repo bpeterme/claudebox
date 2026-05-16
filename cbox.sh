@@ -5,7 +5,7 @@
 # Source this file in .bashrc or .zshrc:
 #   source /path/to/claudebox/cbox.sh
 #
-# Configure by creating ~/.cbox.env (see cbox.env.example)
+# Configure by creating ~/.config/claudebox/cbox.env (see cbox.env.example)
 
 # =========================================================
 # cbox - Claude Container Runtime
@@ -55,8 +55,10 @@ CBOX_IMAGE="${CBOX_IMAGE:-claudebox}"
 CBOX_LABEL="${CBOX_LABEL:-cbox.project=true}"
 CBOX_KEEPALIVE_SECONDS="${CBOX_KEEPALIVE_SECONDS:-600}"
 
-# Source user config if present (~/.cbox.env)
-[[ -f "$HOME/.cbox.env" ]] && . "$HOME/.cbox.env"
+# Source user config if present (~/.config/claudebox/cbox.env)
+_CBOX_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
+[[ -f "$_CBOX_CONFIG" ]] && . "$_CBOX_CONFIG"
+unset _CBOX_CONFIG
 
 CBOX_DATA_DIR="${CBOX_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/cbox}"
 CBOX_CLAUDE_DIR="${CBOX_CLAUDE_DIR:-$HOME/.claude}"

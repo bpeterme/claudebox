@@ -31,6 +31,10 @@ Container Management:
   cbox rebuild          Rebuild container image
   cbox gc               Remove stopped cbox containers
 
+Sync (cross-machine):
+  cbox sync-init <url>  Initialize project history sync with a git remote
+  cbox sync             Pull and push project history manually
+
 Maintenance:
   cbox update           Force Claude Code update
   cbox doctor           Run environment diagnostics
@@ -179,6 +183,111 @@ _cbox_create_network() {
 }
 
 # ---------------------------------------------------------
+# sync
+# ---------------------------------------------------------
+
+_cbox_sync_pull() {
+  local dir="$CBOX_CLAUDE_DIR/projects"
+  [[ -d "$dir/.git" ]] || return 0
+  command -v git >/dev/null || return 0
+
+  # Only pull if a tracking branch is configured
+  git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name @{u} >/dev/null 2>&1 || return 0
+
+  echo "Pulling project history..."
+  git -C "$dir" pull --rebase 2>&1 \
+    || echo "⚠  Sync pull failed — continuing with local state"
+}
+
+_cbox_sync_push() {
+  local dir="$CBOX_CLAUDE_DIR/projects"
+  [[ -d "$dir/.git" ]] || return 0
+  command -v git >/dev/null || return 0
+
+  # Only push if a remote is configured
+  git -C "$dir" remote get-url origin >/dev/null 2>&1 || return 0
+
+  git -C "$dir" add -A
+
+  # Nothing new to commit
+  git -C "$dir" diff --cached --quiet && return 0
+
+  git -C "$dir" commit -m "sync — $(hostname) — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  if git -C "$dir" push; then
+    return 0
+  fi
+
+  # Push was rejected — rebase on remote and retry once
+  echo "Push rejected, rebasing..."
+  if git -C "$dir" pull --rebase && git -C "$dir" push; then
+    echo "✔ Synced (after rebase)"
+  else
+    echo "⚠  Sync push failed — changes saved locally."
+    echo "   Retry manually: git -C \"$dir\" push"
+  fi
+}
+
+_cbox_sync_init() {
+  local remote="$1"
+  local dir="$CBOX_CLAUDE_DIR/projects"
+
+  if [[ -z "$remote" ]]; then
+    echo "Usage: cbox sync-init <remote-url>"
+    return 1
+  fi
+
+  if ! command -v git >/dev/null; then
+    echo "Error: git not found"
+    return 1
+  fi
+
+  mkdir -p "$dir"
+
+  if [[ ! -d "$dir/.git" ]]; then
+    git -C "$dir" init -b main 2>/dev/null \
+      || { git -C "$dir" init && git -C "$dir" branch -M main 2>/dev/null || true; }
+  fi
+
+  if git -C "$dir" remote get-url origin >/dev/null 2>&1; then
+    git -C "$dir" remote set-url origin "$remote"
+  else
+    git -C "$dir" remote add origin "$remote"
+  fi
+
+  # Check whether the remote already has a main branch (second-machine setup)
+  if git -C "$dir" fetch origin 2>/dev/null \
+      && git -C "$dir" ls-remote --exit-code origin main >/dev/null 2>&1; then
+
+    # Remote has history — commit any local state, then rebase on top of remote
+    git -C "$dir" add -A
+    if ! git -C "$dir" diff --cached --quiet 2>/dev/null; then
+      git -C "$dir" commit -m "local state before initial sync — $(hostname)"
+    fi
+    git -C "$dir" branch --set-upstream-to=origin/main main 2>/dev/null || true
+    git -C "$dir" rebase origin/main \
+      || echo "⚠  Rebase had conflicts — resolve manually in $dir"
+    echo "✔ Sync initialized — pulled existing history from remote."
+
+  else
+    # Remote is empty — push local state
+    git -C "$dir" add -A
+    if ! git -C "$dir" diff --cached --quiet 2>/dev/null \
+        || ! git -C "$dir" log -1 >/dev/null 2>&1; then
+      git -C "$dir" commit --allow-empty -m "initial sync — $(hostname)"
+    fi
+    if git -C "$dir" push -u origin main; then
+      echo "✔ Sync initialized — pushed local history to remote."
+    else
+      echo "⚠  Push failed. Check remote access and retry:"
+      echo "   git -C \"$dir\" push -u origin main"
+    fi
+  fi
+
+  echo "Project history will now sync automatically on cbox start and exit."
+}
+
+# ---------------------------------------------------------
 # container creation
 # ---------------------------------------------------------
 
@@ -289,11 +398,16 @@ _cbox_enter() {
 
   if [[ "$command" == "claude" ]]; then
     _cbox_maybe_update "$name"
+    _cbox_sync_pull
   fi
 
   echo "Entering container '$name'..."
 
   $_CBOX_CMD exec -it -w "/Workspace/$name" "$name" zsh -ic "$command"
+
+  if [[ "$command" == "claude" ]]; then
+    _cbox_sync_push
+  fi
 
   if [[ "$stop_on_exit" == "yes" ]]; then
     echo "Stopping container '$name'..."
@@ -353,6 +467,23 @@ _cbox_doctor() {
       || echo "✘ custom zshrc missing ($CBOX_ZSHRC)"
   else
     echo "ℹ no custom zshrc configured (CBOX_ZSHRC unset)"
+  fi
+
+  echo
+  echo "[sync]"
+
+  local projects_dir="$CBOX_CLAUDE_DIR/projects"
+  if [[ -d "$projects_dir/.git" ]]; then
+    local sync_remote
+    sync_remote=$(git -C "$projects_dir" remote get-url origin 2>/dev/null || echo "none")
+    echo "✔ sync enabled (remote: $sync_remote)"
+
+    local ahead behind
+    ahead=$(git -C "$projects_dir" rev-list --count @{u}..HEAD 2>/dev/null || echo "?")
+    behind=$(git -C "$projects_dir" rev-list --count HEAD..@{u} 2>/dev/null || echo "?")
+    echo "  ahead: $ahead  behind: $behind"
+  else
+    echo "ℹ sync not configured (run: cbox sync-init <remote-url>)"
   fi
 
   echo
@@ -422,6 +553,15 @@ cbox() {
         --build-arg HOST_UID="$(id -u)" \
         --build-arg BUILD_PLAYWRIGHT="${BUILD_PLAYWRIGHT:-0}" \
         -t "$CBOX_IMAGE" "$_CBOX_BUILD_DIR"
+      ;;
+
+    sync-init)
+      _cbox_sync_init "${2:-}"
+      ;;
+
+    sync)
+      _cbox_sync_pull
+      _cbox_sync_push
       ;;
 
     update)

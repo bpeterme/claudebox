@@ -4,6 +4,8 @@ A shell utility that runs [Claude Code](https://github.com/anthropics/claude-cod
 
 Each project gets its own container, named after the directory. Two modes are available: **normal** (full access to your Claude config and SSH keys) and **safe** (sandboxed with dropped capabilities, memory/CPU limits, and an isolated network).
 
+**Machine independent by design.** Conversation history and project memory live in `~/.claude/projects/` with path names scoped to the container — not the host machine. Point any machine at the same git remote and your full history follows you. Authentication is automatic: credentials are mounted from the host, so no re-authentication is needed inside the container.
+
 ## Prerequisites
 
 - Docker (Linux/macOS) or [Apple Container](https://github.com/apple/containerization) (macOS)
@@ -52,6 +54,31 @@ cbox shell     # open a zsh shell instead of Claude Code
 | `cbox doctor` | Run environment diagnostics |
 | `cbox list` | List all cbox containers |
 | `cbox gc` | Remove all stopped cbox containers |
+| `cbox sync-init <url>` | Initialize cross-machine sync with a git remote |
+| `cbox sync` | Pull and push project history manually |
+
+## Cross-Machine Sync
+
+claudebox stores conversation history and project memory in `~/.claude/projects/`. The folder names are derived from the container workspace path (e.g. `-Workspace-myproject`), which is the same on every machine — making the directory portable without any path translation.
+
+To sync across machines, point `~/.claude/projects/` at a git remote. claudebox will pull before each session and push after it exits.
+
+### Setup
+
+Create a **private** empty repository on GitHub (or any git host), then run:
+
+```bash
+cbox sync-init git@github.com:you/claude-history.git
+```
+
+That's it. From this point on, sync is automatic — no extra steps on your other machines beyond running the same command with the same remote URL.
+
+### How it handles conflicts
+
+- Each session commits with a timestamp and hostname, so history is always traceable.
+- Push rejections (two machines worked offline) trigger an automatic `git pull --rebase` and retry. Because conversation files are append-only, rebases almost never produce conflicts.
+- If a rebase does fail, the local commit is preserved and a clear message tells you exactly what to run to resolve it manually.
+- `cbox doctor` shows sync status (remote URL, commits ahead/behind) at a glance.
 
 ## Container Modes
 
@@ -117,6 +144,13 @@ The container user is `claude` (UID matches your host UID to avoid permission is
 - Claude Code is updated automatically once per day on first use
 - On exit, the container is stopped and the share folder is cleared
 - `cbox keepalive` leaves the container running for 10 minutes (useful for follow-up `exec` calls)
+- Authentication is automatic — credentials are mounted from the host, so no re-authentication is needed inside the container
+
+## Works With
+
+### [flux](https://github.com/bpeterme/flux)
+
+[flux](https://github.com/bpeterme/flux) handles automatic file routing between any Git remote and large file cloud object storage. If your projects involve large assets alongside code, claudebox and flux complement each other naturally — claudebox scopes Claude Code to your project, flux manages the file transport layer for assets that don't belong in a regular git repo.
 
 ## License
 

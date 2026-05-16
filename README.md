@@ -82,7 +82,7 @@ That's it. From this point on, sync is automatic — no extra steps on your othe
 
 ### What not to use
 
-**Avoid placing `CBOX_CLAUDE_DIR` and `CBOX_DATA_DIR` (default `~/.claude` and `~/.local/share/cbox`), or your project directories, on iCloud Drive, Dropbox Smart Sync, Google Drive Stream, or any on-demand cloud storage.** These services evict file contents to stubs when not recently accessed. A container mounting an evicted path will fail to read files that appear to exist on disk — a subtle failure that is hard to diagnose.
+**Avoid placing `CBOX_CLAUDE_DIR` (default `~/.claude`), or your project directories, on iCloud Drive, Dropbox Smart Sync, Google Drive Stream, or any on-demand cloud storage.** These services evict file contents to stubs when not recently accessed. A container mounting an evicted path will fail to read files that appear to exist on disk — a subtle failure that is hard to diagnose.
 
 **Avoid continuous sync tools (Syncthing, rsync daemons, etc.) for `CBOX_CLAUDE_DIR`.** They can write into the directory while Claude is actively appending to a conversation file, risking corruption or lost writes. The git approach is safe because it only touches the directory at explicit session boundaries.
 

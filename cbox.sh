@@ -60,7 +60,7 @@ CBOX_KEEPALIVE_SECONDS="${CBOX_KEEPALIVE_SECONDS:-600}"
 
 CBOX_DATA_DIR="${CBOX_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/cbox}"
 CBOX_CLAUDE_DIR="${CBOX_CLAUDE_DIR:-$HOME/.claude}"
-CBOX_HOST_CONFIG_DIR="${CBOX_HOST_CONFIG_DIR:-$HOME/.config}"
+CBOX_HOST_CONFIG_DIR="${CBOX_HOST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}}"
 CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-/tmp/cbox-$(id -un)}"
 # CBOX_SSH_DIR      — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC        — path to a .zshrc to source inside container; unset = none

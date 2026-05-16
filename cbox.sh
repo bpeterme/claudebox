@@ -51,7 +51,7 @@ EOF
 # config
 # ---------------------------------------------------------
 
-CBOX_IMAGE="${CBOX_IMAGE:-claude-dev}"
+CBOX_IMAGE="${CBOX_IMAGE:-claudebox}"
 CBOX_LABEL="${CBOX_LABEL:-cbox.project=true}"
 CBOX_KEEPALIVE_SECONDS="${CBOX_KEEPALIVE_SECONDS:-600}"
 

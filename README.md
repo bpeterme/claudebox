@@ -106,7 +106,7 @@ Create `~/.cbox.env` to override defaults. See [`cbox.env.example`](cbox.env.exa
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CBOX_IMAGE` | `claude-dev` | Docker image name |
-| `CBOX_DATA_DIR` | `~/.cbox` | State files directory |
+| `CBOX_DATA_DIR` | `~/.cbox` | Per-project container config files (`.claude-<name>.json`), one per project |
 | `CBOX_CLAUDE_DIR` | `~/.claude` | Claude Code config, mounted as `~/.claude` in container |
 | `CBOX_HOST_CONFIG_DIR` | `~/.config` | Host config dir, mounted as `~/.config` in container (normal mode) |
 | `CBOX_SHARE_DIR` | `~/.cbox/share` | Share folder, mounted as `~/share` in container; cleared on exit |

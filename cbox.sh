@@ -58,7 +58,7 @@ CBOX_KEEPALIVE_SECONDS="${CBOX_KEEPALIVE_SECONDS:-600}"
 # Source user config if present (~/.cbox.env)
 [[ -f "$HOME/.cbox.env" ]] && . "$HOME/.cbox.env"
 
-CBOX_DATA_DIR="${CBOX_DATA_DIR:-$HOME/.cbox}"
+CBOX_DATA_DIR="${CBOX_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/cbox}"
 CBOX_CLAUDE_DIR="${CBOX_CLAUDE_DIR:-$HOME/.claude}"
 CBOX_HOST_CONFIG_DIR="${CBOX_HOST_CONFIG_DIR:-$HOME/.config}"
 CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-/tmp/cbox-$(id -un)}"

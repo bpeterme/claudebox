@@ -109,12 +109,11 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 |----------|---------|-------------|
 | `CBOX_IMAGE` | `claudebox` | Docker image name |
 | `CBOX_DATA_DIR` | `~/.local/share/cbox` | Per-project container config files (`.claude-<name>.json`), one per project |
-| `CBOX_CLAUDE_DIR` | `~/.claude` | Claude Code config, mounted as `~/.claude` in container |
-| `CBOX_HOST_CONFIG_DIR` | `~/.config` | Host config dir, mounted as `~/.config` in container (normal mode) |
-| `CBOX_SHARE_DIR` | `/tmp/cbox-<user>` | Share folder, mounted as `~/share` in container; cleared on exit |
-| `CBOX_SSH_DIR` | *(unset)* | SSH dir to mount as `~/.ssh` in container (normal mode); unset = no SSH mount |
-| `CBOX_ZSHRC` | *(unset)* | Path to a `.zshrc` to source as `~/.zshrc.global` inside the container |
-| `CBOX_DOTFILES_DIR` | *(unset)* | Directory to mount read-only inside the container at the same path |
+| `CBOX_CLAUDE_DIR` | `~/.claude` | Claude Code config, mounted as `~/.claude` (read-write; read-only in safe mode) |
+| `CBOX_HOST_CONFIG_DIR` | `~/.config` | Host config dir, mounted as `~/.config` in container (normal mode, read-write) |
+| `CBOX_SHARE_DIR` | `/tmp/cbox-<user>` | Share folder, mounted as `~/share` in container; cleared on exit (read-write) |
+| `CBOX_SSH_DIR` | *(unset)* | SSH dir to mount as `~/.ssh` in container (normal mode, **read-only**); unset = no SSH mount |
+| `CBOX_ZSHRC` | *(unset)* | `.zshrc` to source as `~/.zshrc.global` inside the container (**read-only**); unset = none |
 | `CBOX_BUILD_DIR` | cbox.sh directory | Build context for `cbox rebuild` |
 | `BUILD_PLAYWRIGHT` | `0` | Set to `1` to include Playwright + Chromium in the image |
 
@@ -126,9 +125,8 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 # CBOX_CLAUDE_DIR="$HOME/.claude"
 # CBOX_HOST_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
 # CBOX_SHARE_DIR="/tmp/cbox-$USER"
-# CBOX_SSH_DIR="$HOME/.ssh"              # unset = no SSH mount
-# CBOX_ZSHRC="$HOME/.config/dotfiles/zshrc.global"   # unset = none
-# CBOX_DOTFILES_DIR="$HOME/.config/dotfiles"          # unset = none
+# CBOX_SSH_DIR="$HOME/.ssh"    # unset = no SSH mount
+# CBOX_ZSHRC="$HOME/.zshrc"   # unset = none
 # CBOX_BUILD_DIR="$HOME/claudebox"
 # BUILD_PLAYWRIGHT=0
 ```

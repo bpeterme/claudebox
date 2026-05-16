@@ -64,9 +64,8 @@ CBOX_DATA_DIR="${CBOX_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/cbox}"
 CBOX_CLAUDE_DIR="${CBOX_CLAUDE_DIR:-$HOME/.claude}"
 CBOX_HOST_CONFIG_DIR="${CBOX_HOST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}}"
 CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-/tmp/cbox-$(id -un)}"
-# CBOX_SSH_DIR      — path to SSH dir to mount; unset = no SSH mount
-# CBOX_ZSHRC        — path to a .zshrc to source inside container; unset = none
-# CBOX_DOTFILES_DIR — path to a dotfiles dir to mount read-only; unset = none
+# CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
+# CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
 if [[ "$(uname)" == "Darwin" ]]; then
@@ -322,9 +321,22 @@ _cbox_create() {
     args+=(-v "$CBOX_ZSHRC:/home/claude/.zshrc.global:ro")
   fi
 
-  if [[ -n "${CBOX_DOTFILES_DIR:-}" ]]; then
-    args+=(-v "$CBOX_DOTFILES_DIR:$CBOX_DOTFILES_DIR:ro")
-  fi
+  # Auto-mount targets of symlinks in CBOX_CLAUDE_DIR so they resolve inside the container
+  local _mounted=() _link _target _tdir _skip
+  while IFS= read -r _link; do
+    _target=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$_link" 2>/dev/null) || continue
+    [[ -e "$_target" ]] || continue
+    [[ "$_target" == "$CBOX_CLAUDE_DIR"* ]] && continue
+    _tdir=$(dirname "$_target")
+    _skip=false
+    for _d in "${_mounted[@]+"${_mounted[@]}"}"; do
+      [[ "$_tdir" == "$_d"* ]] && { _skip=true; break; }
+    done
+    "$_skip" && continue
+    _mounted+=("$_tdir")
+    args+=(-v "$_tdir:$_tdir:ro")
+  done < <(find "$CBOX_CLAUDE_DIR" -maxdepth 1 -type l 2>/dev/null)
+  unset _link _target _tdir _skip _mounted
 
   if [[ "$mode" == "normal" ]]; then
     if [[ -n "${CBOX_SSH_DIR:-}" ]]; then

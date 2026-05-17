@@ -1,0 +1,10 @@
+#!/bin/sh
+# Embed the current HEAD hash into cbox.sh as _CBOX_VERSION.
+# The resulting commit will contain the parent hash — one behind,
+# but stable and sufficient to identify what version is installed.
+
+hash=$(git rev-parse --short HEAD 2>/dev/null) || exit 0
+[ -z "$hash" ] && exit 0
+
+sed -i.bak "s/^_CBOX_VERSION=\"[^\"]*\"/_CBOX_VERSION=\"$hash\"/" cbox.sh && rm -f cbox.sh.bak
+git add cbox.sh

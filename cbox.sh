@@ -68,7 +68,7 @@ CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-/tmp/cbox-$(id -un)}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-_CBOX_VERSION="e5877c9"
+_CBOX_VERSION="80ad8d4"
 
 if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
   _CBOX_CMD="container"
@@ -183,18 +183,6 @@ _cbox_force_update() {
 
 _cbox_create_network() {
   $_CBOX_CMD network create cbox-bridge >/dev/null 2>&1 || true
-}
-
-# Resolves a path through symlink chain (up to 10 levels), returning the real path.
-_cbox_resolve_path() {
-  local path="$1"
-  local target count=0
-  while [[ -L "$path" ]] && (( count++ < 10 )); do
-    target=$(readlink "$path")
-    [[ "$target" == /* ]] || target="$(cd "$(dirname "$path")" && pwd -P)/$target"
-    path="$target"
-  done
-  echo "$path"
 }
 
 # ---------------------------------------------------------
@@ -345,7 +333,6 @@ _cbox_create() {
 
   local claude_json="$CBOX_DATA_DIR/.claude-$name.json"
 
-  # Ensure projects/ exists on the host so the bind mount source is valid
   mkdir -p "$CBOX_CLAUDE_DIR/projects"
 
   echo "Creating $mode container '$name'..."
@@ -366,16 +353,14 @@ _cbox_create() {
   )
 
   if [[ -n "${CBOX_ZSHRC:-}" ]]; then
-    local _zshrc
-    _zshrc=$(_cbox_resolve_path "$CBOX_ZSHRC")
-    [[ -f "$_zshrc" ]] && args+=(-v "$_zshrc:/home/claude/.zshrc.global:ro")
-    unset _zshrc
+    local _zshrc_real
+    _zshrc_real=$(_cbox_resolve_path "$CBOX_ZSHRC")
+    [[ -f "$_zshrc_real" ]] && args+=(-v "$_zshrc_real:/home/claude/.zshrc.global:ro")
+    unset _zshrc_real
   fi
 
   if [[ "$mode" == "normal" ]]; then
-    if [[ -n "${CBOX_SSH_DIR:-}" ]]; then
-      args+=(-v "$CBOX_SSH_DIR:/home/claude/.ssh:ro")
-    fi
+    [[ -n "${CBOX_SSH_DIR:-}" ]] && args+=(-v "$CBOX_SSH_DIR:/home/claude/.ssh:ro")
     args+=(
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude"
       -v "$CBOX_HOST_CONFIG_DIR:/home/claude/.config"
@@ -385,7 +370,6 @@ _cbox_create() {
 
   if [[ "$mode" == "safe" ]]; then
     _cbox_create_network
-
     args+=(
       --network cbox-bridge
       --cap-drop=ALL
@@ -393,22 +377,23 @@ _cbox_create() {
       --pids-limit 512
       --memory=4g
       --cpus=2
-
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude:ro"
     )
   fi
 
-  # For each symlink in CBOX_CLAUDE_DIR, mount the resolved real file/dir at the
-  # same container path, overriding the dangling symlink from the directory mount.
-  local _ro="" _link _target _bname
+  # For each symlink in CBOX_CLAUDE_DIR, resolve it to the real host path and
+  # mount that target at its own absolute path inside the container. The symlink
+  # in ~/.claude points to e.g. /Users/work/.config/dotfiles/claude/settings.json;
+  # mounting that path at the same path in the container lets the symlink resolve.
+  local _ro="" _link _target
   [[ "$mode" == "safe" ]] && _ro=":ro"
   while IFS= read -r _link; do
     _target=$(_cbox_resolve_path "$_link")
     [[ -e "$_target" ]] || continue
-    _bname=$(basename "$_link")
-    args+=(-v "$_target:/home/claude/.claude/$_bname$_ro")
+    [[ "$_target" == "$CBOX_CLAUDE_DIR"* ]] && continue
+    args+=(-v "$_target:$_target$_ro")
   done < <(find "$CBOX_CLAUDE_DIR" -maxdepth 1 -type l 2>/dev/null)
-  unset _ro _link _target _bname
+  unset _ro _link _target
 
   args+=(
     "$CBOX_IMAGE"

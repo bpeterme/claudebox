@@ -359,12 +359,12 @@ _cbox_create() {
   while IFS= read -r _link; do
     _raw=$(readlink "$_link" 2>/dev/null) || continue
     if [[ "$_raw" == /* ]]; then
+      # Absolute symlink — use directly, no normalization needed
       _target="$_raw"
     else
-      _target="$(dirname "$_link")/$_raw"
+      # Relative symlink — build absolute path and normalize .. via python3
+      _target=$(python3 -c "import os,sys; print(os.path.normpath(os.path.join(os.path.dirname(sys.argv[1]), sys.argv[2])))" "$_link" "$_raw" 2>/dev/null) || continue
     fi
-    # Normalize away any .. or . components without touching the filesystem
-    _target=$(python3 -c "import os,sys; print(os.path.normpath(sys.argv[1]))" "$_target" 2>/dev/null) || continue
     [[ "$_target" == "$CBOX_CLAUDE_DIR"* ]] && continue
     _tdir=$(dirname "$_target")
     _skip=false

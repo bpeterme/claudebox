@@ -65,5 +65,5 @@ RUN if [ "$BUILD_PLAYWRIGHT" = "1" ]; then \
       playwright install --with-deps chromium; \
     fi
 
-WORKDIR /workspace
+WORKDIR /Workspace
 CMD ["/bin/zsh"]

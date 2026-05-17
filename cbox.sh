@@ -29,7 +29,8 @@ Container Management:
   cbox stop             Stop current project container
   cbox reset            Remove current project container
   cbox rebuild          Rebuild container image
-  cbox gc               Remove stopped cbox containers
+  cbox list             List cbox containers
+  cbox prune            Remove stopped cbox containers
 
 Sync (cross-machine):
   cbox sync-init <url>  Initialize project history sync with a git remote
@@ -38,7 +39,6 @@ Sync (cross-machine):
 Maintenance:
   cbox update           Force Claude Code update
   cbox doctor           Run environment diagnostics
-  cbox list             List cbox containers
   cbox version          Show sourced commit hash
 
 Help:
@@ -213,6 +213,11 @@ _cbox_prepare_claude_dir() {
   # Create empty mount points for the subdirs we mount separately
   mkdir -p "$staging/projects"
   [[ -d "$CBOX_CLAUDE_DIR/plugins" ]] && mkdir -p "$staging/plugins"
+
+  # Resolve CBOX_ZSHRC symlink the same way as .claude config files
+  if [[ -n "${CBOX_ZSHRC:-}" ]]; then
+    cp -L "$CBOX_ZSHRC" "$staging/.zshrc.global" 2>/dev/null || true
+  fi
 }
 
 # ---------------------------------------------------------
@@ -382,8 +387,8 @@ _cbox_create() {
     -e ZDOTDIR=/home/claude
   )
 
-  if [[ -n "${CBOX_ZSHRC:-}" ]]; then
-    args+=(-v "$CBOX_ZSHRC:/home/claude/.zshrc.global:ro")
+  if [[ -n "${CBOX_ZSHRC:-}" ]] && [[ -f "$staging/.zshrc.global" ]]; then
+    args+=(-v "$staging/.zshrc.global:/home/claude/.zshrc.global:ro")
   fi
 
   if [[ "$mode" == "normal" ]]; then
@@ -650,7 +655,7 @@ cbox() {
       fi
       ;;
 
-    gc)
+    prune)
       echo "Removing stopped cbox containers..."
 
       local stopped

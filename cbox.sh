@@ -68,7 +68,7 @@ CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-/tmp/cbox-$(id -un)}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-_CBOX_VERSION="$(git -C "$_CBOX_BUILD_DIR" log -1 --format='%h' 2>/dev/null || echo 'unknown')"
+_CBOX_VERSION="$(command git -C "$_CBOX_BUILD_DIR" log -1 --format='%h' 2>/dev/null || /usr/bin/git -C "$_CBOX_BUILD_DIR" log -1 --format='%h' 2>/dev/null || echo 'unknown')"
 
 if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
   _CBOX_CMD="container"

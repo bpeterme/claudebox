@@ -378,11 +378,12 @@ _cbox_create() {
     )
   fi
 
-  # Resolve symlinks in CBOX_CLAUDE_DIR by mounting each target directly at its
-  # container path, added AFTER the .claude directory mount so these take precedence
-  # over the dangling symlinks. This avoids mounting macOS host paths (e.g.
-  # /Users/work/...) inside the container, which is not portable across runtimes.
-  local _link _target _raw _name
+  # For each symlink in CBOX_CLAUDE_DIR that points outside the directory, mount
+  # the target's parent directory at the same absolute path inside the container.
+  # The symlinks then resolve correctly because their target paths are accessible.
+  # This avoids file-level mounts and mount shadowing, both unsupported by
+  # Apple Container / VirtioFS. No-op when there are no symlinks (default case).
+  local _link _target _raw _parent _seen=""
   while IFS= read -r _link; do
     _raw=$(readlink "$_link" 2>/dev/null) || continue
     if [[ "$_raw" == /* ]]; then
@@ -391,10 +392,12 @@ _cbox_create() {
       _target=$(python3 -c "import os,sys; print(os.path.normpath(os.path.join(os.path.dirname(sys.argv[1]), sys.argv[2])))" "$_link" "$_raw" 2>/dev/null) || continue
     fi
     [[ "$_target" == "$CBOX_CLAUDE_DIR"* ]] && continue
-    _name=$(basename "$_link")
-    args+=(-v "$_target:/home/claude/.claude/$_name:ro")
+    _parent=$(dirname "$_target")
+    case ":$_seen:" in *":$_parent:"*) continue ;; esac
+    _seen="${_seen}:${_parent}"
+    args+=(-v "$_parent:$_parent:ro")
   done < <(find "$CBOX_CLAUDE_DIR" -maxdepth 1 -type l 2>/dev/null)
-  unset _link _target _raw _name
+  unset _link _target _raw _parent _seen
 
   args+=(
     "$CBOX_IMAGE"

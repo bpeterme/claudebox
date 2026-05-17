@@ -68,7 +68,7 @@ CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-/tmp/cbox-$(id -un)}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-_CBOX_VERSION="785e018"
+_CBOX_VERSION="e5877c9"
 
 if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
   _CBOX_CMD="container"
@@ -185,40 +185,16 @@ _cbox_create_network() {
   $_CBOX_CMD network create cbox-bridge >/dev/null 2>&1 || true
 }
 
-# Copies CBOX_CLAUDE_DIR to a temp staging directory, resolving any symlinks to
-# real file content. Config files managed via dotfile symlinks become readable
-# files inside the container without needing any special mount tricks.
-# projects/ and plugins/ are excluded — they are mounted directly from the real
-# CBOX_CLAUDE_DIR so that conversation history and plugin state persist.
-_cbox_prepare_claude_dir() {
-  local name="$1"
-  local staging="/tmp/cbox-claude-$name"
-
-  mkdir -p "$staging"
-  find "$staging" -maxdepth 1 -mindepth 1 -not -name 'projects' -not -name 'plugins' -exec rm -rf {} +
-
-  # Ensure projects/ exists on the host so the bind mount source is valid
-  mkdir -p "$CBOX_CLAUDE_DIR/projects"
-
-  local _f _n
-  while IFS= read -r _f; do
-    _n=$(basename "$_f")
-    [[ "$_n" == "projects" ]] && continue   # mounted directly from real dir
-    [[ "$_n" == "plugins"  ]] && continue   # mounted directly from real dir
-    [[ "$_n" == ".git"     ]] && continue   # not needed inside container
-    cp -rL "$_f" "$staging/$_n" 2>/dev/null || true
-  done < <(find "$CBOX_CLAUDE_DIR" -maxdepth 1 -mindepth 1 2>/dev/null)
-  unset _f _n
-
-  # Create empty mount points for the subdirs we mount separately
-  mkdir -p "$staging/projects"
-  [[ -d "$CBOX_CLAUDE_DIR/plugins" ]] && mkdir -p "$staging/plugins"
-
-  # Resolve CBOX_ZSHRC symlink into a separate temp file (NOT inside staging)
-  # to avoid VirtioFS conflicts from sharing a directory and a file inside it.
-  if [[ -n "${CBOX_ZSHRC:-}" ]]; then
-    cp -L "$CBOX_ZSHRC" "/tmp/cbox-zshrc-$name" 2>/dev/null || true
-  fi
+# Resolves a path through symlink chain (up to 10 levels), returning the real path.
+_cbox_resolve_path() {
+  local path="$1"
+  local target count=0
+  while [[ -L "$path" ]] && (( count++ < 10 )); do
+    target=$(readlink "$path")
+    [[ "$target" == /* ]] || target="$(cd "$(dirname "$path")" && pwd -P)/$target"
+    path="$target"
+  done
+  echo "$path"
 }
 
 # ---------------------------------------------------------
@@ -366,10 +342,11 @@ _cbox_create() {
   local mode="$2"
 
   _cbox_generate_claude_json "$name"
-  _cbox_prepare_claude_dir "$name"
 
   local claude_json="$CBOX_DATA_DIR/.claude-$name.json"
-  local staging="/tmp/cbox-claude-$name"
+
+  # Ensure projects/ exists on the host so the bind mount source is valid
+  mkdir -p "$CBOX_CLAUDE_DIR/projects"
 
   echo "Creating $mode container '$name'..."
 
@@ -388,8 +365,11 @@ _cbox_create() {
     -e ZDOTDIR=/home/claude
   )
 
-  if [[ -n "${CBOX_ZSHRC:-}" ]] && [[ -f "/tmp/cbox-zshrc-$name" ]]; then
-    args+=(-v "/tmp/cbox-zshrc-$name:/home/claude/.zshrc.global:ro")
+  if [[ -n "${CBOX_ZSHRC:-}" ]]; then
+    local _zshrc
+    _zshrc=$(_cbox_resolve_path "$CBOX_ZSHRC")
+    [[ -f "$_zshrc" ]] && args+=(-v "$_zshrc:/home/claude/.zshrc.global:ro")
+    unset _zshrc
   fi
 
   if [[ "$mode" == "normal" ]]; then
@@ -397,13 +377,10 @@ _cbox_create() {
       args+=(-v "$CBOX_SSH_DIR:/home/claude/.ssh:ro")
     fi
     args+=(
-      -v "$staging:/home/claude/.claude"
-      -v "$CBOX_CLAUDE_DIR/projects:/home/claude/.claude/projects"
+      -v "$CBOX_CLAUDE_DIR:/home/claude/.claude"
       -v "$CBOX_HOST_CONFIG_DIR:/home/claude/.config"
       -v "$CBOX_SHARE_DIR:/home/claude/share"
     )
-    [[ -d "$CBOX_CLAUDE_DIR/plugins" ]] && \
-      args+=(-v "$CBOX_CLAUDE_DIR/plugins:/home/claude/.claude/plugins")
   fi
 
   if [[ "$mode" == "safe" ]]; then
@@ -417,12 +394,21 @@ _cbox_create() {
       --memory=4g
       --cpus=2
 
-      -v "$staging:/home/claude/.claude:ro"
-      -v "$CBOX_CLAUDE_DIR/projects:/home/claude/.claude/projects:ro"
+      -v "$CBOX_CLAUDE_DIR:/home/claude/.claude:ro"
     )
-    [[ -d "$CBOX_CLAUDE_DIR/plugins" ]] && \
-      args+=(-v "$CBOX_CLAUDE_DIR/plugins:/home/claude/.claude/plugins:ro")
   fi
+
+  # For each symlink in CBOX_CLAUDE_DIR, mount the resolved real file/dir at the
+  # same container path, overriding the dangling symlink from the directory mount.
+  local _ro="" _link _target _bname
+  [[ "$mode" == "safe" ]] && _ro=":ro"
+  while IFS= read -r _link; do
+    _target=$(_cbox_resolve_path "$_link")
+    [[ -e "$_target" ]] || continue
+    _bname=$(basename "$_link")
+    args+=(-v "$_target:/home/claude/.claude/$_bname$_ro")
+  done < <(find "$CBOX_CLAUDE_DIR" -maxdepth 1 -type l 2>/dev/null)
+  unset _ro _link _target _bname
 
   args+=(
     "$CBOX_IMAGE"
@@ -456,7 +442,6 @@ _cbox_ensure() {
   fi
 
   if ! _cbox_running "$name"; then
-    _cbox_prepare_claude_dir "$name"
     echo "Starting container '$name'..."
     $_CBOX_CMD start "$name"
   fi
@@ -620,7 +605,6 @@ cbox() {
     reset)
       echo "Removing container '$name'..."
       $_CBOX_CMD rm -f "$name"
-      rm -rf "/tmp/cbox-claude-$name" "/tmp/cbox-zshrc-$name"
       ;;
 
     rebuild)
@@ -663,12 +647,7 @@ cbox() {
       stopped=$(_cbox_rt_list --filter "label=$CBOX_LABEL" \
         | awk '$2 != "running" {print $1}')
 
-      if [[ -n "$stopped" ]]; then
-        while IFS= read -r _gc_name; do
-          rm -rf "/tmp/cbox-claude-$_gc_name" "/tmp/cbox-zshrc-$_gc_name"
-        done <<< "$stopped"
-        echo "$stopped" | xargs "$_CBOX_CMD" rm -f
-      fi
+      [[ -n "$stopped" ]] && echo "$stopped" | xargs "$_CBOX_CMD" rm -f
       ;;
 
     "")

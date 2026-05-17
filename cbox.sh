@@ -68,7 +68,7 @@ CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-/tmp/cbox-$(id -un)}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-_CBOX_VERSION="80ad8d4"
+_CBOX_VERSION="cad0977"
 
 if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
   _CBOX_CMD="container"
@@ -183,6 +183,20 @@ _cbox_force_update() {
 
 _cbox_create_network() {
   $_CBOX_CMD network create cbox-bridge >/dev/null 2>&1 || true
+}
+
+# Resolves a path through symlink chain (up to 10 levels), returning the real path.
+# Uses /usr/bin/readlink and shell builtins only — no PATH dependency.
+_cbox_resolve_path() {
+  local path="$1" target count=0
+  while [[ -L "$path" ]] && (( count++ < 10 )); do
+    target=$(/usr/bin/readlink "$path" 2>/dev/null) || break
+    [[ "$target" == /* ]] || target="${path%/*}/$target"
+    path="$target"
+  done
+  local _dir="${path%/*}" _base="${path##*/}"
+  path="$(cd "$_dir" 2>/dev/null && pwd -P)/$_base"
+  echo "$path"
 }
 
 # ---------------------------------------------------------
@@ -391,6 +405,7 @@ _cbox_create() {
     _target=$(_cbox_resolve_path "$_link")
     [[ -e "$_target" ]] || continue
     [[ "$_target" == "$CBOX_CLAUDE_DIR"* ]] && continue
+    [[ "$_target" == "$PWD" || "$_target" == "$PWD/"* ]] && continue
     args+=(-v "$_target:$_target$_ro")
   done < <(find "$CBOX_CLAUDE_DIR" -maxdepth 1 -type l 2>/dev/null)
   unset _ro _link _target

@@ -59,16 +59,31 @@ cbox shell     # open a zsh shell instead of Claude Code
 
 ## Cross-Machine Sync
 
-claudebox stores conversation history and project memory in `CBOX_CLAUDE_DIR/projects/`. The folder names are derived from the container workspace path (e.g. `-Workspace-myproject`), which is the same on every machine — making the directory portable without any path translation.
+claudebox can sync your Claude config directory (`CBOX_CLAUDE_DIR`, default `~/.claude`) across machines using a private git remote. claudebox pulls before each session and pushes after it exits.
 
-To sync across machines, point `CBOX_CLAUDE_DIR/projects/` at a git remote. claudebox will pull before each session and push after it exits.
+### What gets synced
+
+Only an explicit allowlist is tracked — everything else in `~/.claude` is ignored. This keeps the sync lean and future-proof: new files that Claude Code might add will not be captured unless deliberately added to the list.
+
+| Synced | Description |
+|--------|-------------|
+| `settings.json` | Permissions, hooks, model preferences |
+| `CLAUDE.md` | Global instructions |
+| `keybindings.json` | Keyboard shortcuts |
+| `*.sh` | User scripts (e.g. `statusline-command.sh`) |
+| `projects/` | Conversation history and project memory |
+| `plugins/` | Plugin/marketplace configuration |
+
+**Never synced:** `.credentials.json`, `backups/`, `cache/`, `sessions/`, `session-env/`, `shell-snapshots/`, `mcp-needs-auth-cache.json`, and anything else not in the list above.
+
+The project folder names are derived from the container workspace path (e.g. `-Workspace-myproject`), which is identical on every machine — making conversation history portable without any path translation.
 
 ### Setup
 
 Create a **private** empty repository on GitHub (or any git host), then run:
 
 ```bash
-cbox sync-init git@github.com:you/claude-history.git
+cbox sync-init git@github.com:you/claude-sync.git
 ```
 
 That's it. From this point on, sync is automatic — no extra steps on your other machines beyond running the same command with the same remote URL.
@@ -77,7 +92,8 @@ That's it. From this point on, sync is automatic — no extra steps on your othe
 
 - Each session commits with a timestamp and hostname, so history is always traceable.
 - Push rejections (two machines worked offline) trigger an automatic `git pull --rebase` and retry. Because conversation files are append-only, rebases almost never produce conflicts.
-- If a rebase does fail, the local commit is preserved and a clear message tells you exactly what to run to resolve it manually.
+- `settings.json` is structured JSON — if the same key diverges on two machines, git will flag a conflict that must be resolved manually.
+- If a rebase fails for any reason, the local commit is preserved and a clear message tells you exactly what to run to resolve it manually.
 - `cbox doctor` shows sync status (remote URL, commits ahead/behind) at a glance.
 
 ### What not to use

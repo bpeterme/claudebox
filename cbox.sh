@@ -188,20 +188,20 @@ _cbox_create_network() {
 # ---------------------------------------------------------
 
 _cbox_sync_pull() {
-  local dir="$CBOX_CLAUDE_DIR/projects"
+  local dir="$CBOX_CLAUDE_DIR"
   [[ -d "$dir/.git" ]] || return 0
   command -v git >/dev/null || return 0
 
   # Only pull if a tracking branch is configured
   git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name @{u} >/dev/null 2>&1 || return 0
 
-  echo "Pulling project history..."
+  echo "Pulling Claude config..."
   git -C "$dir" pull --rebase 2>&1 \
     || echo "⚠  Sync pull failed — continuing with local state"
 }
 
 _cbox_sync_push() {
-  local dir="$CBOX_CLAUDE_DIR/projects"
+  local dir="$CBOX_CLAUDE_DIR"
   [[ -d "$dir/.git" ]] || return 0
   command -v git >/dev/null || return 0
 
@@ -229,9 +229,38 @@ _cbox_sync_push() {
   fi
 }
 
+# Explicit allowlist of what gets synced — only these patterns are tracked.
+# New files Claude Code might add in future will be ignored unless added here.
+_cbox_sync_write_gitignore() {
+  local dir="$1"
+  cat > "$dir/.gitignore" <<'EOF'
+# Ignore everything — only explicitly listed items are synced.
+*
+
+# This file itself
+!.gitignore
+
+# Claude Code config
+!settings.json
+!CLAUDE.md
+!keybindings.json
+
+# User scripts (e.g. statusline-command.sh)
+!*.sh
+
+# Project conversation history
+!projects/
+!projects/**
+
+# Plugin configuration
+!plugins/
+!plugins/**
+EOF
+}
+
 _cbox_sync_init() {
   local remote="$1"
-  local dir="$CBOX_CLAUDE_DIR/projects"
+  local dir="$CBOX_CLAUDE_DIR"
 
   if [[ -z "$remote" ]]; then
     echo "Usage: cbox sync-init <remote-url>"
@@ -249,6 +278,8 @@ _cbox_sync_init() {
     git -C "$dir" init -b main 2>/dev/null \
       || { git -C "$dir" init && git -C "$dir" branch -M main 2>/dev/null || true; }
   fi
+
+  _cbox_sync_write_gitignore "$dir"
 
   if git -C "$dir" remote get-url origin >/dev/null 2>&1; then
     git -C "$dir" remote set-url origin "$remote"
@@ -278,14 +309,14 @@ _cbox_sync_init() {
       git -C "$dir" commit --allow-empty -m "initial sync — $(hostname)"
     fi
     if git -C "$dir" push -u origin main; then
-      echo "✔ Sync initialized — pushed local history to remote."
+      echo "✔ Sync initialized — pushed local config to remote."
     else
       echo "⚠  Push failed. Check remote access and retry:"
       echo "   git -C \"$dir\" push -u origin main"
     fi
   fi
 
-  echo "Project history will now sync automatically on cbox start and exit."
+  echo "Claude config will now sync automatically on cbox start and exit."
 }
 
 # ---------------------------------------------------------
@@ -486,15 +517,14 @@ _cbox_doctor() {
   echo
   echo "[sync]"
 
-  local projects_dir="$CBOX_CLAUDE_DIR/projects"
-  if [[ -d "$projects_dir/.git" ]]; then
+  if [[ -d "$CBOX_CLAUDE_DIR/.git" ]]; then
     local sync_remote
-    sync_remote=$(git -C "$projects_dir" remote get-url origin 2>/dev/null || echo "none")
+    sync_remote=$(git -C "$CBOX_CLAUDE_DIR" remote get-url origin 2>/dev/null || echo "none")
     echo "✔ sync enabled (remote: $sync_remote)"
 
     local ahead behind
-    ahead=$(git -C "$projects_dir" rev-list --count @{u}..HEAD 2>/dev/null || echo "?")
-    behind=$(git -C "$projects_dir" rev-list --count HEAD..@{u} 2>/dev/null || echo "?")
+    ahead=$(git -C "$CBOX_CLAUDE_DIR" rev-list --count @{u}..HEAD 2>/dev/null || echo "?")
+    behind=$(git -C "$CBOX_CLAUDE_DIR" rev-list --count HEAD..@{u} 2>/dev/null || echo "?")
     echo "  ahead: $ahead  behind: $behind"
   else
     echo "ℹ sync not configured (run: cbox sync-init <remote-url>)"

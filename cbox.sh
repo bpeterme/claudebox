@@ -68,7 +68,7 @@ CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-/tmp/cbox-$(id -un)}"
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
-if [[ "$(uname)" == "Darwin" ]]; then
+if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
   _CBOX_CMD="container"
   _CBOX_RUNTIME="apple"
 else
@@ -93,7 +93,7 @@ _cbox_name() {
 # Normalises Apple Container tabular output and Docker --format output to the same shape.
 _cbox_rt_list() {
   if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
-    container list --all "$@" | awk 'NR>1 {print $1, $4}'
+    container ls --all "$@" | awk 'NR>1 {print $1, $2}'
   else
     docker ps -a "$@" --format "{{.Names}} {{.State}}"
   fi
@@ -352,31 +352,6 @@ _cbox_create() {
     args+=(-v "$CBOX_ZSHRC:/home/claude/.zshrc.global:ro")
   fi
 
-  # Auto-mount targets of symlinks in CBOX_CLAUDE_DIR so they resolve inside the container.
-  # We read the raw symlink value (no existence check) because this may run inside a container
-  # where the host paths don't exist locally but are valid on the Docker host.
-  local _mounted=() _link _target _tdir _raw _skip
-  while IFS= read -r _link; do
-    _raw=$(readlink "$_link" 2>/dev/null) || continue
-    if [[ "$_raw" == /* ]]; then
-      # Absolute symlink — use directly, no normalization needed
-      _target="$_raw"
-    else
-      # Relative symlink — build absolute path and normalize .. via python3
-      _target=$(python3 -c "import os,sys; print(os.path.normpath(os.path.join(os.path.dirname(sys.argv[1]), sys.argv[2])))" "$_link" "$_raw" 2>/dev/null) || continue
-    fi
-    [[ "$_target" == "$CBOX_CLAUDE_DIR"* ]] && continue
-    _tdir=$(dirname "$_target")
-    _skip=false
-    for _d in "${_mounted[@]+"${_mounted[@]}"}"; do
-      [[ "$_tdir" == "$_d"* ]] && { _skip=true; break; }
-    done
-    "$_skip" && continue
-    _mounted+=("$_tdir")
-    args+=(-v "$_tdir:$_tdir:ro")
-  done < <(find "$CBOX_CLAUDE_DIR" -maxdepth 1 -type l 2>/dev/null)
-  unset _link _target _tdir _raw _skip _mounted
-
   if [[ "$mode" == "normal" ]]; then
     if [[ -n "${CBOX_SSH_DIR:-}" ]]; then
       args+=(-v "$CBOX_SSH_DIR:/home/claude/.ssh:ro")
@@ -402,6 +377,24 @@ _cbox_create() {
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude:ro"
     )
   fi
+
+  # Resolve symlinks in CBOX_CLAUDE_DIR by mounting each target directly at its
+  # container path, added AFTER the .claude directory mount so these take precedence
+  # over the dangling symlinks. This avoids mounting macOS host paths (e.g.
+  # /Users/work/...) inside the container, which is not portable across runtimes.
+  local _link _target _raw _name
+  while IFS= read -r _link; do
+    _raw=$(readlink "$_link" 2>/dev/null) || continue
+    if [[ "$_raw" == /* ]]; then
+      _target="$_raw"
+    else
+      _target=$(python3 -c "import os,sys; print(os.path.normpath(os.path.join(os.path.dirname(sys.argv[1]), sys.argv[2])))" "$_link" "$_raw" 2>/dev/null) || continue
+    fi
+    [[ "$_target" == "$CBOX_CLAUDE_DIR"* ]] && continue
+    _name=$(basename "$_link")
+    args+=(-v "$_target:/home/claude/.claude/$_name:ro")
+  done < <(find "$CBOX_CLAUDE_DIR" -maxdepth 1 -type l 2>/dev/null)
+  unset _link _target _raw _name
 
   args+=(
     "$CBOX_IMAGE"
@@ -626,7 +619,7 @@ cbox() {
 
     list)
       if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
-        container list --all --filter "label=$CBOX_LABEL"
+        container ls --all --filter "label=$CBOX_LABEL"
       else
         docker ps -a --filter "label=$CBOX_LABEL"
       fi

@@ -352,11 +352,19 @@ _cbox_create() {
     args+=(-v "$CBOX_ZSHRC:/home/claude/.zshrc.global:ro")
   fi
 
-  # Auto-mount targets of symlinks in CBOX_CLAUDE_DIR so they resolve inside the container
-  local _mounted=() _link _target _tdir _skip
+  # Auto-mount targets of symlinks in CBOX_CLAUDE_DIR so they resolve inside the container.
+  # We read the raw symlink value (no existence check) because this may run inside a container
+  # where the host paths don't exist locally but are valid on the Docker host.
+  local _mounted=() _link _target _tdir _raw _skip
   while IFS= read -r _link; do
-    _target=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$_link" 2>/dev/null) || continue
-    [[ -e "$_target" ]] || continue
+    _raw=$(readlink "$_link" 2>/dev/null) || continue
+    if [[ "$_raw" == /* ]]; then
+      _target="$_raw"
+    else
+      _target="$(dirname "$_link")/$_raw"
+    fi
+    # Normalize away any .. or . components without touching the filesystem
+    _target=$(python3 -c "import os,sys; print(os.path.normpath(sys.argv[1]))" "$_target" 2>/dev/null) || continue
     [[ "$_target" == "$CBOX_CLAUDE_DIR"* ]] && continue
     _tdir=$(dirname "$_target")
     _skip=false
@@ -367,7 +375,7 @@ _cbox_create() {
     _mounted+=("$_tdir")
     args+=(-v "$_tdir:$_tdir:ro")
   done < <(find "$CBOX_CLAUDE_DIR" -maxdepth 1 -type l 2>/dev/null)
-  unset _link _target _tdir _skip _mounted
+  unset _link _target _tdir _raw _skip _mounted
 
   if [[ "$mode" == "normal" ]]; then
     if [[ -n "${CBOX_SSH_DIR:-}" ]]; then

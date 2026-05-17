@@ -39,6 +39,7 @@ Maintenance:
   cbox update           Force Claude Code update
   cbox doctor           Run environment diagnostics
   cbox list             List cbox containers
+  cbox version          Show sourced commit hash
 
 Help:
   cbox help
@@ -67,6 +68,7 @@ CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-/tmp/cbox-$(id -un)}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+_CBOX_VERSION="$(git -C "$_CBOX_BUILD_DIR" log -1 --format='%h' 2>/dev/null || echo 'unknown')"
 
 if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
   _CBOX_CMD="container"
@@ -181,6 +183,36 @@ _cbox_force_update() {
 
 _cbox_create_network() {
   $_CBOX_CMD network create cbox-bridge >/dev/null 2>&1 || true
+}
+
+# Copies CBOX_CLAUDE_DIR to a temp staging directory, resolving any symlinks to
+# real file content. Config files managed via dotfile symlinks become readable
+# files inside the container without needing any special mount tricks.
+# projects/ and plugins/ are excluded — they are mounted directly from the real
+# CBOX_CLAUDE_DIR so that conversation history and plugin state persist.
+_cbox_prepare_claude_dir() {
+  local name="$1"
+  local staging="/tmp/cbox-claude-$name"
+
+  rm -rf "$staging"
+  mkdir -p "$staging"
+
+  # Ensure projects/ exists on the host so the bind mount source is valid
+  mkdir -p "$CBOX_CLAUDE_DIR/projects"
+
+  local _f _n
+  while IFS= read -r _f; do
+    _n=$(basename "$_f")
+    [[ "$_n" == "projects" ]] && continue   # mounted directly from real dir
+    [[ "$_n" == "plugins"  ]] && continue   # mounted directly from real dir
+    [[ "$_n" == ".git"     ]] && continue   # not needed inside container
+    cp -rL "$_f" "$staging/$_n" 2>/dev/null || true
+  done < <(find "$CBOX_CLAUDE_DIR" -maxdepth 1 -mindepth 1 2>/dev/null)
+  unset _f _n
+
+  # Create empty mount points for the subdirs we mount separately
+  mkdir -p "$staging/projects"
+  [[ -d "$CBOX_CLAUDE_DIR/plugins" ]] && mkdir -p "$staging/plugins"
 }
 
 # ---------------------------------------------------------
@@ -328,8 +360,10 @@ _cbox_create() {
   local mode="$2"
 
   _cbox_generate_claude_json "$name"
+  _cbox_prepare_claude_dir "$name"
 
   local claude_json="$CBOX_DATA_DIR/.claude-$name.json"
+  local staging="/tmp/cbox-claude-$name"
 
   echo "Creating $mode container '$name'..."
 
@@ -357,10 +391,13 @@ _cbox_create() {
       args+=(-v "$CBOX_SSH_DIR:/home/claude/.ssh:ro")
     fi
     args+=(
-      -v "$CBOX_CLAUDE_DIR:/home/claude/.claude"
+      -v "$staging:/home/claude/.claude"
+      -v "$CBOX_CLAUDE_DIR/projects:/home/claude/.claude/projects"
       -v "$CBOX_HOST_CONFIG_DIR:/home/claude/.config"
       -v "$CBOX_SHARE_DIR:/home/claude/share"
     )
+    [[ -d "$CBOX_CLAUDE_DIR/plugins" ]] && \
+      args+=(-v "$CBOX_CLAUDE_DIR/plugins:/home/claude/.claude/plugins")
   fi
 
   if [[ "$mode" == "safe" ]]; then
@@ -374,30 +411,12 @@ _cbox_create() {
       --memory=4g
       --cpus=2
 
-      -v "$CBOX_CLAUDE_DIR:/home/claude/.claude:ro"
+      -v "$staging:/home/claude/.claude:ro"
+      -v "$CBOX_CLAUDE_DIR/projects:/home/claude/.claude/projects:ro"
     )
+    [[ -d "$CBOX_CLAUDE_DIR/plugins" ]] && \
+      args+=(-v "$CBOX_CLAUDE_DIR/plugins:/home/claude/.claude/plugins:ro")
   fi
-
-  # For each symlink in CBOX_CLAUDE_DIR that points outside the directory, mount
-  # the target's parent directory at the same absolute path inside the container.
-  # The symlinks then resolve correctly because their target paths are accessible.
-  # This avoids file-level mounts and mount shadowing, both unsupported by
-  # Apple Container / VirtioFS. No-op when there are no symlinks (default case).
-  local _link _target _raw _parent _seen=""
-  while IFS= read -r _link; do
-    _raw=$(readlink "$_link" 2>/dev/null) || continue
-    if [[ "$_raw" == /* ]]; then
-      _target="$_raw"
-    else
-      _target=$(python3 -c "import os,sys; print(os.path.normpath(os.path.join(os.path.dirname(sys.argv[1]), sys.argv[2])))" "$_link" "$_raw" 2>/dev/null) || continue
-    fi
-    [[ "$_target" == "$CBOX_CLAUDE_DIR"* ]] && continue
-    _parent=$(dirname "$_target")
-    case ":$_seen:" in *":$_parent:"*) continue ;; esac
-    _seen="${_seen}:${_parent}"
-    args+=(-v "$_parent:$_parent:ro")
-  done < <(find "$CBOX_CLAUDE_DIR" -maxdepth 1 -type l 2>/dev/null)
-  unset _link _target _raw _parent _seen
 
   args+=(
     "$CBOX_IMAGE"
@@ -431,6 +450,7 @@ _cbox_ensure() {
   fi
 
   if ! _cbox_running "$name"; then
+    _cbox_prepare_claude_dir "$name"
     echo "Starting container '$name'..."
     $_CBOX_CMD start "$name"
   fi
@@ -494,6 +514,7 @@ _cbox_doctor() {
   name=$(_cbox_name)
 
   echo "== cbox doctor =="
+  echo "Version: $_CBOX_VERSION"
 
   echo
   echo "[environment]"
@@ -593,6 +614,7 @@ cbox() {
     reset)
       echo "Removing container '$name'..."
       $_CBOX_CMD rm -f "$name"
+      rm -rf "/tmp/cbox-claude-$name"
       ;;
 
     rebuild)
@@ -635,13 +657,22 @@ cbox() {
       stopped=$(_cbox_rt_list --filter "label=$CBOX_LABEL" \
         | awk '$2 != "running" {print $1}')
 
-      [[ -n "$stopped" ]] && echo "$stopped" | xargs "$_CBOX_CMD" rm -f
+      if [[ -n "$stopped" ]]; then
+        while IFS= read -r _gc_name; do
+          rm -rf "/tmp/cbox-claude-$_gc_name"
+        done <<< "$stopped"
+        echo "$stopped" | xargs "$_CBOX_CMD" rm -f
+      fi
       ;;
 
     "")
 
       _cbox_ensure "$name" "normal" || return 1
       _cbox_enter "$name" "claude"
+      ;;
+
+    version)
+      echo "cbox $_CBOX_VERSION"
       ;;
 
      help|--help|-h)

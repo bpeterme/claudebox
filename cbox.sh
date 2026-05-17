@@ -29,7 +29,8 @@ Container Management:
   cbox stop             Stop current project container
   cbox reset            Remove current project container
   cbox rebuild          Rebuild container image
-  cbox gc               Remove stopped cbox containers
+  cbox list             List cbox containers
+  cbox prune            Remove stopped cbox containers
 
 Sync (cross-machine):
   cbox sync-init <url>  Initialize project history sync with a git remote
@@ -38,7 +39,7 @@ Sync (cross-machine):
 Maintenance:
   cbox update           Force Claude Code update
   cbox doctor           Run environment diagnostics
-  cbox list             List cbox containers
+  cbox version          Show sourced commit hash
 
 Help:
   cbox help
@@ -67,6 +68,7 @@ CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-/tmp/cbox-$(id -un)}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+_CBOX_VERSION="0.1.0"
 
 if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
   _CBOX_CMD="container"
@@ -149,6 +151,8 @@ _cbox_generate_claude_json() {
 
   local claude_json="$CBOX_DATA_DIR/.claude-$name.json"
 
+  [[ -f "$claude_json" ]] && return 0
+
   echo "{\"hasCompletedOnboarding\":true,\"installMethod\":\"native\",\"projects\":{\"/Workspace/$name\":{\"hasTrustDialogAccepted\":true}}}" \
     > "$claude_json"
 }
@@ -181,6 +185,20 @@ _cbox_force_update() {
 
 _cbox_create_network() {
   $_CBOX_CMD network create cbox-bridge >/dev/null 2>&1 || true
+}
+
+# Resolves a path through symlink chain (up to 10 levels), returning the real path.
+# Uses /usr/bin/readlink and shell builtins only — no PATH dependency.
+_cbox_resolve_path() {
+  local path="$1" target count=0
+  while [[ -L "$path" ]] && (( count++ < 10 )); do
+    target=$(/usr/bin/readlink "$path" 2>/dev/null) || break
+    [[ "$target" == /* ]] || target="${path%/*}/$target"
+    path="$target"
+  done
+  local _dir="${path%/*}" _base="${path##*/}"
+  path="$(cd "$_dir" 2>/dev/null && pwd -P)/$_base"
+  echo "$path"
 }
 
 # ---------------------------------------------------------
@@ -331,6 +349,8 @@ _cbox_create() {
 
   local claude_json="$CBOX_DATA_DIR/.claude-$name.json"
 
+  mkdir -p "$CBOX_CLAUDE_DIR/projects"
+
   echo "Creating $mode container '$name'..."
 
   local args=(
@@ -349,13 +369,14 @@ _cbox_create() {
   )
 
   if [[ -n "${CBOX_ZSHRC:-}" ]]; then
-    args+=(-v "$CBOX_ZSHRC:/home/claude/.zshrc.global:ro")
+    local _zshrc_real
+    _zshrc_real=$(_cbox_resolve_path "$CBOX_ZSHRC")
+    [[ -f "$_zshrc_real" ]] && args+=(-v "$_zshrc_real:/home/claude/.zshrc.global:ro")
+    unset _zshrc_real
   fi
 
   if [[ "$mode" == "normal" ]]; then
-    if [[ -n "${CBOX_SSH_DIR:-}" ]]; then
-      args+=(-v "$CBOX_SSH_DIR:/home/claude/.ssh:ro")
-    fi
+    [[ -n "${CBOX_SSH_DIR:-}" ]] && args+=(-v "$CBOX_SSH_DIR:/home/claude/.ssh:ro")
     args+=(
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude"
       -v "$CBOX_HOST_CONFIG_DIR:/home/claude/.config"
@@ -365,7 +386,6 @@ _cbox_create() {
 
   if [[ "$mode" == "safe" ]]; then
     _cbox_create_network
-
     args+=(
       --network cbox-bridge
       --cap-drop=ALL
@@ -373,28 +393,24 @@ _cbox_create() {
       --pids-limit 512
       --memory=4g
       --cpus=2
-
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude:ro"
     )
   fi
 
-  # Resolve symlinks in CBOX_CLAUDE_DIR by mounting each target directly at its
-  # container path, added AFTER the .claude directory mount so these take precedence
-  # over the dangling symlinks. This avoids mounting macOS host paths (e.g.
-  # /Users/work/...) inside the container, which is not portable across runtimes.
-  local _link _target _raw _name
+  # For each symlink in CBOX_CLAUDE_DIR, resolve it to the real host path and
+  # mount that target at its own absolute path inside the container. The symlink
+  # in ~/.claude points to e.g. /Users/work/.config/dotfiles/claude/settings.json;
+  # mounting that path at the same path in the container lets the symlink resolve.
+  local _ro="" _link _target
+  [[ "$mode" == "safe" ]] && _ro=":ro"
   while IFS= read -r _link; do
-    _raw=$(readlink "$_link" 2>/dev/null) || continue
-    if [[ "$_raw" == /* ]]; then
-      _target="$_raw"
-    else
-      _target=$(python3 -c "import os,sys; print(os.path.normpath(os.path.join(os.path.dirname(sys.argv[1]), sys.argv[2])))" "$_link" "$_raw" 2>/dev/null) || continue
-    fi
+    _target=$(_cbox_resolve_path "$_link")
+    [[ -e "$_target" ]] || continue
     [[ "$_target" == "$CBOX_CLAUDE_DIR"* ]] && continue
-    _name=$(basename "$_link")
-    args+=(-v "$_target:/home/claude/.claude/$_name:ro")
+    [[ "$_target" == "$PWD" || "$_target" == "$PWD/"* ]] && continue
+    args+=(-v "$_target:$_target$_ro")
   done < <(find "$CBOX_CLAUDE_DIR" -maxdepth 1 -type l 2>/dev/null)
-  unset _link _target _raw _name
+  unset _ro _link _target
 
   args+=(
     "$CBOX_IMAGE"
@@ -491,6 +507,7 @@ _cbox_doctor() {
   name=$(_cbox_name)
 
   echo "== cbox doctor =="
+  echo "Version: $_CBOX_VERSION"
 
   echo
   echo "[environment]"
@@ -625,7 +642,7 @@ cbox() {
       fi
       ;;
 
-    gc)
+    prune)
       echo "Removing stopped cbox containers..."
 
       local stopped
@@ -639,6 +656,10 @@ cbox() {
 
       _cbox_ensure "$name" "normal" || return 1
       _cbox_enter "$name" "claude"
+      ;;
+
+    version)
+      echo "cbox $_CBOX_VERSION"
       ;;
 
      help|--help|-h)

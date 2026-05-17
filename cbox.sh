@@ -194,8 +194,8 @@ _cbox_prepare_claude_dir() {
   local name="$1"
   local staging="/tmp/cbox-claude-$name"
 
-  rm -rf "$staging"
   mkdir -p "$staging"
+  find "$staging" -maxdepth 1 -mindepth 1 ! -name 'projects' ! -name 'plugins' -exec rm -rf {} +
 
   # Ensure projects/ exists on the host so the bind mount source is valid
   mkdir -p "$CBOX_CLAUDE_DIR/projects"
@@ -456,10 +456,7 @@ _cbox_ensure() {
   fi
 
   if ! _cbox_running "$name"; then
-    # Only prepare staging if it was cleaned up (e.g. after reset/prune).
-    # Do NOT recreate on restart — deleting and recreating the staging dir
-    # changes its inode and confuses Apple Container's VirtioFS on start.
-    [[ ! -d "/tmp/cbox-claude-$name" ]] && _cbox_prepare_claude_dir "$name"
+    _cbox_prepare_claude_dir "$name"
     echo "Starting container '$name'..."
     $_CBOX_CMD start "$name"
   fi

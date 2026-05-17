@@ -214,9 +214,10 @@ _cbox_prepare_claude_dir() {
   mkdir -p "$staging/projects"
   [[ -d "$CBOX_CLAUDE_DIR/plugins" ]] && mkdir -p "$staging/plugins"
 
-  # Resolve CBOX_ZSHRC symlink the same way as .claude config files
+  # Resolve CBOX_ZSHRC symlink into a separate temp file (NOT inside staging)
+  # to avoid VirtioFS conflicts from sharing a directory and a file inside it.
   if [[ -n "${CBOX_ZSHRC:-}" ]]; then
-    cp -L "$CBOX_ZSHRC" "$staging/.zshrc.global" 2>/dev/null || true
+    cp -L "$CBOX_ZSHRC" "/tmp/cbox-zshrc-$name" 2>/dev/null || true
   fi
 }
 
@@ -387,8 +388,8 @@ _cbox_create() {
     -e ZDOTDIR=/home/claude
   )
 
-  if [[ -n "${CBOX_ZSHRC:-}" ]] && [[ -f "$staging/.zshrc.global" ]]; then
-    args+=(-v "$staging/.zshrc.global:/home/claude/.zshrc.global:ro")
+  if [[ -n "${CBOX_ZSHRC:-}" ]] && [[ -f "/tmp/cbox-zshrc-$name" ]]; then
+    args+=(-v "/tmp/cbox-zshrc-$name:/home/claude/.zshrc.global:ro")
   fi
 
   if [[ "$mode" == "normal" ]]; then
@@ -619,7 +620,7 @@ cbox() {
     reset)
       echo "Removing container '$name'..."
       $_CBOX_CMD rm -f "$name"
-      rm -rf "/tmp/cbox-claude-$name"
+      rm -rf "/tmp/cbox-claude-$name" "/tmp/cbox-zshrc-$name"
       ;;
 
     rebuild)
@@ -664,7 +665,7 @@ cbox() {
 
       if [[ -n "$stopped" ]]; then
         while IFS= read -r _gc_name; do
-          rm -rf "/tmp/cbox-claude-$_gc_name"
+          rm -rf "/tmp/cbox-claude-$_gc_name" "/tmp/cbox-zshrc-$_gc_name"
         done <<< "$stopped"
         echo "$stopped" | xargs "$_CBOX_CMD" rm -f
       fi

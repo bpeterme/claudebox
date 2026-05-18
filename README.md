@@ -189,8 +189,6 @@ In safe mode (`cbox safe`), claudebox pulls config from `main` but performs no w
 
 Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.example`](cbox.env.example) for all options. If `$XDG_CONFIG_HOME` is set, the file goes in `$XDG_CONFIG_HOME/claudebox/cbox.env` instead.
 
-> **Migrating from `~/.cbox.env`?** Run: `mkdir -p ~/.config/claudebox && mv ~/.cbox.env ~/.config/claudebox/cbox.env`
-
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CBOX_IMAGE` | `claudebox` | Docker image name |

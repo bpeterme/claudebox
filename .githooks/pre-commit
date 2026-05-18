@@ -1,7 +1,6 @@
 #!/bin/sh
-# Bump VERSION and embed it into cbox.sh as _CBOX_VERSION.
-# On dev branch: bump patch (0.0.X → 0.0.X+1)
-# On main branch: bump minor, reset patch (0.X.Y → 0.X+1.0)
+# Bump patch version on every commit and embed into cbox.sh.
+# Minor version bump on merge to main is handled by the release workflow.
 
 [ -f VERSION ] || exit 0
 
@@ -10,16 +9,7 @@ major=$(echo "$version" | cut -d. -f1)
 minor=$(echo "$version" | cut -d. -f2)
 patch=$(echo "$version" | cut -d. -f3)
 
-branch=$(git symbolic-ref --short HEAD 2>/dev/null)
-
-if [ "$branch" = "main" ]; then
-  minor=$((minor + 1))
-  patch=0
-else
-  patch=$((patch + 1))
-fi
-
-new_version="$major.$minor.$patch"
+new_version="$major.$minor.$((patch + 1))"
 printf '%s\n' "$new_version" > VERSION
 sed -i.bak "s/^_CBOX_VERSION=\"[^\"]*\"/_CBOX_VERSION=\"$new_version\"/" cbox.sh && rm -f cbox.sh.bak
 git add VERSION cbox.sh

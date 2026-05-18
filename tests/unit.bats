@@ -111,3 +111,193 @@ setup() {
   run cat "$f"
   [ "$output" = "preserved" ]
 }
+
+# ---------------------------------------------------------------------------
+# _cbox_project_dir
+# ---------------------------------------------------------------------------
+
+@test "_cbox_project_dir: prefixes name with -Workspace-" {
+  run _cbox_project_dir "myproject"
+  [ "$status" -eq 0 ]
+  [ "$output" = "-Workspace-myproject" ]
+}
+
+@test "_cbox_project_dir: preserves hyphens in name" {
+  run _cbox_project_dir "my-cool-project"
+  [ "$status" -eq 0 ]
+  [ "$output" = "-Workspace-my-cool-project" ]
+}
+
+# ---------------------------------------------------------------------------
+# _cbox_history_branch
+# ---------------------------------------------------------------------------
+
+@test "_cbox_history_branch: returns history/<name>/<hostname>" {
+  run _cbox_history_branch "myproject"
+  [ "$status" -eq 0 ]
+  [ "$output" = "history/myproject/$(hostname)" ]
+}
+
+# ---------------------------------------------------------------------------
+# _cbox_sync_is_opted_in
+# ---------------------------------------------------------------------------
+
+@test "_cbox_sync_is_opted_in: returns true when project is in list" {
+  CBOX_SYNC_PROJECTS="alpha bravo charlie"
+  run _cbox_sync_is_opted_in "bravo"
+  [ "$status" -eq 0 ]
+}
+
+@test "_cbox_sync_is_opted_in: returns false when project is not in list" {
+  CBOX_SYNC_PROJECTS="alpha charlie"
+  run _cbox_sync_is_opted_in "bravo"
+  [ "$status" -ne 0 ]
+}
+
+@test "_cbox_sync_is_opted_in: returns false when list is empty" {
+  CBOX_SYNC_PROJECTS=""
+  run _cbox_sync_is_opted_in "bravo"
+  [ "$status" -ne 0 ]
+}
+
+@test "_cbox_sync_is_opted_in: does not match partial word" {
+  CBOX_SYNC_PROJECTS="foobar"
+  run _cbox_sync_is_opted_in "foo"
+  [ "$status" -ne 0 ]
+}
+
+@test "_cbox_sync_is_opted_in: matches sole entry in list" {
+  CBOX_SYNC_PROJECTS="only"
+  run _cbox_sync_is_opted_in "only"
+  [ "$status" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# _cbox_sync_register
+# ---------------------------------------------------------------------------
+
+@test "_cbox_sync_register add: creates cbox.env when absent" {
+  local config="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
+  rm -f "$config"
+  CBOX_SYNC_PROJECTS=""
+  _cbox_sync_register "myproject" "add"
+  [ -f "$config" ]
+}
+
+@test "_cbox_sync_register add: writes project into CBOX_SYNC_PROJECTS" {
+  CBOX_SYNC_PROJECTS=""
+  _cbox_sync_register "myproject" "add"
+  local config="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
+  run grep "^CBOX_SYNC_PROJECTS=" "$config"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"myproject"* ]]
+}
+
+@test "_cbox_sync_register add: updates in-memory CBOX_SYNC_PROJECTS" {
+  CBOX_SYNC_PROJECTS=""
+  _cbox_sync_register "myproject" "add"
+  [[ " $CBOX_SYNC_PROJECTS " == *" myproject "* ]]
+}
+
+@test "_cbox_sync_register add: is idempotent" {
+  CBOX_SYNC_PROJECTS="myproject"
+  _cbox_sync_register "myproject" "add"
+  local count
+  count=$(printf '%s\n' $CBOX_SYNC_PROJECTS | grep -cx "myproject")
+  [ "$count" -eq 1 ]
+}
+
+@test "_cbox_sync_register add: appends to existing projects" {
+  CBOX_SYNC_PROJECTS="alpha"
+  _cbox_sync_register "bravo" "add"
+  [[ " $CBOX_SYNC_PROJECTS " == *" alpha "* ]]
+  [[ " $CBOX_SYNC_PROJECTS " == *" bravo "* ]]
+}
+
+@test "_cbox_sync_register add: preserves other lines in cbox.env" {
+  local config="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
+  echo 'CBOX_IMAGE="myimage"' > "$config"
+  CBOX_SYNC_PROJECTS=""
+  _cbox_sync_register "myproject" "add"
+  run grep "^CBOX_IMAGE=" "$config"
+  [ "$status" -eq 0 ]
+}
+
+@test "_cbox_sync_register remove: removes project from list" {
+  CBOX_SYNC_PROJECTS="alpha bravo charlie"
+  _cbox_sync_register "bravo" "remove"
+  [[ " $CBOX_SYNC_PROJECTS " != *" bravo "* ]]
+}
+
+@test "_cbox_sync_register remove: retains other projects" {
+  CBOX_SYNC_PROJECTS="alpha bravo charlie"
+  _cbox_sync_register "bravo" "remove"
+  [[ " $CBOX_SYNC_PROJECTS " == *" alpha "* ]]
+  [[ " $CBOX_SYNC_PROJECTS " == *" charlie "* ]]
+}
+
+@test "_cbox_sync_register remove: handles removing sole project" {
+  CBOX_SYNC_PROJECTS="only"
+  _cbox_sync_register "only" "remove"
+  [ -z "$CBOX_SYNC_PROJECTS" ]
+}
+
+@test "_cbox_sync_register remove: no-op when project not in list" {
+  CBOX_SYNC_PROJECTS="alpha charlie"
+  _cbox_sync_register "bravo" "remove"
+  [[ " $CBOX_SYNC_PROJECTS " == *" alpha "* ]]
+  [[ " $CBOX_SYNC_PROJECTS " == *" charlie "* ]]
+}
+
+# ---------------------------------------------------------------------------
+# _cbox_sync_write_gitignore
+# ---------------------------------------------------------------------------
+
+@test "_cbox_sync_write_gitignore: creates gitignore when absent" {
+  local dir="$BATS_TMPDIR/gitignore-new"
+  mkdir -p "$dir"
+  _cbox_sync_write_gitignore "$dir"
+  [ -f "$dir/.gitignore" ]
+}
+
+@test "_cbox_sync_write_gitignore: gitignore contains wildcard deny-all" {
+  local dir="$BATS_TMPDIR/gitignore-content"
+  mkdir -p "$dir"
+  _cbox_sync_write_gitignore "$dir"
+  run grep -q "^\*$" "$dir/.gitignore"
+  [ "$status" -eq 0 ]
+}
+
+@test "_cbox_sync_write_gitignore: gitignore allows settings.json" {
+  local dir="$BATS_TMPDIR/gitignore-allowlist"
+  mkdir -p "$dir"
+  _cbox_sync_write_gitignore "$dir"
+  run grep -q "^!settings.json" "$dir/.gitignore"
+  [ "$status" -eq 0 ]
+}
+
+@test "_cbox_sync_write_gitignore: gitignore does not allow projects/" {
+  local dir="$BATS_TMPDIR/gitignore-no-projects"
+  mkdir -p "$dir"
+  _cbox_sync_write_gitignore "$dir"
+  run grep -q "projects/" "$dir/.gitignore"
+  [ "$status" -ne 0 ]
+}
+
+@test "_cbox_sync_write_gitignore: skips write when already correct" {
+  local dir="$BATS_TMPDIR/gitignore-skip"
+  mkdir -p "$dir"
+  echo "correct" > "$dir/.gitignore"
+  _cbox_sync_write_gitignore "$dir"
+  run cat "$dir/.gitignore"
+  [ "$output" = "correct" ]
+}
+
+@test "_cbox_sync_write_gitignore: overwrites old format containing !projects/" {
+  local dir="$BATS_TMPDIR/gitignore-migrate"
+  mkdir -p "$dir"
+  printf '*\n!projects/\n!projects/**\n' > "$dir/.gitignore"
+  _cbox_sync_write_gitignore "$dir"
+  run grep -q "^!projects/" "$dir/.gitignore"
+  [ "$status" -ne 0 ]
+}

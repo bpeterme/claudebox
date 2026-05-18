@@ -1037,6 +1037,10 @@ cbox() {
       ;;
 
     reset)
+      if ! _cbox_exists "$name"; then
+        echo "No container found for '$name'."
+        return 0
+      fi
       echo "Removing container '$name'..."
       $_CBOX_CMD rm -f "$name"
       ;;

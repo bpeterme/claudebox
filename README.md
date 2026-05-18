@@ -208,16 +208,28 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 ### `~/.config/claudebox/cbox.env` template
 
 ```bash
+# ── image & container ─────────────────────────────────────────────────────────
 # CBOX_IMAGE="claudebox"
+# CBOX_LABEL="cbox.project=true"
+# CBOX_KEEPALIVE_SECONDS=600
+
+# ── host paths ────────────────────────────────────────────────────────────────
 # CBOX_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/cbox"
 # CBOX_CLAUDE_DIR="$HOME/.claude"
 # CBOX_HOST_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
 # CBOX_SHARE_DIR="/tmp/cbox-$USER"
-# CBOX_SSH_DIR="$HOME/.ssh"    # unset = no SSH mount
-# CBOX_ZSHRC="$HOME/.zshrc"   # unset = none
+
+# ── optional mounts (leave unset to disable) ──────────────────────────────────
+# CBOX_SSH_DIR="$HOME/.ssh"
+# CBOX_ZSHRC="$HOME/.zshrc"
+
+# ── build ─────────────────────────────────────────────────────────────────────
 # CBOX_BUILD_DIR="$HOME/claudebox"
 # BUILD_PLAYWRIGHT=0
+
+# ── sync ──────────────────────────────────────────────────────────────────────
 # CBOX_SYNC_SIZE_WARN_MB=500
+# CBOX_SYNC_PROJECTS=""        # managed by 'cbox sync add/remove'
 ```
 
 ## Container Image

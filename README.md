@@ -9,7 +9,6 @@ Each project gets its own container, named after the directory. Two modes are av
 ## Prerequisites
 
 - [Apple Container](https://github.com/apple/containerization) (macOS) or Docker (Linux)
-- `jq` (installed automatically by Homebrew; required for manual installs)
 
 ## Installation
 

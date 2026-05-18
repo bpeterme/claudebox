@@ -1,17 +1,14 @@
 class Claudebox < Formula
   desc "Claude Code container runtime — scoped per project, runs in Docker or Apple Container"
   homepage "https://github.com/bpeterme/claudebox"
-  url "https://github.com/bpeterme/claudebox/archive/refs/tags/PLACEHOLDER.tar.gz"
-  sha256 "PLACEHOLDER"
   license "MIT"
 
   head "https://github.com/bpeterme/claudebox.git", branch: "dev"
 
   depends_on :macos
-  depends_on "jq"
 
   def install
-    version_str = build.head? ? `git describe --tags --always`.chomp : version.to_s
+    version_str = build.head? ? "HEAD-#{`git describe --tags --always`.chomp}" : version.to_s
     inreplace "cbox.sh", '_CBOX_VERSION="dev"', "_CBOX_VERSION=\"#{version_str}\""
     bin.install "cbox.sh" => "cbox"
     (share/"claudebox").install "dockerfile"
@@ -27,7 +24,6 @@ class Claudebox < Formula
   end
 
   test do
-    output = shell_output("#{bin}/cbox version")
-    assert_match version.to_s, output
+    assert_match "cbox HEAD-", shell_output("#{bin}/cbox version")
   end
 end

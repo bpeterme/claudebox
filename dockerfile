@@ -57,6 +57,8 @@ RUN git clone --depth=1 https://github.com/zsh-users/zsh-autosuggestions \
 
 USER claude
 
+RUN mkdir -p /home/claude/.ssh && chmod 700 /home/claude/.ssh
+
 # .zshrc loader
 RUN printf '[ -f /home/claude/.zshrc.global ] && . /home/claude/.zshrc.global\n[ -f /home/claude/.zshrc.local ] && . /home/claude/.zshrc.local\n' \
     > /home/claude/.zshrc

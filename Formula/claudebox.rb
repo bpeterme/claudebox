@@ -6,7 +6,6 @@ class Claudebox < Formula
   license "MIT"
 
   depends_on :macos
-  depends_on "bash"
   depends_on "jq"
 
   def install

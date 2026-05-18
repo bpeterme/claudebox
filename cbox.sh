@@ -2,7 +2,9 @@
 # shellcheck shell=bash
 
 # claudebox (cbox) - Claude Container Runtime
-# Source this file in .bashrc or .zshrc:
+# Install via Homebrew:
+#   brew tap bpeterme/claudebox && brew install claudebox
+# Or source this file in .bashrc or .zshrc:
 #   source /path/to/claudebox/cbox.sh
 #
 # Configure by creating ~/.config/claudebox/cbox.env (see cbox.env.example)
@@ -44,7 +46,7 @@ Sync (cross-machine):
 Maintenance:
   cbox update           Force Claude Code update
   cbox doctor           Run environment diagnostics
-  cbox version          Show sourced commit hash
+  cbox version          Show version
 
 Help:
   cbox help
@@ -75,7 +77,14 @@ CBOX_SYNC_PROJECTS="${CBOX_SYNC_PROJECTS:-}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-_CBOX_VERSION="0.1.16"
+# For prefix-based installs (e.g. Homebrew), the dockerfile lives in share/claudebox
+# rather than next to the binary — check PREFIX/share/claudebox as a fallback.
+if [[ ! -f "$_CBOX_BUILD_DIR/dockerfile" ]]; then
+  _cbox_share="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/share/claudebox"
+  [[ -f "$_cbox_share/dockerfile" ]] && _CBOX_BUILD_DIR="$_cbox_share"
+  unset _cbox_share
+fi
+_CBOX_VERSION="dev"
 
 if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
   _CBOX_CMD="container"
@@ -1011,7 +1020,7 @@ cbox() {
 
     list)
       if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
-        container ls --all --filter "label=$CBOX_LABEL"
+        container ls --all
       else
         docker ps -a --filter "label=$CBOX_LABEL"
       fi
@@ -1021,8 +1030,17 @@ cbox() {
       echo "Removing stopped cbox containers..."
 
       local stopped
-      stopped=$(_cbox_rt_list --filter "label=$CBOX_LABEL" \
-        | awk '$2 != "running" {print $1}')
+      if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
+        stopped=$(
+          _cbox_rt_list | while read -r cname cstate; do
+            [[ "$cstate" == "running" ]] && continue
+            [[ "$(_cbox_rt_label "$cname" "cbox.project")" == "true" ]] && echo "$cname"
+          done
+        )
+      else
+        stopped=$(_cbox_rt_list --filter "label=$CBOX_LABEL" \
+          | awk '$2 != "running" {print $1}')
+      fi
 
       [[ -n "$stopped" ]] && echo "$stopped" | xargs "$_CBOX_CMD" rm -f
       ;;
@@ -1056,3 +1074,7 @@ cbox() {
       ;;
   esac
 }
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  cbox "$@"
+fi

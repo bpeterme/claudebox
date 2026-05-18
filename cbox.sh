@@ -230,8 +230,12 @@ _cbox_project_dir() {
   echo "-Workspace-$1"
 }
 
+_cbox_machine_id() {
+  echo "${USER}@$(hostname -s)"
+}
+
 _cbox_history_branch() {
-  echo "history/$1/$(hostname)"
+  echo "history/$1/$(_cbox_machine_id)"
 }
 
 _cbox_sync_is_opted_in() {
@@ -297,7 +301,7 @@ _cbox_sync_push() {
   # Nothing new to commit
   git -C "$dir" diff --cached --quiet && return 0
 
-  git -C "$dir" commit -m "sync — $(hostname) — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  git -C "$dir" commit -m "sync — $(_cbox_machine_id) — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   if git -C "$dir" push; then
     return 0
@@ -385,19 +389,46 @@ _cbox_sync_init() {
     # Remote has history — commit any local state, then rebase on top of remote
     git -C "$dir" add -A
     if [[ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]]; then
-      git -C "$dir" commit -m "local state before initial sync — $(hostname)"
+      git -C "$dir" commit -m "local state before initial sync — $(_cbox_machine_id)"
     fi
     git -C "$dir" branch --set-upstream-to="origin/$remote_default" main 2>/dev/null || true
-    git -C "$dir" rebase "origin/$remote_default" \
-      || echo "⚠  Rebase had conflicts — resolve manually in $dir"
-    echo "✔ Sync initialized — pulled existing config from remote."
+    if git -C "$dir" rebase "origin/$remote_default"; then
+      echo "✔ Sync initialized — pulled existing config from remote."
+    else
+      local conflicts
+      conflicts=$(git -C "$dir" diff --name-only --diff-filter=U 2>/dev/null)
+      echo ""
+      echo "⚠  Config conflict during initial sync."
+      echo "   Your local config and the remote have diverged on the same file(s)."
+      echo ""
+      if [[ -n "$conflicts" ]]; then
+        echo "   Conflicting files:"
+        while IFS= read -r f; do
+          echo "     $f"
+        done <<< "$conflicts"
+        echo ""
+      fi
+      echo "   In each conflicting file, '<<<<<<< HEAD' is the remote config"
+      echo "   and '>>>>>>>' is your local config. Edit to resolve, then:"
+      echo ""
+      echo "     cd $dir"
+      echo "     git add <file>"
+      echo "     git rebase --continue"
+      echo ""
+      echo "   To discard your local config and use the remote as-is:"
+      echo "     git -C \"$dir\" rebase --abort"
+      echo "     git -C \"$dir\" reset --hard origin/$remote_default"
+      echo ""
+      echo "   Once resolved, run 'cbox sync' to push your merged config."
+      return 1
+    fi
 
   else
     # Remote is empty — push local state
     git -C "$dir" add -A
     if ! git -C "$dir" diff --cached --quiet 2>/dev/null \
         || ! git -C "$dir" log -1 >/dev/null 2>&1; then
-      git -C "$dir" commit --allow-empty -m "initial sync — $(hostname)"
+      git -C "$dir" commit --allow-empty -m "initial sync — $(_cbox_machine_id)"
     fi
     if git -C "$dir" push -u origin main; then
       echo "✔ Sync initialized — pushed local config to remote."
@@ -412,7 +443,7 @@ _cbox_sync_init() {
 }
 
 # ---------------------------------------------------------
-# sync — history (per-project branches: history/<project>/<hostname>)
+# sync — history (per-project branches: history/<project>/<user>@<host>)
 # ---------------------------------------------------------
 
 _cbox_sync_size_check() {
@@ -482,7 +513,7 @@ _cbox_sync_push_history() {
 
   local commit
   commit=$(git -C "$dir" commit-tree "$tree" "${parent_args[@]}" \
-    -m "sync — $(hostname) — $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>/dev/null)
+    -m "sync — $(_cbox_machine_id) — $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>/dev/null)
 
   [[ -n "$commit" ]] || { echo "⚠  Failed to create history commit for '$name'."; return 1; }
 
@@ -547,7 +578,7 @@ _cbox_sync_compact() {
   # Orphan commit — no parent, drops all prior history on this branch
   local commit
   commit=$(git -C "$dir" commit-tree "$tree" \
-    -m "compact — $(hostname) — $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>/dev/null)
+    -m "compact — $(_cbox_machine_id) — $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>/dev/null)
 
   [[ -n "$commit" ]] || { echo "⚠  Failed to create compact commit."; return 1; }
 
@@ -585,7 +616,7 @@ _cbox_sync_prune() {
   echo "Fetching remote refs..."
   git -C "$dir" fetch origin 2>/dev/null || true
 
-  local host; host=$(hostname)
+  local host; host=$(_cbox_machine_id)
   local branches=()
 
   if $all_projects; then
@@ -668,7 +699,7 @@ _cbox_sync_list() {
   git -C "$dir" fetch origin 2>/dev/null || true
 
   local host
-  host=$(hostname)
+  host=$(_cbox_machine_id)
   local found=false
 
   while IFS= read -r ref; do

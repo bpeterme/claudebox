@@ -14,6 +14,16 @@ Each project gets its own container, named after the directory. Two modes are av
 
 ## Installation
 
+### Homebrew (recommended)
+
+```bash
+brew tap bpeterme/claudebox
+brew install claudebox
+cbox rebuild
+```
+
+### Manual
+
 ```bash
 git clone https://github.com/bpeterme/claudebox.git ~/claudebox
 ```
@@ -24,7 +34,7 @@ Add to your `~/.zshrc` or `~/.bashrc`:
 source ~/claudebox/cbox.sh
 ```
 
-Then build the Docker image:
+Then build the container image:
 
 ```bash
 cbox rebuild

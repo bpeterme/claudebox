@@ -2,7 +2,9 @@
 # shellcheck shell=bash
 
 # claudebox (cbox) - Claude Container Runtime
-# Source this file in .bashrc or .zshrc:
+# Install via Homebrew:
+#   brew tap bpeterme/claudebox && brew install claudebox
+# Or source this file in .bashrc or .zshrc:
 #   source /path/to/claudebox/cbox.sh
 #
 # Configure by creating ~/.config/claudebox/cbox.env (see cbox.env.example)
@@ -75,6 +77,13 @@ CBOX_SYNC_PROJECTS="${CBOX_SYNC_PROJECTS:-}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+# For prefix-based installs (e.g. Homebrew), the dockerfile lives in share/claudebox
+# rather than next to the binary — check PREFIX/share/claudebox as a fallback.
+if [[ ! -f "$_CBOX_BUILD_DIR/dockerfile" ]]; then
+  _cbox_share="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/share/claudebox"
+  [[ -f "$_cbox_share/dockerfile" ]] && _CBOX_BUILD_DIR="$_cbox_share"
+  unset _cbox_share
+fi
 _CBOX_VERSION="dev"
 
 if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
@@ -1065,3 +1074,7 @@ cbox() {
       ;;
   esac
 }
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  cbox "$@"
+fi

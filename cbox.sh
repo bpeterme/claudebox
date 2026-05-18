@@ -770,23 +770,34 @@ _cbox_create() {
 
   if [[ "$mode" == "normal" ]]; then
     if [[ -n "${CBOX_SSH_DIR:-}" ]]; then
-      args+=(-v "$CBOX_SSH_DIR:/home/claude/.ssh:ro")
-      # If no config exists, generate one so non-standard key names are discovered.
-      # Mounted as a separate file at ~/.ssh/config — overrides the ro directory mount.
+      # Mount each file individually so ~/.ssh/ itself is not a volume mount.
+      # This allows known_hosts to be writable while keys remain read-only,
+      # and lets us mount a generated config without EROFS conflicts.
+      while IFS= read -r _f; do
+        local _fname; _fname=$(basename "$_f")
+        case "$_fname" in
+          known_hosts|known_hosts.old) args+=(-v "$_f:/home/claude/.ssh/$_fname") ;;
+          *)                           args+=(-v "$_f:/home/claude/.ssh/$_fname:ro") ;;
+        esac
+      done < <(find "$CBOX_SSH_DIR" -maxdepth 1 -type f 2>/dev/null)
+
+      # Generate and mount a config if the source directory has none
       if [[ ! -f "$CBOX_SSH_DIR/config" ]]; then
         local _ssh_cfg="$CBOX_DATA_DIR/.ssh_config"
         {
           echo "Host *"
-          while IFS= read -r _key; do
-            echo "  IdentityFile /home/claude/.ssh/$(basename "$_key")"
-          done < <(find "$CBOX_SSH_DIR" -maxdepth 1 -type f \
+          find "$CBOX_SSH_DIR" -maxdepth 1 -type f \
             ! -name "*.pub" ! -name "known_hosts" ! -name "known_hosts.old" \
-            ! -name "authorized_keys" ! -name "config" 2>/dev/null | sort)
+            ! -name "authorized_keys" ! -name "config" 2>/dev/null | sort \
+            | while IFS= read -r _key; do
+                echo "  IdentityFile /home/claude/.ssh/$(basename "$_key")"
+              done
         } > "$_ssh_cfg"
         chmod 600 "$_ssh_cfg"
         args+=(-v "$_ssh_cfg:/home/claude/.ssh/config:ro")
-        unset _ssh_cfg _key
+        unset _ssh_cfg
       fi
+      unset _f _fname _key
     fi
     args+=(
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude"

@@ -1011,7 +1011,7 @@ cbox() {
 
     list)
       if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
-        container ls --all --filter "label=$CBOX_LABEL"
+        container ls --all
       else
         docker ps -a --filter "label=$CBOX_LABEL"
       fi
@@ -1021,8 +1021,17 @@ cbox() {
       echo "Removing stopped cbox containers..."
 
       local stopped
-      stopped=$(_cbox_rt_list --filter "label=$CBOX_LABEL" \
-        | awk '$2 != "running" {print $1}')
+      if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
+        stopped=$(
+          _cbox_rt_list | while read -r cname cstate; do
+            [[ "$cstate" == "running" ]] && continue
+            [[ "$(_cbox_rt_label "$cname" "cbox.project")" == "true" ]] && echo "$cname"
+          done
+        )
+      else
+        stopped=$(_cbox_rt_list --filter "label=$CBOX_LABEL" \
+          | awk '$2 != "running" {print $1}')
+      fi
 
       [[ -n "$stopped" ]] && echo "$stopped" | xargs "$_CBOX_CMD" rm -f
       ;;

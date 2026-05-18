@@ -5,12 +5,14 @@ class Claudebox < Formula
   sha256 "PLACEHOLDER"
   license "MIT"
 
+  head "https://github.com/bpeterme/claudebox.git", branch: "dev"
+
   depends_on :macos
-  depends_on "bash"
   depends_on "jq"
 
   def install
-    inreplace "cbox.sh", '_CBOX_VERSION="dev"', "_CBOX_VERSION=\"#{version}\""
+    version_str = build.head? ? `git describe --tags --always`.chomp : version.to_s
+    inreplace "cbox.sh", '_CBOX_VERSION="dev"', "_CBOX_VERSION=\"#{version_str}\""
     bin.install "cbox.sh" => "cbox"
     (share/"claudebox").install "dockerfile"
   end

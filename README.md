@@ -9,8 +9,7 @@ Each project gets its own container, named after the directory. Two modes are av
 ## Prerequisites
 
 - [Apple Container](https://github.com/apple/containerization) (macOS) or Docker (Linux)
-- `jq`
-- `bash` or `zsh`
+- `jq` (installed automatically by Homebrew; required for manual installs)
 
 ## Installation
 
@@ -19,7 +18,7 @@ Each project gets its own container, named after the directory. Two modes are av
 ```bash
 brew tap bpeterme/claudebox
 brew install claudebox
-cbox rebuild
+cbox --help
 ```
 
 ### Manual
@@ -34,10 +33,10 @@ Add to your `~/.zshrc` or `~/.bashrc`:
 source ~/claudebox/cbox.sh
 ```
 
-Then build the container image:
+Then:
 
 ```bash
-cbox rebuild
+cbox --help
 ```
 
 ## Quick Start
@@ -86,7 +85,7 @@ cbox shell     # open a zsh shell instead of Claude Code
 |---------|-------------|
 | `cbox update` | Force-update Claude Code inside a running container |
 | `cbox doctor` | Run environment diagnostics |
-| `cbox version` | Show the sourced version |
+| `cbox version` | Show version |
 
 ## Cross-Machine Sync
 

@@ -40,7 +40,7 @@ Sync (cross-machine):
   cbox sync add         Opt current project into history sync
   cbox sync remove      Stop syncing history for current project
   cbox sync compact     Squash current project's history to one commit
-  cbox sync prune [--all]  Remove old/oversized history branches (default: current project)
+  cbox sync prune       Remove old/oversized history branches (--all: all projects)
   cbox sync list        List projects with history sync and sizes
 
 Maintenance:

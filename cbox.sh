@@ -33,8 +33,13 @@ Container Management:
   cbox prune            Remove stopped cbox containers
 
 Sync (cross-machine):
-  cbox sync-init <url>  Initialize project history sync with a git remote
-  cbox sync             Pull and push project history manually
+  cbox sync-init <url>  Initialize config sync with a git remote
+  cbox sync             Pull and push config + opted-in project history
+  cbox sync add         Opt current project into history sync
+  cbox sync remove      Stop syncing history for current project
+  cbox sync compact     Squash current project's history to one commit
+  cbox sync prune       Remove old/oversized history branches from remote
+  cbox sync list        List projects with history sync and sizes
 
 Maintenance:
   cbox update           Force Claude Code update
@@ -65,10 +70,12 @@ CBOX_DATA_DIR="${CBOX_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/cbox}"
 CBOX_CLAUDE_DIR="${CBOX_CLAUDE_DIR:-$HOME/.claude}"
 CBOX_HOST_CONFIG_DIR="${CBOX_HOST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}}"
 CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-/tmp/cbox-$(id -un)}"
+CBOX_SYNC_SIZE_WARN_MB="${CBOX_SYNC_SIZE_WARN_MB:-500}"
+CBOX_SYNC_PROJECTS="${CBOX_SYNC_PROJECTS:-}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-_CBOX_VERSION="0.1.2"
+_CBOX_VERSION="0.1.3"
 
 if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
   _CBOX_CMD="container"
@@ -202,7 +209,46 @@ _cbox_resolve_path() {
 }
 
 # ---------------------------------------------------------
-# sync
+# sync — helpers
+# ---------------------------------------------------------
+
+_cbox_project_dir() {
+  echo "-Workspace-$1"
+}
+
+_cbox_history_branch() {
+  echo "history/$1/$(hostname)"
+}
+
+_cbox_sync_is_opted_in() {
+  [[ " ${CBOX_SYNC_PROJECTS:-} " == *" $1 "* ]]
+}
+
+_cbox_sync_register() {
+  local name="$1" action="$2"
+  local config="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
+  local current="${CBOX_SYNC_PROJECTS:-}"
+  local new_value
+
+  if [[ "$action" == "add" ]]; then
+    [[ " $current " == *" $name "* ]] && return 0
+    new_value="${current:+$current }$name"
+  else
+    new_value=$(printf '%s\n' $current | grep -vx "$name" | tr '\n' ' ')
+    new_value="${new_value% }"
+  fi
+
+  local tmp
+  tmp=$(mktemp)
+  mkdir -p "$(dirname "$config")"
+  [[ -f "$config" ]] && grep -v "^CBOX_SYNC_PROJECTS=" "$config" > "$tmp" || true
+  printf 'CBOX_SYNC_PROJECTS="%s"\n' "$new_value" >> "$tmp"
+  mv "$tmp" "$config"
+  CBOX_SYNC_PROJECTS="$new_value"
+}
+
+# ---------------------------------------------------------
+# sync — config (main branch)
 # ---------------------------------------------------------
 
 _cbox_sync_pull() {
@@ -256,11 +302,14 @@ _cbox_sync_push() {
   echo "   Retry manually: git -C \"$dir\" push"
 }
 
-# Explicit allowlist of what gets synced — only these patterns are tracked.
-# New files Claude Code might add in future will be ignored unless added here.
+# Allowlist for main branch — config only. projects/ is handled via per-project
+# history branches and is intentionally excluded here.
+# Overwritten if the old format (containing !projects/) is detected (migration).
 _cbox_sync_write_gitignore() {
   local dir="$1"
-  [[ -f "$dir/.gitignore" ]] && return 0
+  if [[ -f "$dir/.gitignore" ]] && ! grep -q "^!projects/" "$dir/.gitignore" 2>/dev/null; then
+    return 0
+  fi
   cat > "$dir/.gitignore" <<'EOF'
 # Ignore everything — only explicitly listed items are synced.
 *
@@ -275,10 +324,6 @@ _cbox_sync_write_gitignore() {
 
 # User scripts (e.g. statusline-command.sh)
 !*.sh
-
-# Project conversation history
-!projects/
-!projects/**
 
 # Plugin configuration
 !plugins/
@@ -331,7 +376,7 @@ _cbox_sync_init() {
     git -C "$dir" branch --set-upstream-to="origin/$remote_default" main 2>/dev/null || true
     git -C "$dir" rebase "origin/$remote_default" \
       || echo "⚠  Rebase had conflicts — resolve manually in $dir"
-    echo "✔ Sync initialized — pulled existing history from remote."
+    echo "✔ Sync initialized — pulled existing config from remote."
 
   else
     # Remote is empty — push local state
@@ -348,7 +393,286 @@ _cbox_sync_init() {
     fi
   fi
 
-  echo "Claude config will now sync automatically on cbox start and exit."
+  echo "Config will now sync automatically on cbox start and exit."
+  echo "Use 'cbox sync add' to opt the current project into history sync."
+}
+
+# ---------------------------------------------------------
+# sync — history (per-project branches: history/<project>/<hostname>)
+# ---------------------------------------------------------
+
+_cbox_sync_size_check() {
+  local warn_mb="${CBOX_SYNC_SIZE_WARN_MB:-500}"
+  local size_mb
+  size_mb=$(du -sm "$CBOX_CLAUDE_DIR/projects/" 2>/dev/null | awk '{print $1}')
+  [[ -z "$size_mb" ]] && return 0
+  if (( size_mb > warn_mb )); then
+    echo "⚠  Project history is ${size_mb}MB (threshold: ${warn_mb}MB)"
+    echo "   Consider: cbox sync prune --older-than 30d"
+    echo "             cbox sync compact"
+  fi
+}
+
+_cbox_sync_pull_history() {
+  local name="$1"
+  local dir="$CBOX_CLAUDE_DIR"
+  [[ -d "$dir/.git" ]] || return 0
+  command -v git >/dev/null || return 0
+  _cbox_sync_is_opted_in "$name" || return 0
+
+  local branch
+  branch=$(_cbox_history_branch "$name")
+
+  echo "Pulling history for '$name'..."
+  git -C "$dir" fetch origin \
+    "refs/heads/$branch:refs/remotes/origin/$branch" 2>/dev/null || return 0
+
+  # Extract directly to working tree — does not touch main's index
+  git -C "$dir" archive "refs/remotes/origin/$branch" \
+    | tar -x -C "$dir" 2>/dev/null || true
+}
+
+_cbox_sync_push_history() {
+  local name="$1"
+  local dir="$CBOX_CLAUDE_DIR"
+  [[ -d "$dir/.git" ]] || return 0
+  command -v git >/dev/null || return 0
+  _cbox_sync_is_opted_in "$name" || return 0
+
+  if [[ -d "$dir/.git/rebase-merge" || -d "$dir/.git/rebase-apply" ]]; then
+    echo "⚠  Rebase in progress in $dir — resolve conflicts before syncing."
+    return 1
+  fi
+
+  local project_dir
+  project_dir=$(_cbox_project_dir "$name")
+  [[ -d "$dir/projects/$project_dir" ]] || return 0
+
+  local branch
+  branch=$(_cbox_history_branch "$name")
+
+  echo "Pushing history for '$name'..."
+
+  local tmp_index="$dir/.git/cbox-history-index-$$"
+  GIT_INDEX_FILE="$tmp_index" git -C "$dir" add "projects/$project_dir/" 2>/dev/null
+  local tree
+  tree=$(GIT_INDEX_FILE="$tmp_index" git -C "$dir" write-tree 2>/dev/null)
+  rm -f "$tmp_index"
+
+  [[ -n "$tree" ]] || { echo "⚠  Failed to build history tree for '$name'."; return 1; }
+
+  local parent_args=()
+  local parent
+  parent=$(git -C "$dir" rev-parse --verify "refs/remotes/origin/$branch" 2>/dev/null)
+  [[ -n "$parent" ]] && parent_args=(-p "$parent")
+
+  local commit
+  commit=$(git -C "$dir" commit-tree "$tree" "${parent_args[@]}" \
+    -m "sync — $(hostname) — $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>/dev/null)
+
+  [[ -n "$commit" ]] || { echo "⚠  Failed to create history commit for '$name'."; return 1; }
+
+  if git -C "$dir" push origin "$commit:refs/heads/$branch" 2>&1; then
+    _cbox_sync_size_check
+    return 0
+  else
+    echo "⚠  History push failed for '$name'."
+    echo "   Retry manually: git -C \"$dir\" push origin $commit:refs/heads/$branch"
+    return 1
+  fi
+}
+
+_cbox_sync_add() {
+  local name="$1"
+  local dir="$CBOX_CLAUDE_DIR"
+  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync-init <url>"; return 1; }
+  _cbox_sync_register "$name" add
+  _cbox_sync_push_history "$name"
+  echo "✔ Project '$name' opted into history sync on this machine."
+}
+
+_cbox_sync_remove() {
+  local name="$1"
+  local dir="$CBOX_CLAUDE_DIR"
+  local branch
+  branch=$(_cbox_history_branch "$name")
+
+  _cbox_sync_register "$name" remove
+
+  if git -C "$dir" push origin --delete "$branch" 2>/dev/null; then
+    echo "✔ History for '$name' removed from remote."
+  else
+    echo "⚠  Could not delete remote branch (may not exist)."
+  fi
+  echo "   '$name' removed from history sync on this machine."
+}
+
+_cbox_sync_compact() {
+  local name="$1"
+  local dir="$CBOX_CLAUDE_DIR"
+
+  if ! _cbox_sync_is_opted_in "$name"; then
+    echo "Project '$name' is not opted into history sync. Run: cbox sync add"
+    return 1
+  fi
+
+  local project_dir branch
+  project_dir=$(_cbox_project_dir "$name")
+  branch=$(_cbox_history_branch "$name")
+
+  [[ -d "$dir/projects/$project_dir" ]] || { echo "No history found for '$name'."; return 1; }
+
+  local tmp_index="$dir/.git/cbox-compact-index-$$"
+  GIT_INDEX_FILE="$tmp_index" git -C "$dir" add "projects/$project_dir/" 2>/dev/null
+  local tree
+  tree=$(GIT_INDEX_FILE="$tmp_index" git -C "$dir" write-tree 2>/dev/null)
+  rm -f "$tmp_index"
+
+  [[ -n "$tree" ]] || { echo "⚠  Failed to build tree for compact."; return 1; }
+
+  # Orphan commit — no parent, drops all prior history on this branch
+  local commit
+  commit=$(git -C "$dir" commit-tree "$tree" \
+    -m "compact — $(hostname) — $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>/dev/null)
+
+  [[ -n "$commit" ]] || { echo "⚠  Failed to create compact commit."; return 1; }
+
+  if git -C "$dir" push --force origin "$commit:refs/heads/$branch"; then
+    echo "✔ History for '$name' compacted to a single commit."
+  else
+    echo "⚠  Compact push failed."
+    echo "   Retry: git -C \"$dir\" push --force origin $commit:refs/heads/$branch"
+  fi
+}
+
+_cbox_sync_prune() {
+  local dir="$CBOX_CLAUDE_DIR"
+  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync-init <url>"; return 1; }
+
+  local older_than_days="" size_limit_mb="" force=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --older-than) older_than_days="${2%[dD]}"; shift 2 ;;
+      --over)       size_limit_mb="${2%[mM]}";   shift 2 ;;
+      --force)      force=true; shift ;;
+      *) echo "Unknown flag: $1"; return 1 ;;
+    esac
+  done
+
+  if [[ -z "$older_than_days" && -z "$size_limit_mb" ]]; then
+    echo "Usage: cbox sync prune --older-than <N>d [--force]"
+    echo "       cbox sync prune --over <N>m [--force]"
+    return 1
+  fi
+
+  echo "Fetching remote refs..."
+  git -C "$dir" fetch origin 2>/dev/null || true
+
+  local host
+  host=$(hostname)
+  local branches=()
+
+  while IFS= read -r ref; do
+    [[ -n "$ref" ]] && branches+=("${ref#refs/heads/}")
+  done < <(git -C "$dir" ls-remote --heads origin "history/*/$host" 2>/dev/null \
+    | awk '{print $2}')
+
+  if [[ ${#branches[@]} -eq 0 ]]; then
+    echo "No history branches found for this machine."
+    return 0
+  fi
+
+  local candidates=()
+  local now_ts
+  now_ts=$(date +%s)
+
+  for branch in "${branches[@]}"; do
+    local project="${branch#history/}"
+    project="${project%/$host}"
+    local should_prune=false
+
+    if [[ -n "$older_than_days" ]]; then
+      local last_ts
+      last_ts=$(git -C "$dir" log -1 --format="%ct" \
+        "refs/remotes/origin/$branch" 2>/dev/null)
+      if [[ -n "$last_ts" ]]; then
+        local cutoff=$(( now_ts - older_than_days * 86400 ))
+        (( last_ts < cutoff )) && should_prune=true
+      fi
+    fi
+
+    if [[ -n "$size_limit_mb" ]]; then
+      local project_dir proj_mb=0
+      project_dir=$(_cbox_project_dir "$project")
+      proj_mb=$(du -sm "$dir/projects/$project_dir" 2>/dev/null | awk '{print $1}')
+      (( proj_mb > size_limit_mb )) && should_prune=true
+    fi
+
+    $should_prune && candidates+=("$branch")
+  done
+
+  if [[ ${#candidates[@]} -eq 0 ]]; then
+    echo "No branches match the prune criteria."
+    return 0
+  fi
+
+  echo "Branches to delete:"
+  for branch in "${candidates[@]}"; do
+    echo "  $branch"
+  done
+
+  if ! $force; then
+    printf "Delete %d branch(es)? [y/N] " "${#candidates[@]}"
+    read -r reply
+    [[ "$reply" =~ ^[Yy]$ ]] || { echo "Aborted."; return 0; }
+  fi
+
+  for branch in "${candidates[@]}"; do
+    if git -C "$dir" push origin --delete "$branch" 2>/dev/null; then
+      echo "✔ Deleted $branch"
+    else
+      echo "⚠  Failed to delete $branch"
+    fi
+  done
+}
+
+_cbox_sync_list() {
+  local dir="$CBOX_CLAUDE_DIR"
+  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync-init <url>"; return 1; }
+
+  echo "Fetching remote refs..."
+  git -C "$dir" fetch origin 2>/dev/null || true
+
+  local host
+  host=$(hostname)
+  local found=false
+
+  while IFS= read -r ref; do
+    found=true
+    local branch="${ref#refs/heads/}"
+    local project="${branch#history/}"
+    project="${project%/$host}"
+
+    local project_dir
+    project_dir=$(_cbox_project_dir "$project")
+
+    local last_date
+    last_date=$(git -C "$dir" log -1 --format="%ci" \
+      "refs/remotes/origin/$branch" 2>/dev/null | cut -d' ' -f1)
+
+    local size_mb="?"
+    [[ -d "$dir/projects/$project_dir" ]] && \
+      size_mb=$(du -sm "$dir/projects/$project_dir" 2>/dev/null | awk '{print $1}')
+
+    local opted=""
+    _cbox_sync_is_opted_in "$project" && opted=" ✔"
+
+    printf "  %-30s  last: %s  size: %smb%s\n" \
+      "$project" "${last_date:-?}" "$size_mb" "$opted"
+  done < <(git -C "$dir" ls-remote --heads origin "history/*/$host" 2>/dev/null \
+    | awk '{print $2}')
+
+  $found || echo "No history branches found for this machine."
 }
 
 # ---------------------------------------------------------
@@ -475,6 +799,7 @@ _cbox_enter() {
   if [[ "$command" == "claude" ]]; then
     _cbox_maybe_update "$name"
     _cbox_sync_pull
+    _cbox_sync_pull_history "$name"
   fi
 
   echo "Entering container '$name'..."
@@ -483,6 +808,7 @@ _cbox_enter() {
 
   if [[ "$command" == "claude" ]]; then
     _cbox_sync_push
+    _cbox_sync_push_history "$name"
   fi
 
   if [[ "$stop_on_exit" == "yes" ]]; then
@@ -558,6 +884,12 @@ _cbox_doctor() {
     ahead=$(git -C "$CBOX_CLAUDE_DIR" rev-list --count @{u}..HEAD 2>/dev/null || echo "?")
     behind=$(git -C "$CBOX_CLAUDE_DIR" rev-list --count HEAD..@{u} 2>/dev/null || echo "?")
     echo "  ahead: $ahead  behind: $behind"
+
+    if [[ -n "${CBOX_SYNC_PROJECTS:-}" ]]; then
+      echo "  history projects: $CBOX_SYNC_PROJECTS"
+    else
+      echo "  history projects: none (use: cbox sync add)"
+    fi
   else
     echo "ℹ sync not configured (run: cbox sync-init <remote-url>)"
   fi
@@ -636,8 +968,25 @@ cbox() {
       ;;
 
     sync)
-      _cbox_sync_pull
-      _cbox_sync_push
+      case "${2:-}" in
+        add)     _cbox_sync_add "$name" ;;
+        remove)  _cbox_sync_remove "$name" ;;
+        compact) _cbox_sync_compact "$name" ;;
+        prune)   _cbox_sync_prune "${@:3}" ;;
+        list)    _cbox_sync_list ;;
+        "")
+          _cbox_sync_pull
+          _cbox_sync_push
+          _cbox_sync_pull_history "$name"
+          _cbox_sync_push_history "$name"
+          ;;
+        *)
+          echo "Unknown sync command: ${2}"
+          echo
+          _cbox_help
+          return 1
+          ;;
+      esac
       ;;
 
     update)

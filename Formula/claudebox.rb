@@ -5,6 +5,7 @@ class Claudebox < Formula
   sha256 "PLACEHOLDER"
   license "MIT"
 
+  depends_on :macos
   depends_on "bash"
   depends_on "jq"
 

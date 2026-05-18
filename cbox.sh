@@ -132,10 +132,10 @@ _cbox_rt_label() {
   local name="$1" label="$2"
   if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
     container inspect "$name" 2>/dev/null \
-      | jq -r ".[0].configuration.labels[\"$label\"]"
+      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('configuration',{}).get('labels',{}).get('$label',''))"
   else
     docker inspect "$name" 2>/dev/null \
-      | jq -r ".[0].Config.Labels[\"$label\"]"
+      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('Config',{}).get('Labels',{}).get('$label',''))"
   fi
 }
 

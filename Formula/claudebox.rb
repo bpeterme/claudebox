@@ -8,7 +8,6 @@ class Claudebox < Formula
   head "https://github.com/bpeterme/claudebox.git", branch: "dev"
 
   depends_on :macos
-  depends_on "jq"
 
   def install
     version_str = build.head? ? `git describe --tags --always`.chomp : version.to_s

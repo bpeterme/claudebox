@@ -47,13 +47,21 @@ cbox shell     # open a zsh shell instead of Claude Code
 | `cbox safe` | Start or enter sandboxed container |
 | `cbox shell` | Open a zsh shell in the container instead of Claude Code |
 | `cbox keepalive` | Run Claude Code; keep container alive for 10 min after exit |
+
+**Container management**
+
+| Command | Description |
+|---------|-------------|
 | `cbox stop` | Stop the current project's container |
 | `cbox reset` | Remove the current project's container |
-| `cbox rebuild` | Rebuild the Docker image |
-| `cbox update` | Force-update Claude Code inside a running container |
-| `cbox doctor` | Run environment diagnostics |
+| `cbox rebuild` | Rebuild the container image |
 | `cbox list` | List all cbox containers |
-| `cbox gc` | Remove all stopped cbox containers |
+| `cbox prune` | Remove all stopped cbox containers |
+
+**Sync (cross-machine)**
+
+| Command | Description |
+|---------|-------------|
 | `cbox sync-init <url>` | Initialize cross-machine sync with a git remote |
 | `cbox sync` | Pull/push config and opted-in project history |
 | `cbox sync add` | Opt current project into history sync |
@@ -61,6 +69,14 @@ cbox shell     # open a zsh shell instead of Claude Code
 | `cbox sync compact` | Squash current project's history to a single commit |
 | `cbox sync prune [--all]` | Delete old/oversized history branches from remote |
 | `cbox sync list` | List all synced projects with sizes and last-push date |
+
+**Maintenance**
+
+| Command | Description |
+|---------|-------------|
+| `cbox update` | Force-update Claude Code inside a running container |
+| `cbox doctor` | Run environment diagnostics |
+| `cbox version` | Show the sourced version |
 
 ## Cross-Machine Sync
 

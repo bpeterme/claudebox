@@ -68,7 +68,7 @@ CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-/tmp/cbox-$(id -un)}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-_CBOX_VERSION="0.1.0"
+_CBOX_VERSION="0.1.1"
 
 if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
   _CBOX_CMD="container"
@@ -153,7 +153,7 @@ _cbox_generate_claude_json() {
 
   [[ -f "$claude_json" ]] && return 0
 
-  echo "{\"hasCompletedOnboarding\":true,\"installMethod\":\"native\",\"projects\":{\"/Workspace/$name\":{\"hasTrustDialogAccepted\":true}}}" \
+  echo "{\"hasCompletedOnboarding\":true,\"installMethod\":\"npm\",\"projects\":{\"/Workspace/$name\":{\"hasTrustDialogAccepted\":true}}}" \
     > "$claude_json"
 }
 

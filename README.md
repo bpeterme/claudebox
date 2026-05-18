@@ -194,7 +194,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_IMAGE` | `claudebox` | Docker image name |
 | `CBOX_LABEL` | `cbox.project=true` | Label applied to all cbox containers |
 | `CBOX_KEEPALIVE_SECONDS` | `600` | Seconds container stays alive before auto-stop in keepalive mode |
-| `CBOX_DATA_DIR` | `~/.local/share/cbox` | Per-project container config files (`.claude-<name>.json`), one per project |
+| `CBOX_DATA_DIR` | `~/.local/share/claudebox` | Per-project container config files (`.claude-<name>.json`), one per project |
 | `CBOX_CLAUDE_DIR` | `~/.claude` | Claude Code config, mounted as `~/.claude` (read-write; read-only in safe mode) |
 | `CBOX_HOST_CONFIG_DIR` | `~/.config` | Host config dir, mounted as `~/.config` in container (normal mode, read-write) |
 | `CBOX_SHARE_DIR` | `/tmp/cbox-<user>` | Share folder, mounted as `~/share` in container; cleared on exit (read-write) |
@@ -214,7 +214,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 # CBOX_KEEPALIVE_SECONDS=600
 
 # ── host paths ────────────────────────────────────────────────────────────────
-# CBOX_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/cbox"
+# CBOX_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/claudebox"
 # CBOX_CLAUDE_DIR="$HOME/.claude"
 # CBOX_HOST_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
 # CBOX_SHARE_DIR="/tmp/cbox-$USER"

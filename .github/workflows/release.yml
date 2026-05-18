@@ -6,7 +6,7 @@ on:
 
 jobs:
   release:
-    name: Create GitHub release and bump version on dev
+    name: Stamp CalVer, tag, and create GitHub release
     runs-on: ubuntu-latest
     if: github.actor != 'github-actions[bot]'
     permissions:
@@ -16,31 +16,38 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Read version
+      - name: Compute CalVer version
         id: version
-        run: echo "value=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+        run: |
+          today=$(date -u +%Y.%m.%d)
+          highest=$(git tag -l "${today}.*" | sed "s/^${today}\.//" | sort -n | tail -1)
+          if [[ -z "$highest" ]]; then
+            n=0
+          else
+            n=$((highest + 1))
+          fi
+          echo "value=${today}.${n}" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp version into files
+        run: |
+          version="${{ steps.version.outputs.value }}"
+          echo "$version" > VERSION
+          sed -i "s/^_CBOX_VERSION=\"[^\"]*\"/_CBOX_VERSION=\"$version\"/" cbox.sh
+
+      - name: Commit and push version stamp
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add VERSION cbox.sh
+          git commit -m "Release ${{ steps.version.outputs.value }}"
+          git tag "${{ steps.version.outputs.value }}"
+          git push origin main --follow-tags
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v${{ steps.version.outputs.value }}" \
-            --title "v${{ steps.version.outputs.value }}" \
+          gh release create "${{ steps.version.outputs.value }}" \
+            --title "${{ steps.version.outputs.value }}" \
             --generate-notes \
             --latest
-
-      - name: Bump minor version on dev
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin dev
-          git checkout dev
-          version=$(cat VERSION)
-          major=$(echo "$version" | cut -d. -f1)
-          minor=$(echo "$version" | cut -d. -f2)
-          new_version="$major.$((minor + 1)).0"
-          echo "$new_version" > VERSION
-          sed -i "s/^_CBOX_VERSION=\"[^\"]*\"/_CBOX_VERSION=\"$new_version\"/" cbox.sh
-          git add VERSION cbox.sh
-          git commit -m "Bump minor version to $new_version"
-          git push origin dev

@@ -1,15 +1,2 @@
 #!/bin/sh
-# Bump patch version on every commit and embed into cbox.sh.
-# Minor version bump on merge to main is handled by the release workflow.
-
-[ -f VERSION ] || exit 0
-
-version=$(cat VERSION)
-major=$(echo "$version" | cut -d. -f1)
-minor=$(echo "$version" | cut -d. -f2)
-patch=$(echo "$version" | cut -d. -f3)
-
-new_version="$major.$minor.$((patch + 1))"
-printf '%s\n' "$new_version" > VERSION
-sed -i.bak "s/^_CBOX_VERSION=\"[^\"]*\"/_CBOX_VERSION=\"$new_version\"/" cbox.sh && rm -f cbox.sh.bak
-git add VERSION cbox.sh
+# Version stamping is handled by the release workflow on merge to main.

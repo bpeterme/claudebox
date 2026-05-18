@@ -85,9 +85,11 @@ if [[ ! -f "$_CBOX_BUILD_DIR/dockerfile" ]]; then
   unset _cbox_share
 fi
 _CBOX_VERSION="dev"
-_v=$(git -C "$(dirname "${BASH_SOURCE[0]}")" describe --tags --always 2>/dev/null)
-[[ -n "$_v" ]] && _CBOX_VERSION="$_v"
-unset _v
+if [[ "$_CBOX_VERSION" == "dev" ]]; then
+  _v=$(git -C "$(dirname "${BASH_SOURCE[0]}")" describe --tags --always 2>/dev/null)
+  [[ -n "$_v" ]] && _CBOX_VERSION="$_v"
+  unset _v
+fi
 
 if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
   _CBOX_CMD="container"

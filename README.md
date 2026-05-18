@@ -1,14 +1,14 @@
 # claudebox
 
-A shell utility that runs [Claude Code](https://github.com/anthropics/claude-code) inside an isolated Docker container, scoped to your current project directory.
+A shell utility that runs [Claude Code](https://github.com/anthropics/claude-code) inside an isolated container, scoped to your current project directory. Uses [Apple Container](https://github.com/apple/containerization) on macOS and Docker on Linux.
 
 Each project gets its own container, named after the directory. Two modes are available: **normal** (full access to your Claude config and SSH keys) and **safe** (sandboxed with dropped capabilities, memory/CPU limits, and an isolated network).
 
-**Machine independent by design.** Conversation history and project memory live in `CBOX_CLAUDE_DIR/projects/` with path names scoped to the container — not the host machine. Point any machine at the same git remote and your full history follows you. Authentication is automatic: credentials are mounted from the host, so no re-authentication is needed inside the container.
+**Machine independent by design.** Claude config and per-project conversation history can sync across machines via a private git remote. Config (settings, keybindings, global instructions) syncs automatically; project history is opt-in per project. Authentication is automatic: credentials are mounted from the host, so no re-authentication is needed inside the container.
 
 ## Prerequisites
 
-- Docker (Linux/macOS) or [Apple Container](https://github.com/apple/containerization) (macOS)
+- [Apple Container](https://github.com/apple/containerization) (macOS) or Docker (Linux)
 - `jq`
 - `bash` or `zsh`
 
@@ -55,28 +55,41 @@ cbox shell     # open a zsh shell instead of Claude Code
 | `cbox list` | List all cbox containers |
 | `cbox gc` | Remove all stopped cbox containers |
 | `cbox sync-init <url>` | Initialize cross-machine sync with a git remote |
-| `cbox sync` | Pull and push project history manually |
+| `cbox sync` | Pull/push config and opted-in project history |
+| `cbox sync add` | Opt current project into history sync |
+| `cbox sync remove` | Stop syncing history for the current project |
+| `cbox sync compact` | Squash current project's history to a single commit |
+| `cbox sync prune [--all]` | Delete old/oversized history branches from remote |
+| `cbox sync list` | List all synced projects with sizes and last-push date |
 
 ## Cross-Machine Sync
 
-claudebox can sync your Claude config directory (`CBOX_CLAUDE_DIR`, default `~/.claude`) across machines using a private git remote. claudebox pulls before each session and pushes after it exits.
+claudebox syncs your Claude config directory (`CBOX_CLAUDE_DIR`, default `~/.claude`) across machines using a private git remote. Config sync is automatic; project conversation history is opt-in per project.
 
-### What gets synced
+### Architecture
 
-Only an explicit allowlist is tracked — everything else in `~/.claude` is ignored. This keeps the sync lean and future-proof: new files that Claude Code might add will not be captured unless deliberately added to the list.
+Two types of branches are used in the same remote repository:
 
-| Synced | Description |
-|--------|-------------|
+| Branch | Contents | When updated |
+|--------|----------|--------------|
+| `main` | Config files (see table below) | Every session automatically |
+| `history/<project>/<hostname>` | Conversation history for one project on one machine | Only when opted in with `cbox sync add` |
+
+History branches are never checked out — they are written and read via git plumbing, so they never interfere with the config on `main`.
+
+### What gets synced to `main`
+
+Only an explicit allowlist is tracked — everything else in `~/.claude` is ignored. This keeps config sync lean and future-proof.
+
+| File/folder | Description |
+|-------------|-------------|
 | `settings.json` | Permissions, hooks, model preferences |
 | `CLAUDE.md` | Global instructions |
 | `keybindings.json` | Keyboard shortcuts |
 | `*.sh` | User scripts (e.g. `statusline-command.sh`) |
-| `projects/` | Conversation history and project memory |
 | `plugins/` | Plugin/marketplace configuration |
 
-**Never synced:** `.credentials.json`, `backups/`, `cache/`, `sessions/`, `session-env/`, `shell-snapshots/`, `mcp-needs-auth-cache.json`, and anything else not in the list above.
-
-The project folder names are derived from the container workspace path (e.g. `-Workspace-myproject`), which is identical on every machine — making conversation history portable without any path translation.
+**Never synced to `main`:** `.credentials.json`, `projects/` (conversation history), `backups/`, `cache/`, `sessions/`, and anything else not in the list above.
 
 ### Setup
 
@@ -86,7 +99,37 @@ Create a **private** empty repository on GitHub (or any git host), then run:
 cbox sync-init git@github.com:you/claude-sync.git
 ```
 
-That's it. From this point on, sync is automatic — no extra steps on your other machines beyond running the same command with the same remote URL.
+Config sync is now active. Run the same command on your other machines to connect them.
+
+### Opt in a project to history sync
+
+Navigate to the project directory and opt it in:
+
+```bash
+cd ~/my-project
+cbox sync add
+```
+
+From that point on, claudebox pulls history before each session and pushes it after. History is stored on a branch named `history/my-project/<hostname>`, so each machine's history is independent and separately prunable.
+
+To stop syncing a project's history and delete the remote branch:
+
+```bash
+cbox sync remove
+```
+
+### Managing history size
+
+Conversation history can grow large over time. claudebox warns when total history exceeds 500 MB (configurable via `CBOX_SYNC_SIZE_WARN_MB`).
+
+```bash
+cbox sync list                        # show all projects, sizes, and last-push date
+cbox sync compact                     # squash all commits to one (frees git history, keeps files)
+cbox sync prune --older-than 30d      # delete current project's remote branch if last push > 30 days ago
+cbox sync prune --all --over 200m     # delete any project branch on this machine over 200 MB
+```
+
+`prune` operates on the current project by default. Pass `--all` to sweep all projects on this machine. Without `--force`, it always shows candidates and asks for confirmation before deleting.
 
 ### How it handles conflicts
 
@@ -95,6 +138,17 @@ That's it. From this point on, sync is automatic — no extra steps on your othe
 - `settings.json` is structured JSON — if the same key diverges on two machines, git will flag a conflict that must be resolved manually.
 - If a rebase fails for any reason, the local commit is preserved and a clear message tells you exactly what to run to resolve it manually.
 - `cbox doctor` shows sync status (remote URL, commits ahead/behind) at a glance.
+
+### Safe mode and sync
+
+In safe mode (`cbox safe`), claudebox pulls config from `main` but performs no writes and no history sync. This matches the read-only nature of the safe mode mount.
+
+| Operation | Normal | Safe |
+|-----------|--------|------|
+| Pull config (`main`) | ✔ | ✔ |
+| Push config (`main`) | ✔ | — |
+| Pull project history | ✔ | — |
+| Push project history | ✔ | — |
 
 ### What not to use
 
@@ -132,6 +186,8 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_ZSHRC` | *(unset)* | `.zshrc` to source as `~/.zshrc.global` inside the container (**read-only**); unset = none |
 | `CBOX_BUILD_DIR` | cbox.sh directory | Build context for `cbox rebuild` |
 | `BUILD_PLAYWRIGHT` | `0` | Set to `1` to include Playwright + Chromium in the image |
+| `CBOX_SYNC_SIZE_WARN_MB` | `500` | Warn when total history size exceeds this threshold (MB) |
+| `CBOX_SYNC_PROJECTS` | *(managed automatically)* | Space-separated list of projects opted into history sync; managed by `cbox sync add/remove` |
 
 ### `~/.config/claudebox/cbox.env` template
 
@@ -145,6 +201,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 # CBOX_ZSHRC="$HOME/.zshrc"   # unset = none
 # CBOX_BUILD_DIR="$HOME/claudebox"
 # BUILD_PLAYWRIGHT=0
+# CBOX_SYNC_SIZE_WARN_MB=500
 ```
 
 ## Container Image

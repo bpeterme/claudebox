@@ -38,7 +38,7 @@ Sync (cross-machine):
   cbox sync add         Opt current project into history sync
   cbox sync remove      Stop syncing history for current project
   cbox sync compact     Squash current project's history to one commit
-  cbox sync prune       Remove old/oversized history branches from remote
+  cbox sync prune [--all]  Remove old/oversized history branches (default: current project)
   cbox sync list        List projects with history sync and sizes
 
 Maintenance:
@@ -75,7 +75,7 @@ CBOX_SYNC_PROJECTS="${CBOX_SYNC_PROJECTS:-}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-_CBOX_VERSION="0.1.5"
+_CBOX_VERSION="0.1.6"
 
 if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
   _CBOX_CMD="container"
@@ -546,12 +546,14 @@ _cbox_sync_compact() {
 }
 
 _cbox_sync_prune() {
+  local name="$1"; shift
   local dir="$CBOX_CLAUDE_DIR"
   [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync-init <url>"; return 1; }
 
-  local older_than_days="" size_limit_mb="" force=false
+  local older_than_days="" size_limit_mb="" force=false all_projects=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --all)        all_projects=true; shift ;;
       --older-than) older_than_days="${2%[dD]}"; shift 2 ;;
       --over)       size_limit_mb="${2%[mM]}";   shift 2 ;;
       --force)      force=true; shift ;;
@@ -562,23 +564,31 @@ _cbox_sync_prune() {
   if [[ -z "$older_than_days" && -z "$size_limit_mb" ]]; then
     echo "Usage: cbox sync prune --older-than <N>d [--force]"
     echo "       cbox sync prune --over <N>m [--force]"
+    echo "       add --all to operate on all projects on this machine"
     return 1
   fi
 
   echo "Fetching remote refs..."
   git -C "$dir" fetch origin 2>/dev/null || true
 
-  local host
-  host=$(hostname)
+  local host; host=$(hostname)
   local branches=()
 
-  while IFS= read -r ref; do
-    [[ -n "$ref" ]] && branches+=("${ref#refs/heads/}")
-  done < <(git -C "$dir" ls-remote --heads origin "history/*/$host" 2>/dev/null \
-    | awk '{print $2}')
+  if $all_projects; then
+    while IFS= read -r ref; do
+      [[ -n "$ref" ]] && branches+=("${ref#refs/heads/}")
+    done < <(git -C "$dir" ls-remote --heads origin "history/*/$host" 2>/dev/null \
+      | awk '{print $2}')
+  else
+    local branch; branch=$(_cbox_history_branch "$name")
+    local ref
+    ref=$(git -C "$dir" ls-remote origin "refs/heads/$branch" 2>/dev/null | awk '{print $2}')
+    [[ -n "$ref" ]] && branches+=("$branch")
+  fi
 
   if [[ ${#branches[@]} -eq 0 ]]; then
-    echo "No history branches found for this machine."
+    $all_projects && echo "No history branches found for this machine." \
+      || echo "No history branch found for project '$name'. Run: cbox sync add"
     return 0
   fi
 
@@ -974,7 +984,7 @@ cbox() {
         add)     _cbox_sync_add "$name" ;;
         remove)  _cbox_sync_remove "$name" ;;
         compact) _cbox_sync_compact "$name" ;;
-        prune)   _cbox_sync_prune "${@:3}" ;;
+        prune)   _cbox_sync_prune "$name" "${@:3}" ;;
         list)    _cbox_sync_list ;;
         "")
           _cbox_sync_pull

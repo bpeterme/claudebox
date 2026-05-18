@@ -68,7 +68,7 @@ CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-/tmp/cbox-$(id -un)}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-_CBOX_VERSION="0.1.1"
+_CBOX_VERSION="0.1.2"
 
 if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
   _CBOX_CMD="container"
@@ -223,6 +223,12 @@ _cbox_sync_push() {
   [[ -d "$dir/.git" ]] || return 0
   command -v git >/dev/null || return 0
 
+  # Bail if a rebase is in progress (unresolved pull conflict)
+  if [[ -d "$dir/.git/rebase-merge" || -d "$dir/.git/rebase-apply" ]]; then
+    echo "⚠  Rebase in progress in $dir — resolve conflicts before syncing."
+    return 1
+  fi
+
   # Only push if a remote is configured
   git -C "$dir" remote get-url origin >/dev/null 2>&1 || return 0
 
@@ -237,20 +243,24 @@ _cbox_sync_push() {
     return 0
   fi
 
-  # Push was rejected — rebase on remote and retry once
-  echo "Push rejected, rebasing..."
-  if git -C "$dir" pull --rebase && git -C "$dir" push; then
-    echo "✔ Synced (after rebase)"
-  else
-    echo "⚠  Sync push failed — changes saved locally."
-    echo "   Retry manually: git -C \"$dir\" push"
+  # Only retry if an upstream tracking branch is configured (genuine rejection)
+  if git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name @{u} >/dev/null 2>&1; then
+    echo "Push rejected, rebasing..."
+    if git -C "$dir" pull --rebase && git -C "$dir" push; then
+      echo "✔ Synced (after rebase)"
+      return 0
+    fi
   fi
+
+  echo "⚠  Sync push failed — changes saved locally."
+  echo "   Retry manually: git -C \"$dir\" push"
 }
 
 # Explicit allowlist of what gets synced — only these patterns are tracked.
 # New files Claude Code might add in future will be ignored unless added here.
 _cbox_sync_write_gitignore() {
   local dir="$1"
+  [[ -f "$dir/.gitignore" ]] && return 0
   cat > "$dir/.gitignore" <<'EOF'
 # Ignore everything — only explicitly listed items are synced.
 *
@@ -305,17 +315,21 @@ _cbox_sync_init() {
     git -C "$dir" remote add origin "$remote"
   fi
 
-  # Check whether the remote already has a main branch (second-machine setup)
-  if git -C "$dir" fetch origin 2>/dev/null \
-      && git -C "$dir" ls-remote --exit-code origin main >/dev/null 2>&1; then
+  # Detect whether the remote has history and what its default branch is
+  local remote_default=""
+  if git -C "$dir" fetch origin 2>/dev/null; then
+    remote_default=$(git -C "$dir" ls-remote --symref origin HEAD 2>/dev/null \
+      | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2; exit}')
+  fi
 
+  if [[ -n "$remote_default" ]]; then
     # Remote has history — commit any local state, then rebase on top of remote
     git -C "$dir" add -A
-    if ! git -C "$dir" diff --cached --quiet 2>/dev/null; then
+    if [[ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]]; then
       git -C "$dir" commit -m "local state before initial sync — $(hostname)"
     fi
-    git -C "$dir" branch --set-upstream-to=origin/main main 2>/dev/null || true
-    git -C "$dir" rebase origin/main \
+    git -C "$dir" branch --set-upstream-to="origin/$remote_default" main 2>/dev/null || true
+    git -C "$dir" rebase "origin/$remote_default" \
       || echo "⚠  Rebase had conflicts — resolve manually in $dir"
     echo "✔ Sync initialized — pulled existing history from remote."
 

@@ -194,6 +194,8 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CBOX_IMAGE` | `claudebox` | Docker image name |
+| `CBOX_LABEL` | `cbox.project=true` | Label applied to all cbox containers |
+| `CBOX_KEEPALIVE_SECONDS` | `600` | Seconds container stays alive before auto-stop in keepalive mode |
 | `CBOX_DATA_DIR` | `~/.local/share/cbox` | Per-project container config files (`.claude-<name>.json`), one per project |
 | `CBOX_CLAUDE_DIR` | `~/.claude` | Claude Code config, mounted as `~/.claude` (read-write; read-only in safe mode) |
 | `CBOX_HOST_CONFIG_DIR` | `~/.config` | Host config dir, mounted as `~/.config` in container (normal mode, read-write) |

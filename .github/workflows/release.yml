@@ -6,32 +6,19 @@ on:
 
 jobs:
   release:
-    name: Bump version and create GitHub release
+    name: Create GitHub release and bump version on dev
     runs-on: ubuntu-latest
     if: github.actor != 'github-actions[bot]'
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
-      - name: Bump minor version
+      - name: Read version
         id: version
-        run: |
-          version=$(cat VERSION)
-          major=$(echo "$version" | cut -d. -f1)
-          minor=$(echo "$version" | cut -d. -f2)
-          new_version="$major.$((minor + 1)).0"
-          echo "$new_version" > VERSION
-          sed -i "s/^_CBOX_VERSION=\"[^\"]*\"/_CBOX_VERSION=\"$new_version\"/" cbox.sh
-          echo "value=$new_version" >> "$GITHUB_OUTPUT"
-
-      - name: Commit and push version bump
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add VERSION cbox.sh
-          git commit -m "Release v${{ steps.version.outputs.value }}"
-          git push
+        run: echo "value=$(cat VERSION)" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub release
         env:
@@ -41,3 +28,19 @@ jobs:
             --title "v${{ steps.version.outputs.value }}" \
             --generate-notes \
             --latest
+
+      - name: Bump minor version on dev
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin dev
+          git checkout dev
+          version=$(cat VERSION)
+          major=$(echo "$version" | cut -d. -f1)
+          minor=$(echo "$version" | cut -d. -f2)
+          new_version="$major.$((minor + 1)).0"
+          echo "$new_version" > VERSION
+          sed -i "s/^_CBOX_VERSION=\"[^\"]*\"/_CBOX_VERSION=\"$new_version\"/" cbox.sh
+          git add VERSION cbox.sh
+          git commit -m "Bump minor version to $new_version"
+          git push origin dev

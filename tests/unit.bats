@@ -132,10 +132,10 @@ setup() {
 # _cbox_history_branch
 # ---------------------------------------------------------------------------
 
-@test "_cbox_history_branch: returns history/<name>/<hostname>" {
+@test "_cbox_history_branch: returns history/<name>/<user>@<host>" {
   run _cbox_history_branch "myproject"
   [ "$status" -eq 0 ]
-  [ "$output" = "history/myproject/$(hostname)" ]
+  [ "$output" = "history/myproject/${USER}@$(hostname -s)" ]
 }
 
 # ---------------------------------------------------------------------------

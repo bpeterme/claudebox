@@ -10,6 +10,7 @@ class Claudebox < Formula
   depends_on "jq"
 
   def install
+    inreplace "cbox.sh", '_CBOX_VERSION="dev"', "_CBOX_VERSION=\"#{version}\""
     bin.install "cbox.sh" => "cbox"
     (share/"claudebox").install "dockerfile"
   end

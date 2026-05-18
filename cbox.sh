@@ -46,7 +46,7 @@ Sync (cross-machine):
 Maintenance:
   cbox update           Force Claude Code update
   cbox doctor           Run environment diagnostics
-  cbox version          Show sourced commit hash
+  cbox version          Show version
 
 Help:
   cbox help

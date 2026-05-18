@@ -16,6 +16,8 @@ class Claudebox < Formula
 
   def caveats
     <<~EOS
+      claudebox requires Apple Container (macOS) or Docker to run containers.
+
       Build the container image before first use:
         cbox rebuild
     EOS

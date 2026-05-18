@@ -19,7 +19,7 @@ Each project gets its own container, named after the directory. Two modes are av
 ```bash
 brew tap bpeterme/claudebox
 brew install claudebox
-cbox rebuild
+cbox --help
 ```
 
 ### Manual

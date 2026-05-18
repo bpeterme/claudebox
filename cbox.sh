@@ -75,7 +75,7 @@ CBOX_SYNC_PROJECTS="${CBOX_SYNC_PROJECTS:-}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-_CBOX_VERSION="0.1.4"
+_CBOX_VERSION="0.1.5"
 
 if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
   _CBOX_CMD="container"
@@ -800,12 +800,8 @@ _cbox_enter() {
 
   if [[ "$command" == "claude" ]]; then
     _cbox_maybe_update "$name"
-    if [[ "$mode" != "safe" ]]; then
-      _cbox_sync_pull
-      _cbox_sync_pull_history "$name"
-    else
-      echo "ℹ  Sync disabled in safe mode."
-    fi
+    _cbox_sync_pull
+    [[ "$mode" != "safe" ]] && _cbox_sync_pull_history "$name"
   fi
 
   echo "Entering container '$name'..."

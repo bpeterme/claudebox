@@ -769,7 +769,25 @@ _cbox_create() {
   fi
 
   if [[ "$mode" == "normal" ]]; then
-    [[ -n "${CBOX_SSH_DIR:-}" ]] && args+=(-v "$CBOX_SSH_DIR:/home/claude/.ssh:ro")
+    if [[ -n "${CBOX_SSH_DIR:-}" ]]; then
+      args+=(-v "$CBOX_SSH_DIR:/home/claude/.ssh:ro")
+      # If no config exists, generate one so non-standard key names are discovered.
+      # Mounted as a separate file at ~/.ssh/config — overrides the ro directory mount.
+      if [[ ! -f "$CBOX_SSH_DIR/config" ]]; then
+        local _ssh_cfg="$CBOX_DATA_DIR/.ssh_config"
+        {
+          echo "Host *"
+          while IFS= read -r _key; do
+            echo "  IdentityFile /home/claude/.ssh/$(basename "$_key")"
+          done < <(find "$CBOX_SSH_DIR" -maxdepth 1 -type f \
+            ! -name "*.pub" ! -name "known_hosts" ! -name "known_hosts.old" \
+            ! -name "authorized_keys" ! -name "config" 2>/dev/null | sort)
+        } > "$_ssh_cfg"
+        chmod 600 "$_ssh_cfg"
+        args+=(-v "$_ssh_cfg:/home/claude/.ssh/config:ro")
+        unset _ssh_cfg _key
+      fi
+    fi
     args+=(
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude"
       -v "$CBOX_HOST_CONFIG_DIR:/home/claude/.config"

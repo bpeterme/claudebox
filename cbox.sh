@@ -415,7 +415,10 @@ _cbox_sync_init() {
   _cbox_sync_exclude_symlinks
 
   if git -C "$dir" remote get-url origin >/dev/null 2>&1; then
+    local old_remote
+    old_remote=$(git -C "$dir" remote get-url origin 2>/dev/null)
     git -C "$dir" remote set-url origin "$remote"
+    [[ "$old_remote" != "$remote" ]] && echo "Re-initializing sync (was: $old_remote)"
   else
     git -C "$dir" remote add origin "$remote"
   fi
@@ -521,10 +524,10 @@ _cbox_sync_unlink() {
   if [[ -f "$config" ]] && grep -q "^CBOX_SYNC_PROJECTS=" "$config"; then
     local tmp
     tmp=$(mktemp)
-    grep -v "^CBOX_SYNC_PROJECTS=" "$config" > "$tmp"
+    grep -v "^CBOX_SYNC_PROJECTS=" "$config" > "$tmp" || true
     mv "$tmp" "$config"
-    CBOX_SYNC_PROJECTS=""
   fi
+  CBOX_SYNC_PROJECTS=""
 
   echo "✔ Sync unlinked. Config files remain at $dir"
   echo "  Run 'cbox sync init <url>' to set up sync again."
@@ -556,10 +559,19 @@ _cbox_sync_pull_history() {
   local branch
   branch=$(_cbox_history_branch "$name")
 
-  echo "Pulling history for '$name'..."
+  local before
+  before=$(git -C "$dir" rev-parse --verify "refs/remotes/origin/$branch" 2>/dev/null || true)
+
   git -C "$dir" fetch origin \
     "refs/heads/$branch:refs/remotes/origin/$branch" 2>/dev/null || return 0
 
+  local after
+  after=$(git -C "$dir" rev-parse --verify "refs/remotes/origin/$branch" 2>/dev/null || true)
+
+  # Branch doesn't exist on remote, or nothing new since last pull
+  [[ -z "$after" || "$before" == "$after" ]] && return 0
+
+  echo "Pulling history for '$name'..."
   # Extract directly to working tree — does not touch main's index
   git -C "$dir" archive "refs/remotes/origin/$branch" \
     | tar -x -C "$dir" 2>/dev/null || true
@@ -598,6 +610,15 @@ _cbox_sync_push_history() {
   local parent
   parent=$(git -C "$dir" rev-parse --verify "refs/remotes/origin/$branch" 2>/dev/null)
   [[ -n "$parent" ]] && parent_args=(-p "$parent")
+
+  # Skip if history hasn't changed since last push
+  if [[ -n "$parent" ]]; then
+    local parent_tree
+    parent_tree=$(git -C "$dir" rev-parse "${parent}^{tree}" 2>/dev/null)
+    [[ "$tree" == "$parent_tree" ]] && return 0
+  fi
+
+  echo "Pushing history for '$name'..."
 
   local commit
   commit=$(git -C "$dir" commit-tree "$tree" "${parent_args[@]}" \

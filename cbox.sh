@@ -627,6 +627,13 @@ _cbox_sync_add() {
 _cbox_sync_remove() {
   local name="$1"
   local dir="$CBOX_CLAUDE_DIR"
+  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync init <url>"; return 1; }
+
+  if ! _cbox_sync_is_opted_in "$name"; then
+    echo "Project '$name' is not opted into history sync."
+    return 1
+  fi
+
   local branch
   branch=$(_cbox_history_branch "$name")
 

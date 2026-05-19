@@ -507,7 +507,7 @@ _cbox_sync_unlink() {
       echo "Their local history branches will be deleted with the repo."
       echo ""
     fi
-    echo "Your config files will not be touched."
+    echo "Your config files will not be touched (only sync metadata is removed)."
     echo ""
     printf "Continue? [y/N] "
     read -r reply
@@ -515,6 +515,17 @@ _cbox_sync_unlink() {
   fi
 
   rm -rf "$dir/.git"
+  rm -f "$dir/.gitignore"
+
+  local config="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
+  if [[ -f "$config" ]] && grep -q "^CBOX_SYNC_PROJECTS=" "$config"; then
+    local tmp
+    tmp=$(mktemp)
+    grep -v "^CBOX_SYNC_PROJECTS=" "$config" > "$tmp"
+    mv "$tmp" "$config"
+    CBOX_SYNC_PROJECTS=""
+  fi
+
   echo "✔ Sync unlinked. Config files remain at $dir"
   echo "  Run 'cbox sync init <url>' to set up sync again."
 }

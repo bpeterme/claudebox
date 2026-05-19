@@ -335,9 +335,10 @@ _cbox_sync_push() {
   # Only push if a remote is configured
   git -C "$dir" remote get-url origin >/dev/null 2>&1 || return 0
 
-  # Exclude local symlinks before staging — they contain machine-specific paths
-  _cbox_sync_exclude_symlinks
   git -C "$dir" add -A
+  # Un-stage any symlinks — .gitignore allowlist overrides info/exclude so we
+  # must remove them from the index after staging, not before
+  _cbox_sync_exclude_symlinks
 
   # Nothing new to commit
   git -C "$dir" diff --cached --quiet && return 0
@@ -433,6 +434,7 @@ _cbox_sync_init() {
   if [[ -n "$remote_default" ]]; then
     # Remote has history — commit any local state, then rebase on top of remote
     git -C "$dir" add -A
+    _cbox_sync_exclude_symlinks
     if [[ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]]; then
       git -C "$dir" commit -m "local state before initial sync — $(_cbox_machine_id)"
     fi
@@ -471,6 +473,7 @@ _cbox_sync_init() {
   else
     # Remote is empty — push local state
     git -C "$dir" add -A
+    _cbox_sync_exclude_symlinks
     if ! git -C "$dir" diff --cached --quiet 2>/dev/null \
         || ! git -C "$dir" log -1 >/dev/null 2>&1; then
       git -C "$dir" commit --allow-empty -m "initial sync — $(_cbox_machine_id)"

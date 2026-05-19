@@ -1156,6 +1156,8 @@ cbox() {
         prune)   _cbox_sync_prune "$name" "${@:3}" ;;
         list)    _cbox_sync_list ;;
         "")
+          [[ -d "$CBOX_CLAUDE_DIR/.git" ]] \
+            || { echo "Sync not initialized. Run: cbox sync init <url>"; return 1; }
           _cbox_sync_pull
           _cbox_sync_push
           _cbox_sync_pull_history "$name"

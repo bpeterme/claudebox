@@ -35,7 +35,8 @@ Container Management:
   cbox prune            Remove stopped cbox containers
 
 Sync (cross-machine):
-  cbox sync-init <url>  Initialize config sync with a git remote
+  cbox sync init <url>  Initialize config sync with a git remote
+  cbox sync unlink      Remove sync remote and deinit local git state
   cbox sync             Pull and push config + opted-in project history
   cbox sync add         Opt current project into history sync
   cbox sync remove      Stop syncing history for current project
@@ -354,7 +355,7 @@ _cbox_sync_init() {
   local dir="$CBOX_CLAUDE_DIR"
 
   if [[ -z "$remote" ]]; then
-    echo "Usage: cbox sync-init <remote-url>"
+    echo "Usage: cbox sync init <remote-url>"
     return 1
   fi
 
@@ -440,6 +441,41 @@ _cbox_sync_init() {
 
   echo "Config will now sync automatically on cbox start and exit."
   echo "Use 'cbox sync add' to opt the current project into history sync."
+}
+
+_cbox_sync_unlink() {
+  local dir="$CBOX_CLAUDE_DIR"
+  local force=""
+  [[ "${1:-}" == "--force" ]] && force=1
+
+  if [[ ! -d "$dir/.git" ]]; then
+    echo "Sync is not initialized — nothing to unlink."
+    return 0
+  fi
+
+  local remote
+  remote=$(git -C "$dir" remote get-url origin 2>/dev/null || echo "none")
+
+  if [[ -z "$force" ]]; then
+    echo "This will remove the local sync git repo at:"
+    echo "  $dir/.git"
+    echo "Remote: $remote"
+    echo ""
+    if [[ -n "${CBOX_SYNC_PROJECTS:-}" ]]; then
+      echo "Projects currently opted in: $CBOX_SYNC_PROJECTS"
+      echo "Their local history branches will be deleted with the repo."
+      echo ""
+    fi
+    echo "Your config files will not be touched."
+    echo ""
+    printf "Continue? [y/N] "
+    read -r reply
+    [[ "$reply" =~ ^[Yy]$ ]] || { echo "Aborted."; return 0; }
+  fi
+
+  rm -rf "$dir/.git"
+  echo "✔ Sync unlinked. Config files remain at $dir"
+  echo "  Run 'cbox sync init <url>' to set up sync again."
 }
 
 # ---------------------------------------------------------
@@ -530,7 +566,7 @@ _cbox_sync_push_history() {
 _cbox_sync_add() {
   local name="$1"
   local dir="$CBOX_CLAUDE_DIR"
-  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync-init <url>"; return 1; }
+  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync init <url>"; return 1; }
   _cbox_sync_register "$name" add
   _cbox_sync_push_history "$name"
   echo "✔ Project '$name' opted into history sync on this machine."
@@ -593,7 +629,7 @@ _cbox_sync_compact() {
 _cbox_sync_prune() {
   local name="$1"; shift
   local dir="$CBOX_CLAUDE_DIR"
-  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync-init <url>"; return 1; }
+  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync init <url>"; return 1; }
 
   local older_than_days="" size_limit_mb="" force=false all_projects=false
   while [[ $# -gt 0 ]]; do
@@ -693,7 +729,7 @@ _cbox_sync_prune() {
 
 _cbox_sync_list() {
   local dir="$CBOX_CLAUDE_DIR"
-  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync-init <url>"; return 1; }
+  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync init <url>"; return 1; }
 
   echo "Fetching remote refs..."
   git -C "$dir" fetch origin 2>/dev/null || true
@@ -977,7 +1013,7 @@ _cbox_doctor() {
       echo "  history projects: none (use: cbox sync add)"
     fi
   else
-    echo "ℹ sync not configured (run: cbox sync-init <remote-url>)"
+    echo "ℹ sync not configured (run: cbox sync init <remote-url>)"
   fi
 
   echo
@@ -1054,11 +1090,14 @@ cbox() {
       ;;
 
     sync-init)
+      echo "Note: 'cbox sync-init' is deprecated — use 'cbox sync init'"
       _cbox_sync_init "${2:-}"
       ;;
 
     sync)
       case "${2:-}" in
+        init)    _cbox_sync_init "${3:-}" ;;
+        unlink)  _cbox_sync_unlink "${3:-}" ;;
         add)     _cbox_sync_add "$name" ;;
         remove)  _cbox_sync_remove "$name" ;;
         compact) _cbox_sync_compact "$name" ;;

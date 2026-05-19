@@ -270,6 +270,41 @@ _cbox_sync_register() {
 # sync — config (main branch)
 # ---------------------------------------------------------
 
+# Finds symlinks in the claude config dir, adds them to the per-machine local
+# exclude (never committed), untracks them from the git index if needed, and
+# warns about broken ones (dangling symlinks typically pulled from another machine).
+_cbox_sync_exclude_symlinks() {
+  local dir="$CBOX_CLAUDE_DIR"
+  [[ -d "$dir/.git" ]] || return 0
+
+  local exclude_file="$dir/.git/info/exclude"
+  local broken=()
+
+  while IFS= read -r -d '' symlink; do
+    local rel="${symlink#"$dir/"}"
+
+    # Append to the per-machine local exclude if not already listed
+    if ! grep -qxF "$rel" "$exclude_file" 2>/dev/null; then
+      echo "$rel" >> "$exclude_file"
+    fi
+
+    # Untrack from git index so the next push commits a deletion, clearing
+    # the symlink from the remote and other machines
+    git -C "$dir" rm --cached --ignore-unmatch "$rel" >/dev/null 2>&1
+
+    # Collect broken (dangling) symlinks — target doesn't exist on this machine
+    [[ ! -e "$symlink" ]] && broken+=("$rel → $(readlink "$symlink")")
+  done < <(find "$dir" \( -path "$dir/.git" -prune \) -o \( -type l -print0 \))
+
+  if [[ ${#broken[@]} -gt 0 ]]; then
+    echo "⚠  Broken symlink(s) in Claude config — likely pulled from another machine:"
+    for b in "${broken[@]}"; do
+      echo "   $b (target missing)"
+    done
+    echo "   Removed from sync. Restore your own symlinks manually."
+  fi
+}
+
 _cbox_sync_pull() {
   local dir="$CBOX_CLAUDE_DIR"
   [[ -d "$dir/.git" ]] || return 0
@@ -281,6 +316,9 @@ _cbox_sync_pull() {
   echo "Pulling Claude config..."
   git -C "$dir" pull --rebase 2>&1 \
     || echo "⚠  Sync pull failed — continuing with local state"
+
+  # Exclude and warn about any symlinks that arrived from the remote
+  _cbox_sync_exclude_symlinks
 }
 
 _cbox_sync_push() {
@@ -297,6 +335,8 @@ _cbox_sync_push() {
   # Only push if a remote is configured
   git -C "$dir" remote get-url origin >/dev/null 2>&1 || return 0
 
+  # Exclude local symlinks before staging — they contain machine-specific paths
+  _cbox_sync_exclude_symlinks
   git -C "$dir" add -A
 
   # Nothing new to commit
@@ -372,6 +412,7 @@ _cbox_sync_init() {
   fi
 
   _cbox_sync_write_gitignore "$dir"
+  _cbox_sync_exclude_symlinks
 
   if git -C "$dir" remote get-url origin >/dev/null 2>&1; then
     git -C "$dir" remote set-url origin "$remote"

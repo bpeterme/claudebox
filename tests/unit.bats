@@ -434,6 +434,53 @@ setup() {
 }
 
 # ---------------------------------------------------------------------------
+# _cbox_sync_config
+# ---------------------------------------------------------------------------
+
+@test "_cbox_sync_config: prompts for URL when no remote configured" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/config-no-remote"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  out=$(printf '\n' | _cbox_sync_config 2>&1) || true
+  [[ "$out" == *"Enter remote URL"* ]]
+}
+
+@test "_cbox_sync_config: aborts when empty URL entered" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/config-empty-url"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  out=$(printf '\n' | _cbox_sync_config 2>&1) || true
+  [[ "$out" == *"Aborted"* ]]
+}
+
+@test "_cbox_sync_config: shows remote when already configured" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/config-has-remote"
+  rm -rf "$CBOX_CLAUDE_DIR" && mkdir -p "$CBOX_CLAUDE_DIR"
+  git -C "$CBOX_CLAUDE_DIR" init 2>/dev/null
+  git -C "$CBOX_CLAUDE_DIR" remote add origin "https://example.com/repo.git"
+  out=$(printf 'n\n' | _cbox_sync_config 2>&1) || true
+  [[ "$out" == *"https://example.com/repo.git"* ]]
+}
+
+@test "_cbox_sync_config: keeps remote when user declines unlink" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/config-keep-remote"
+  rm -rf "$CBOX_CLAUDE_DIR" && mkdir -p "$CBOX_CLAUDE_DIR"
+  git -C "$CBOX_CLAUDE_DIR" init 2>/dev/null
+  git -C "$CBOX_CLAUDE_DIR" remote add origin "https://example.com/repo.git"
+  printf "n\n" | _cbox_sync_config >/dev/null 2>&1 || true
+  run git -C "$CBOX_CLAUDE_DIR" remote get-url origin
+  [ "$status" -eq 0 ]
+  [[ "$output" == "https://example.com/repo.git" ]]
+}
+
+@test "_cbox_sync_config: unlinks when user confirms" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/config-unlink"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  git -C "$CBOX_CLAUDE_DIR" init 2>/dev/null
+  git -C "$CBOX_CLAUDE_DIR" remote add origin "https://example.com/repo.git"
+  printf "y\n" | bash -c "source '$BATS_TEST_DIRNAME/../cbox.sh' 2>/dev/null; CBOX_CLAUDE_DIR='$CBOX_CLAUDE_DIR' _cbox_sync_config" >/dev/null 2>&1 || true
+  [ ! -d "$CBOX_CLAUDE_DIR/.git" ]
+}
+
+# ---------------------------------------------------------------------------
 # _cbox_sync_add guard conditions
 # ---------------------------------------------------------------------------
 

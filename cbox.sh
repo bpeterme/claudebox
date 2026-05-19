@@ -35,8 +35,7 @@ Container Management:
   cbox prune            Remove stopped cbox containers
 
 Sync (cross-machine):
-  cbox sync init <url>  Initialize config sync with a git remote
-  cbox sync unlink      Remove sync remote and deinit local git state
+  cbox sync config      Set or remove the sync remote
   cbox sync             Pull and push config + opted-in project history
   cbox sync add         Opt current project into history sync
   cbox sync remove      Stop syncing history for current project
@@ -396,7 +395,7 @@ _cbox_sync_init() {
   local dir="$CBOX_CLAUDE_DIR"
 
   if [[ -z "$remote" ]]; then
-    echo "Usage: cbox sync init <remote-url>"
+    echo "Error: remote URL required"
     return 1
   fi
 
@@ -533,7 +532,30 @@ _cbox_sync_unlink() {
   CBOX_SYNC_PROJECTS=""
 
   echo "✔ Sync unlinked. Config files remain at $dir"
-  echo "  Run 'cbox sync init <url>' to set up sync again."
+  echo "  Run 'cbox sync config' to set up sync again."
+}
+
+_cbox_sync_config() {
+  local dir="$CBOX_CLAUDE_DIR"
+
+  if [[ ! -d "$dir/.git" ]] || ! git -C "$dir" remote get-url origin >/dev/null 2>&1; then
+    printf "Enter remote URL: "
+    read -r remote
+    [[ -z "$remote" ]] && { echo "Aborted."; return 0; }
+    _cbox_sync_init "$remote"
+  else
+    local remote
+    remote=$(git -C "$dir" remote get-url origin 2>/dev/null)
+    echo "Sync remote: $remote"
+    echo ""
+    printf "Unlink sync? [y/N] "
+    read -r reply
+    if [[ "$reply" =~ ^[Yy]$ ]]; then
+      _cbox_sync_unlink --force
+    else
+      echo "No changes made."
+    fi
+  fi
 }
 
 # ---------------------------------------------------------
@@ -642,7 +664,7 @@ _cbox_sync_push_history() {
 _cbox_sync_add() {
   local name="$1"
   local dir="$CBOX_CLAUDE_DIR"
-  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync init <url>"; return 1; }
+  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync config"; return 1; }
 
   if _cbox_sync_is_opted_in "$name"; then
     echo "Project '$name' is already opted into history sync on this machine."
@@ -657,7 +679,7 @@ _cbox_sync_add() {
 _cbox_sync_remove() {
   local name="$1"
   local dir="$CBOX_CLAUDE_DIR"
-  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync init <url>"; return 1; }
+  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync config"; return 1; }
 
   if ! _cbox_sync_is_opted_in "$name"; then
     echo "Project '$name' is not opted into history sync."
@@ -680,7 +702,7 @@ _cbox_sync_remove() {
 _cbox_sync_compact() {
   local name="$1"
   local dir="$CBOX_CLAUDE_DIR"
-  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync init <url>"; return 1; }
+  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync config"; return 1; }
 
   if ! _cbox_sync_is_opted_in "$name"; then
     echo "Project '$name' is not opted into history sync. Run: cbox sync add"
@@ -719,7 +741,7 @@ _cbox_sync_compact() {
 _cbox_sync_prune() {
   local name="$1"; shift
   local dir="$CBOX_CLAUDE_DIR"
-  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync init <url>"; return 1; }
+  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync config"; return 1; }
 
   local older_than_days="" size_limit_mb="" force=false all_projects=false
   while [[ $# -gt 0 ]]; do
@@ -819,7 +841,7 @@ _cbox_sync_prune() {
 
 _cbox_sync_list() {
   local dir="$CBOX_CLAUDE_DIR"
-  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync init <url>"; return 1; }
+  [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync config"; return 1; }
 
   echo "Fetching remote refs..."
   git -C "$dir" fetch origin 2>/dev/null || true
@@ -1103,7 +1125,7 @@ _cbox_doctor() {
       echo "  history projects: none (use: cbox sync add)"
     fi
   else
-    echo "ℹ sync not configured (run: cbox sync init <remote-url>)"
+    echo "ℹ sync not configured (run: cbox sync config)"
   fi
 
   echo
@@ -1183,15 +1205,9 @@ cbox() {
         -t "$CBOX_IMAGE" "$_CBOX_BUILD_DIR"
       ;;
 
-    sync-init)
-      echo "Note: 'cbox sync-init' is deprecated — use 'cbox sync init'"
-      _cbox_sync_init "${2:-}"
-      ;;
-
     sync)
       case "${2:-}" in
-        init)    _cbox_sync_init "${3:-}" ;;
-        unlink)  _cbox_sync_unlink "${3:-}" ;;
+        config)  _cbox_sync_config ;;
         add)     _cbox_sync_add "$name" ;;
         remove)  _cbox_sync_remove "$name" ;;
         compact) _cbox_sync_compact "$name" ;;
@@ -1199,7 +1215,7 @@ cbox() {
         list)    _cbox_sync_list ;;
         "")
           [[ -d "$CBOX_CLAUDE_DIR/.git" ]] \
-            || { echo "Sync not initialized. Run: cbox sync init <url>"; return 1; }
+            || { echo "Sync not initialized. Run: cbox sync config"; return 1; }
           _cbox_sync_pull
           _cbox_sync_push
           _cbox_sync_pull_history "$name"

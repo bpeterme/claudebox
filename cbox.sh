@@ -619,6 +619,12 @@ _cbox_sync_add() {
   local name="$1"
   local dir="$CBOX_CLAUDE_DIR"
   [[ -d "$dir/.git" ]] || { echo "Sync not initialized. Run: cbox sync init <url>"; return 1; }
+
+  if _cbox_sync_is_opted_in "$name"; then
+    echo "Project '$name' is already opted into history sync on this machine."
+    return 0
+  fi
+
   _cbox_sync_register "$name" add
   _cbox_sync_push_history "$name"
   echo "✔ Project '$name' opted into history sync on this machine."
@@ -1128,6 +1134,10 @@ cbox() {
       ;;
 
     stop)
+      if ! _cbox_exists "$name"; then
+        echo "No container found for '$name'."
+        return 0
+      fi
       echo "Stopping container '$name'..."
       $_CBOX_CMD stop "$name"
       ;;

@@ -301,3 +301,200 @@ setup() {
   run grep -q "^!projects/" "$dir/.gitignore"
   [ "$status" -ne 0 ]
 }
+
+# ---------------------------------------------------------------------------
+# _cbox_sync_exclude_symlinks
+# ---------------------------------------------------------------------------
+
+@test "_cbox_sync_exclude_symlinks: no-op when .git does not exist" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/excl-no-git"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  run _cbox_sync_exclude_symlinks
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "_cbox_sync_exclude_symlinks: adds symlink path to .git/info/exclude" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/excl-add"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  git -C "$CBOX_CLAUDE_DIR" init 2>/dev/null
+  local target="$BATS_TMPDIR/real-settings.json"
+  echo '{}' > "$target"
+  ln -sf "$target" "$CBOX_CLAUDE_DIR/settings.json"
+  _cbox_sync_exclude_symlinks
+  run grep -Fx "settings.json" "$CBOX_CLAUDE_DIR/.git/info/exclude"
+  [ "$status" -eq 0 ]
+}
+
+@test "_cbox_sync_exclude_symlinks: does not duplicate entry in exclude" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/excl-dedup"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  git -C "$CBOX_CLAUDE_DIR" init 2>/dev/null
+  local target="$BATS_TMPDIR/real-settings-dedup.json"
+  echo '{}' > "$target"
+  ln -sf "$target" "$CBOX_CLAUDE_DIR/settings.json"
+  _cbox_sync_exclude_symlinks
+  _cbox_sync_exclude_symlinks
+  run bash -c "grep -Fc 'settings.json' '$CBOX_CLAUDE_DIR/.git/info/exclude'"
+  [ "$output" -eq 1 ]
+}
+
+@test "_cbox_sync_exclude_symlinks: untracks a previously tracked symlink" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/excl-untrack"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  git -C "$CBOX_CLAUDE_DIR" init 2>/dev/null
+  git -C "$CBOX_CLAUDE_DIR" config user.email "test@test.com"
+  git -C "$CBOX_CLAUDE_DIR" config user.name "Test"
+  local target="$BATS_TMPDIR/real-settings-untrack.json"
+  echo '{}' > "$target"
+  ln -sf "$target" "$CBOX_CLAUDE_DIR/settings.json"
+  git -C "$CBOX_CLAUDE_DIR" add -f settings.json
+  _cbox_sync_exclude_symlinks
+  run git -C "$CBOX_CLAUDE_DIR" ls-files "settings.json"
+  [ -z "$output" ]
+}
+
+@test "_cbox_sync_exclude_symlinks: warns about broken symlinks" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/excl-broken"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  git -C "$CBOX_CLAUDE_DIR" init 2>/dev/null
+  ln -sf "/nonexistent/path/settings.json" "$CBOX_CLAUDE_DIR/settings.json"
+  run _cbox_sync_exclude_symlinks
+  [[ "$output" == *"Broken symlink"* ]]
+}
+
+@test "_cbox_sync_exclude_symlinks: no output for valid symlinks" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/excl-valid"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  git -C "$CBOX_CLAUDE_DIR" init 2>/dev/null
+  local target="$BATS_TMPDIR/real-settings-valid.json"
+  echo '{}' > "$target"
+  ln -sf "$target" "$CBOX_CLAUDE_DIR/settings.json"
+  run _cbox_sync_exclude_symlinks
+  [ -z "$output" ]
+}
+
+# ---------------------------------------------------------------------------
+# _cbox_sync_unlink
+# ---------------------------------------------------------------------------
+
+@test "_cbox_sync_unlink: reports not initialized when .git absent" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/unlink-no-git"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  run _cbox_sync_unlink --force
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not initialized"* ]]
+}
+
+@test "_cbox_sync_unlink --force: removes .git directory" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/unlink-git"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  git -C "$CBOX_CLAUDE_DIR" init 2>/dev/null
+  _cbox_sync_unlink --force
+  [ ! -d "$CBOX_CLAUDE_DIR/.git" ]
+}
+
+@test "_cbox_sync_unlink --force: removes .gitignore" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/unlink-gitignore"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  git -C "$CBOX_CLAUDE_DIR" init 2>/dev/null
+  echo "*" > "$CBOX_CLAUDE_DIR/.gitignore"
+  _cbox_sync_unlink --force
+  [ ! -f "$CBOX_CLAUDE_DIR/.gitignore" ]
+}
+
+@test "_cbox_sync_unlink --force: clears CBOX_SYNC_PROJECTS from cbox.env" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/unlink-env"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  git -C "$CBOX_CLAUDE_DIR" init 2>/dev/null
+  local config="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
+  mkdir -p "$(dirname "$config")"
+  echo 'CBOX_SYNC_PROJECTS="alpha bravo"' > "$config"
+  CBOX_SYNC_PROJECTS="alpha bravo"
+  _cbox_sync_unlink --force
+  run grep "^CBOX_SYNC_PROJECTS=" "$config"
+  [ "$status" -ne 0 ]
+}
+
+@test "_cbox_sync_unlink --force: clears CBOX_SYNC_PROJECTS in memory" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/unlink-mem"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  git -C "$CBOX_CLAUDE_DIR" init 2>/dev/null
+  CBOX_SYNC_PROJECTS="alpha bravo"
+  _cbox_sync_unlink --force
+  [ -z "$CBOX_SYNC_PROJECTS" ]
+}
+
+@test "_cbox_sync_unlink: aborts without removing .git when user declines" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/unlink-abort"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  git -C "$CBOX_CLAUDE_DIR" init 2>/dev/null
+  printf "n\n" | _cbox_sync_unlink >/dev/null 2>&1 || true
+  [ -d "$CBOX_CLAUDE_DIR/.git" ]
+}
+
+# ---------------------------------------------------------------------------
+# _cbox_sync_add guard conditions
+# ---------------------------------------------------------------------------
+
+@test "_cbox_sync_add: reports not initialized when .git absent" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/add-no-git"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  run _cbox_sync_add "myproject"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not initialized"* ]]
+}
+
+@test "_cbox_sync_add: reports already opted in when project is in list" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/add-opted-in"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  git -C "$CBOX_CLAUDE_DIR" init 2>/dev/null
+  CBOX_SYNC_PROJECTS="myproject"
+  run _cbox_sync_add "myproject"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"already opted into"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# _cbox_sync_remove guard conditions
+# ---------------------------------------------------------------------------
+
+@test "_cbox_sync_remove: reports not initialized when .git absent" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/remove-no-git"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  run _cbox_sync_remove "myproject"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not initialized"* ]]
+}
+
+@test "_cbox_sync_remove: reports not opted in when project not in list" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/remove-not-opted"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  git -C "$CBOX_CLAUDE_DIR" init 2>/dev/null
+  CBOX_SYNC_PROJECTS=""
+  run _cbox_sync_remove "myproject"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not opted into history sync"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# _cbox_sync_compact guard conditions
+# ---------------------------------------------------------------------------
+
+@test "_cbox_sync_compact: reports not initialized when .git absent" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/compact-no-git"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  run _cbox_sync_compact "myproject"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not initialized"* ]]
+}
+
+@test "_cbox_sync_compact: reports not opted in when project not in list" {
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/compact-not-opted"
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  git -C "$CBOX_CLAUDE_DIR" init 2>/dev/null
+  CBOX_SYNC_PROJECTS=""
+  run _cbox_sync_compact "myproject"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not opted into history sync"* ]]
+}

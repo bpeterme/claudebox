@@ -57,6 +57,9 @@ EOF
 CBOX_IMAGE="${CBOX_IMAGE:-claudebox}"
 CBOX_LABEL="${CBOX_LABEL:-cbox.project=true}"
 CBOX_KEEPALIVE_SECONDS="${CBOX_KEEPALIVE_SECONDS:-600}"
+# Minimum plumbing API versions required from companion tools
+_CBOX_CDOT_API=1
+_CBOX_FLUX_API=1
 
 # Source user config if present (~/.config/claudebox/cbox.env)
 _CBOX_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
@@ -359,6 +362,20 @@ _cbox_ensure() {
 }
 
 # ---------------------------------------------------------
+# companion API version check
+# ---------------------------------------------------------
+
+_cbox_check_companion_api() {
+  local tool="$1" expected="$2"
+  local actual
+  actual=$("$tool" _api-version 2>/dev/null) || true
+  if ! [[ "$actual" =~ ^[0-9]+$ ]] || (( actual < expected )); then
+    echo "⚠  $tool is outdated (need API $expected) — upgrade: brew upgrade $tool"
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------
 # enter container
 # ---------------------------------------------------------
 
@@ -371,11 +388,11 @@ _cbox_enter() {
 
   if [[ "$command" == "claude" ]]; then
     _cbox_maybe_update "$name"
-    if command -v cdot >/dev/null 2>&1; then
+    if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
       cdot _pull
       [[ "$mode" != "safe" ]] && cdot _pull-history "$name"
     fi
-    if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]]; then
+    if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]] && _cbox_check_companion_api flux "$_CBOX_FLUX_API"; then
       flux _pull
     fi
   fi
@@ -385,11 +402,11 @@ _cbox_enter() {
   $_CBOX_CMD exec -it -w "/Workspace/$name" "$name" zsh -ic "$command"
 
   if [[ "$command" == "claude" && "$mode" != "safe" ]]; then
-    if command -v cdot >/dev/null 2>&1; then
+    if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
       cdot _push
       cdot _push-history "$name"
     fi
-    if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]]; then
+    if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]] && _cbox_check_companion_api flux "$_CBOX_FLUX_API"; then
       flux _push
     fi
   fi
@@ -459,7 +476,9 @@ _cbox_doctor() {
   echo
   echo "[sync]"
   if command -v cdot >/dev/null 2>&1; then
-    cdot _doctor
+    if _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
+      cdot _doctor
+    fi
   else
     echo "ℹ cdot not installed — sync unavailable"
     echo "  Install: brew tap bpeterme/claudebox && brew install claudedot"
@@ -468,7 +487,9 @@ _cbox_doctor() {
   echo
   echo "[flux]"
   if command -v flux >/dev/null 2>&1; then
-    flux _doctor
+    if _cbox_check_companion_api flux "$_CBOX_FLUX_API"; then
+      flux _doctor
+    fi
   else
     echo "ℹ flux not installed — large-file sync unavailable"
     echo "  Install: brew tap bpeterme/flux && brew install flux"

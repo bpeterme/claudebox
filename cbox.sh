@@ -127,10 +127,10 @@ _cbox_rt_label() {
   local name="$1" label="$2"
   if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
     container inspect "$name" 2>/dev/null \
-      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('configuration',{}).get('labels',{}).get('$label',''))"
+      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('configuration',{}).get('labels',{}).get(sys.argv[1],''))" -- "$label"
   else
     docker inspect "$name" 2>/dev/null \
-      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('Config',{}).get('Labels',{}).get('$label',''))"
+      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('Config',{}).get('Labels',{}).get(sys.argv[1],''))" -- "$label"
   fi
 }
 
@@ -633,5 +633,6 @@ cbox() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  set -euo pipefail
   cbox "$@"
 fi

@@ -399,7 +399,8 @@ _cbox_enter() {
     $_CBOX_CMD stop "$name"
   fi
 
-  find "$CBOX_SHARE_DIR" -mindepth 1 -delete 2>/dev/null || true
+  [[ -n "$CBOX_SHARE_DIR" && "$CBOX_SHARE_DIR" == /tmp/* ]] && \
+    find "$CBOX_SHARE_DIR" -mindepth 1 -delete 2>/dev/null || true
 }
 
 # ---------------------------------------------------------

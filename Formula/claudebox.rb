@@ -8,7 +8,7 @@ class Claudebox < Formula
   depends_on :macos
 
   def install
-    version_str = build.head? ? "HEAD-#{`git describe --tags --always`.chomp}" : version.to_s
+    version_str = build.head? ? "HEAD-#{`git rev-parse --short HEAD`.chomp}" : version.to_s
     inreplace "cbox.sh", '_CBOX_VERSION="dev"', "_CBOX_VERSION=\"#{version_str}\""
     bin.install "cbox.sh" => "cbox"
     (share/"claudebox").install "dockerfile"

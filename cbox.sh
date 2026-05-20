@@ -523,7 +523,7 @@ _cbox_doctor() {
 # ---------------------------------------------------------
 
 cbox() {
-  local subcommand="$1"
+  local subcommand="${1:-}"
 
   local name
   name=$(_cbox_name)

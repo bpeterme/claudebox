@@ -12,6 +12,7 @@ class Claudebox < Formula
     inreplace "cbox.sh", '_CBOX_VERSION="dev"', "_CBOX_VERSION=\"#{version_str}\""
     bin.install "cbox.sh" => "cbox"
     (share/"claudebox").install "dockerfile"
+    (share/"claudebox").install "cbox.env.example"
   end
 
   def caveats
@@ -20,6 +21,10 @@ class Claudebox < Formula
 
       Build the container image before first use:
         cbox rebuild
+
+      To configure claudebox, copy the example config:
+        mkdir -p ~/.config/claudebox
+        cp #{share}/claudebox/cbox.env.example ~/.config/claudebox/cbox.env
     EOS
   end
 

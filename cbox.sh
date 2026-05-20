@@ -375,6 +375,9 @@ _cbox_enter() {
       cdot _pull
       [[ "$mode" != "safe" ]] && cdot _pull-history "$name"
     fi
+    if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]]; then
+      flux _pull
+    fi
   fi
 
   echo "Entering container '$name'..."
@@ -385,6 +388,9 @@ _cbox_enter() {
     if command -v cdot >/dev/null 2>&1; then
       cdot _push
       cdot _push-history "$name"
+    fi
+    if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]]; then
+      flux _push
     fi
   fi
 
@@ -456,6 +462,15 @@ _cbox_doctor() {
   else
     echo "ℹ cdot not installed — sync unavailable"
     echo "  Install: brew tap bpeterme/claudebox && brew install claudedot"
+  fi
+
+  echo
+  echo "[flux]"
+  if command -v flux >/dev/null 2>&1; then
+    flux _doctor
+  else
+    echo "ℹ flux not installed — large-file sync unavailable"
+    echo "  Install: brew tap bpeterme/flux && brew install flux"
   fi
 
   echo

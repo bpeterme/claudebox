@@ -40,7 +40,7 @@ Maintenance:
   cbox version          Show version
 
 Companion tools:
-  claudedot             Config + history sync across machines
+  cdot                  claudedot — Config + history sync across machines
   flux                  Large-file routing for your projects (git + R2 storage)
 
 Help:
@@ -584,12 +584,13 @@ cbox() {
       _cbox_help
       ;;
 
-    claudedot)
+    cdot)
       if command -v cdot >/dev/null 2>&1; then
-        echo "claudedot is installed. Use: cdot help"
+        cdot help
       else
         echo "claudedot is not installed."
         echo "Install: brew tap bpeterme/claudedot && brew install bpeterme/claudedot/claudedot"
+        return 1
       fi
       ;;
 

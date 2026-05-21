@@ -456,16 +456,7 @@ _cbox_keepalive() {
 # doctor
 # ---------------------------------------------------------
 
-_cbox_doctor() {
-  local name
-  name=$(_cbox_name)
-
-  echo "== cbox doctor =="
-  echo "Version: $_CBOX_VERSION"
-
-  echo
-  echo "[environment]"
-
+_cbox_doctor_inline() {
   command -v "$_CBOX_CMD" >/dev/null \
     && echo "✔ $_CBOX_CMD command found" \
     || echo "✘ $_CBOX_CMD command missing"
@@ -485,6 +476,18 @@ _cbox_doctor() {
   else
     echo "ℹ no custom zshrc configured (CBOX_ZSHRC unset)"
   fi
+}
+
+_cbox_doctor() {
+  local name
+  name=$(_cbox_name)
+
+  echo "== cbox doctor =="
+  echo "Version: $_CBOX_VERSION"
+
+  echo
+  echo "[environment]"
+  _cbox_doctor_inline
 
   echo
   echo "[cdot]"
@@ -592,6 +595,10 @@ cbox() {
 
     doctor)
       _cbox_doctor
+      ;;
+
+    _doctor)
+      _cbox_doctor_inline
       ;;
 
     list)

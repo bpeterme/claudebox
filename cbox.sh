@@ -561,12 +561,13 @@ cbox() {
       ;;
 
     reset)
-      if ! _cbox_exists "$name"; then
-        echo "No container found for '$name'."
+      local reset_target="${2:-$name}"
+      if ! _cbox_exists "$reset_target"; then
+        echo "No container found for '$reset_target'."
         return 0
       fi
-      echo "Removing container '$name'..."
-      $_CBOX_CMD rm -f "$name"
+      echo "Removing container '$reset_target'..."
+      $_CBOX_CMD rm -f "$reset_target"
       ;;
 
     rebuild)

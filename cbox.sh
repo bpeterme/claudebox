@@ -192,7 +192,15 @@ _cbox_maybe_update() {
 _cbox_force_update() {
   local name="$1"
 
-  _cbox_ensure "$name" "normal"
+  if ! _cbox_exists "$name"; then
+    echo "No container found for '$name'."
+    return 0
+  fi
+
+  if ! _cbox_running "$name"; then
+    echo "Starting container '$name'..."
+    $_CBOX_CMD start "$name"
+  fi
 
   echo "Updating Claude Code..."
 

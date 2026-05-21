@@ -28,9 +28,9 @@ Usage:
   cbox keepalive        Keep container alive for 10 minutes after exit
 
 Container Management:
+  cbox list             List cbox containers
   cbox stop             Stop current project container
   cbox reset            Remove current project container
-  cbox list             List cbox containers
   cbox prune            Remove stopped cbox containers
   cbox rebuild          Rebuild container image
 
@@ -479,7 +479,7 @@ _cbox_doctor() {
   fi
 
   echo
-  echo "[sync]"
+  echo "[cdot]"
   if command -v cdot >/dev/null 2>&1; then
     if _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
       cdot _doctor

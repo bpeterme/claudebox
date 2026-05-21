@@ -301,12 +301,17 @@ _cbox_create() {
     args+=(
       --network cbox-bridge
       --cap-drop=ALL
-      --security-opt no-new-privileges
-      --pids-limit 512
       --memory=4g
       --cpus=2
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude:ro"
     )
+    # --security-opt and --pids-limit are not supported by Apple's container CLI
+    if [[ "$_CBOX_RUNTIME" != "apple" ]]; then
+      args+=(
+        --security-opt no-new-privileges
+        --pids-limit 512
+      )
+    fi
   fi
 
   # For each symlink in CBOX_CLAUDE_DIR, resolve it to the real host path and

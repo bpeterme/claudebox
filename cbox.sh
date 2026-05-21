@@ -30,9 +30,9 @@ Usage:
 Container Management:
   cbox stop             Stop current project container
   cbox reset            Remove current project container
-  cbox rebuild          Rebuild container image
   cbox list             List cbox containers
   cbox prune            Remove stopped cbox containers
+  cbox rebuild          Rebuild container image
 
 Maintenance:
   cbox update           Force Claude Code update

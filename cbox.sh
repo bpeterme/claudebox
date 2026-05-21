@@ -426,7 +426,7 @@ _cbox_enter() {
 
   if [[ "$stop_on_exit" == "yes" ]]; then
     echo "Stopping container '$name'..."
-    $_CBOX_CMD stop "$name"
+    $_CBOX_CMD stop "$name" >/dev/null
   fi
 
   [[ -n "$CBOX_SHARE_DIR" && "$CBOX_SHARE_DIR" == /tmp/* ]] && \
@@ -568,7 +568,7 @@ cbox() {
         return 0
       fi
       echo "Stopping container '$name'..."
-      $_CBOX_CMD stop "$name"
+      $_CBOX_CMD stop "$name" >/dev/null
       ;;
 
     reset)

@@ -18,6 +18,7 @@
 # ---------------------------------------------------------
 
 _cbox_help() {
+    clear
     cat <<'EOF'
 cbox - Claude Container Runtime
 
@@ -191,6 +192,7 @@ _cbox_maybe_update() {
 
 _cbox_force_update() {
   local name="$1"
+  clear
 
   if ! _cbox_exists "$name"; then
     echo "No container found for '$name'."
@@ -481,6 +483,7 @@ _cbox_doctor_inline() {
 _cbox_doctor() {
   local name
   name=$(_cbox_name)
+  clear
 
   echo "== cbox doctor =="
   echo "Version: $_CBOX_VERSION"
@@ -582,6 +585,7 @@ cbox() {
       ;;
 
     rebuild)
+      clear
       echo "Rebuilding image '$CBOX_IMAGE'..."
       $_CBOX_CMD build \
         --build-arg HOST_UID="$(id -u)" \

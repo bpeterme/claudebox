@@ -606,6 +606,7 @@ cbox() {
       ;;
 
     list)
+      clear
       if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
         container ls --all
       else

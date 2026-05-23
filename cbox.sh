@@ -41,8 +41,8 @@ Maintenance:
   cbox version          Show version
 
 Companion tools:
-  cdot                  claudedot — Config + history sync across machines
-  flux                  Large-file routing for your projects (git + R2 storage)
+  cdot help             claudedot — Config + history sync across machines
+  flux help             Large-file routing for your projects (git + R2 storage)
 
 Help:
   cbox help

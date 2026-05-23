@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y \
     gnupg \
     nano \
     jq \
+    bats \
     btop \
     htop \
     iotop

@@ -59,7 +59,7 @@ cbox shell     # open a zsh shell instead of Claude Code
 | Command | Description |
 |---------|-------------|
 | `cbox stop` | Stop the current project's container |
-| `cbox reset` | Remove the current project's container |
+| `cbox reset [<name>]` | Remove the current project's container (or a named container) |
 | `cbox rebuild` | Rebuild the container image |
 | `cbox list` | List all cbox containers |
 | `cbox prune` | Remove all stopped cbox containers |
@@ -69,7 +69,7 @@ cbox shell     # open a zsh shell instead of Claude Code
 | Command | Description |
 |---------|-------------|
 | `cbox update` | Force-update Claude Code inside a running container |
-| `cbox doctor` | Run environment diagnostics |
+| `cbox doctor` | Run environment diagnostics (includes companion tool status) |
 | `cbox version` | Show version |
 
 ## Container Modes
@@ -128,6 +128,8 @@ The container user is `claude` (UID matches your host UID to avoid permission is
 - On exit, the container is stopped and the share folder is cleared
 - `cbox keepalive` leaves the container running for 10 minutes (useful for follow-up `exec` calls)
 - Authentication is automatic — credentials are mounted from the host, so no re-authentication is needed inside the container
+- If [claudedot](https://github.com/bpeterme/claudedot) is installed, config and history sync runs automatically at session start and exit
+- If [flux](https://github.com/bpeterme/flux) is installed and the project has a `.dvc/` directory, large-file sync runs automatically at session boundaries
 
 ## Companion Tools
 
@@ -143,12 +145,12 @@ cdot config    # connect to your sync remote
 
 ### [flux](https://github.com/bpeterme/flux)
 
-[flux](https://github.com/bpeterme/flux) handles automatic file routing between any Git remote and Cloudflare R2 object storage. If your projects involve large assets alongside code, claudebox and flux complement each other naturally — claudebox scopes Claude Code to your project, flux manages the file transport layer for assets that don't belong in a regular git repo.
+[flux](https://github.com/bpeterme/flux) handles automatic file routing between any Git remote and Cloudflare R2 object storage. If your projects involve large assets alongside code, claudebox and flux complement each other naturally — claudebox scopes Claude Code to your project, flux manages the file transport layer for assets that don't belong in a regular git repo. claudebox calls `flux` automatically at session boundaries when a flux-managed project is detected.
 
 ```bash
 brew tap bpeterme/flux
 brew install bpeterme/flux/flux
-flux setup     # initialise flux in a git repository
+flux add       # initialise flux in a git repository
 ```
 
 ## License

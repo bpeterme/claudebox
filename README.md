@@ -103,6 +103,11 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_BUILD_DIR` | cbox.sh directory | Build context for `cbox rebuild` |
 | `BUILD_PLAYWRIGHT` | `0` | Set to `1` to include Playwright + Chromium in the image |
 
+> [!WARNING]
+> **Do not place `CBOX_CLAUDE_DIR` (default `~/.claude`) or your project directories on iCloud Drive, Dropbox Smart Sync, Google Drive Stream, or any on-demand cloud storage.** These services evict file contents to stubs when not recently accessed. A container mounting an evicted path will fail to read files that appear to exist on disk — a subtle failure that is hard to diagnose.
+>
+> **Do not use continuous sync tools (Syncthing, rsync daemons, etc.) on `CBOX_CLAUDE_DIR`.** They can write into the directory while Claude is actively appending to a conversation file, risking corruption or lost writes. If you need to sync `~/.claude` across machines, use [claudedot](https://github.com/bpeterme/claudedot) — it only touches the directory at explicit session boundaries.
+
 ## Container Image
 
 The image is based on Ubuntu 24.04 and includes:

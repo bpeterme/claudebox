@@ -70,7 +70,7 @@ unset _CBOX_CONFIG
 CBOX_DATA_DIR="${CBOX_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/claudebox}"
 CBOX_CLAUDE_DIR="${CBOX_CLAUDE_DIR:-$HOME/.claude}"
 CBOX_HOST_CONFIG_DIR="${CBOX_HOST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}}"
-CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-/tmp/cbox-$(id -un)}"
+CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/claudebox/share}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
@@ -299,6 +299,7 @@ _cbox_create() {
       fi
       unset _f _fname _key
     fi
+    mkdir -p "$CBOX_SHARE_DIR"
     args+=(
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude"
       -v "$CBOX_HOST_CONFIG_DIR:/home/claude/.config"
@@ -431,8 +432,10 @@ _cbox_enter() {
     $_CBOX_CMD stop "$name" >/dev/null
   fi
 
-  [[ -n "$CBOX_SHARE_DIR" && "$CBOX_SHARE_DIR" == /tmp/* ]] && \
+  local _cache_base="${XDG_CACHE_HOME:-$HOME/.cache}"
+  [[ -n "$CBOX_SHARE_DIR" && ( "$CBOX_SHARE_DIR" == /tmp/* || "$CBOX_SHARE_DIR" == "$_cache_base"/* ) ]] && \
     find "$CBOX_SHARE_DIR" -mindepth 1 -delete 2>/dev/null || true
+  unset _cache_base
 }
 
 # ---------------------------------------------------------

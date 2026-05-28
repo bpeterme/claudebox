@@ -97,7 +97,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_DATA_DIR` | `~/.local/share/claudebox` | Per-project container config files (`.claude-<name>.json`), one per project |
 | `CBOX_CLAUDE_DIR` | `~/.claude` | Claude Code config, mounted as `~/.claude` (read-write; read-only in safe mode) |
 | `CBOX_HOST_CONFIG_DIR` | `~/.config` | Host config dir, mounted as `~/.config` in container (normal mode, read-write) |
-| `CBOX_SHARE_DIR` | `/tmp/cbox-<user>` | Share folder, mounted as `~/share` in container; cleared on exit (read-write) |
+| `CBOX_SHARE_DIR` | `~/.cache/claudebox/share` | Share folder, mounted as `~/share` in container; cleared on exit (read-write) |
 | `CBOX_SSH_DIR` | *(unset)* | SSH dir to mount as `~/.ssh` in container (normal mode, **read-only**); unset = no SSH mount |
 | `CBOX_ZSHRC` | *(unset)* | `.zshrc` to source as `~/.zshrc.global` inside the container (**read-only**); unset = none |
 | `CBOX_BUILD_DIR` | cbox.sh directory | Build context for `cbox rebuild` |

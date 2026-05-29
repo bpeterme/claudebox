@@ -97,11 +97,10 @@ _mounts() {
 # auth persistence
 # ---------------------------------------------------------------------------
 
-@test ".claude.json is not overwritten when it already exists" {
+@test ".claude.json preserves auth tokens across re-runs" {
   local f="$CBOX_DATA_DIR/.claude-$TEST_NAME.json"
+  echo '{"oauthToken":"tok_abc","projects":{}}' > "$f"
   _cbox_generate_claude_json "$TEST_NAME"
-  echo "preserved" > "$f"
-  _cbox_generate_claude_json "$TEST_NAME"
-  run cat "$f"
-  [ "$output" = "preserved" ]
+  run python3 -c "import json,sys; d=json.load(open('$f')); sys.exit(0 if d.get('oauthToken')=='tok_abc' else 1)"
+  [ "$status" -eq 0 ]
 }

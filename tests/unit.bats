@@ -104,10 +104,19 @@ setup() {
   [ "$status" -eq 0 ]
 }
 
-@test "_cbox_generate_claude_json: does not overwrite existing file" {
+@test "_cbox_generate_claude_json: preserves existing auth tokens on re-run" {
   local f="$CBOX_DATA_DIR/.claude-stable.json"
-  echo "preserved" > "$f"
+  echo '{"oauthToken":"tok_abc","projects":{}}' > "$f"
   _cbox_generate_claude_json "stable"
-  run cat "$f"
-  [ "$output" = "preserved" ]
+  run python3 -c "import json,sys; d=json.load(open('$f')); sys.exit(0 if d.get('oauthToken')=='tok_abc' else 1)"
+  [ "$status" -eq 0 ]
+}
+
+@test "_cbox_generate_claude_json: merges mcpServers from host on re-run" {
+  local f="$CBOX_DATA_DIR/.claude-myapp.json"
+  echo '{"oauthToken":"tok_abc"}' > "$f"
+  echo '{"mcpServers":{"mytool":{"command":"npx","args":["mytool-mcp"]}}}' > "$HOME/.claude.json"
+  _cbox_generate_claude_json "myapp"
+  run python3 -c "import json,sys; d=json.load(open('$f')); sys.exit(0 if 'mytool' in d.get('mcpServers',{}) else 1)"
+  [ "$status" -eq 0 ]
 }

@@ -169,10 +169,37 @@ _cbox_generate_claude_json() {
 
   local claude_json="$CBOX_DATA_DIR/.claude-$name.json"
 
-  [[ -f "$claude_json" ]] && return 0
+  python3 - "$claude_json" "$name" <<'PYEOF'
+import json, sys, os
 
-  echo "{\"hasCompletedOnboarding\":true,\"installMethod\":\"npm\",\"projects\":{\"/Workspace/$name\":{\"hasTrustDialogAccepted\":true}}}" \
-    > "$claude_json"
+project_file, name = sys.argv[1], sys.argv[2]
+
+try:
+    with open(project_file) as f:
+        project = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    project = {}
+
+try:
+    with open(os.path.expanduser("~/.claude.json")) as f:
+        host = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    host = {}
+
+# Host wins for mcpServers (user-wide config); omit key if host has none
+if "mcpServers" in host:
+    project["mcpServers"] = host["mcpServers"]
+
+# Ensure required container defaults
+project["hasCompletedOnboarding"] = True
+project["installMethod"] = "npm"
+project.setdefault("projects", {}).setdefault(
+    f"/Workspace/{name}", {}
+)["hasTrustDialogAccepted"] = True
+
+with open(project_file, "w") as f:
+    json.dump(project, f)
+PYEOF
 }
 
 _cbox_maybe_update() {

@@ -493,6 +493,15 @@ _cbox_doctor_inline() {
     && echo "✔ $_CBOX_CMD command found" \
     || echo "✘ $_CBOX_CMD command missing"
 
+  # Apple Container 1.0.0+ manages a container machine; check it is running
+  if [[ "$_CBOX_RUNTIME" == "apple" ]] && container help 2>&1 | grep -q "machine"; then
+    if container machine status >/dev/null 2>&1; then
+      echo "✔ container machine running"
+    else
+      echo "✘ container machine not running — run: container machine start"
+    fi
+  fi
+
   _cbox_rt_image_list | grep -q "^$CBOX_IMAGE " \
     && echo "✔ image '$CBOX_IMAGE' exists" \
     || echo "✘ image '$CBOX_IMAGE' missing"

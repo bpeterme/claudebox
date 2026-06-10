@@ -1,12 +1,13 @@
 # claudebox
 
-A shell utility that runs [Claude Code](https://github.com/anthropics/claude-code) inside an isolated container, scoped to your current project directory. Uses [Apple Container](https://github.com/apple/containerization) on macOS and Docker on Linux.
+A shell utility that runs [Claude Code](https://github.com/anthropics/claude-code) inside an isolated container, scoped to your current project directory. Uses [Apple Container](https://github.com/apple/container) on macOS and Docker on Linux.
 
 Each project gets its own container, named after the directory. Two modes are available: **normal** (full access to your Claude config and SSH keys) and **safe** (sandboxed with dropped capabilities, memory/CPU limits, and an isolated network).
 
 ## Prerequisites
 
-- [Apple Container](https://github.com/apple/containerization) (macOS) or Docker (Linux)
+- **macOS:** [Apple Container](https://github.com/apple/container) 1.0.0+ — requires macOS 26 and Apple Silicon
+- **Linux:** Docker
 
 ## Installation
 

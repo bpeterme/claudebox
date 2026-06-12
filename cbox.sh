@@ -274,7 +274,7 @@ _cbox_session_end() {
   for f in "$_CBOX_SESSION_DIR/.cbox-active-${name}-"*; do
     [[ -f "$f" ]] || continue
     pid="${f##*-}"
-    kill -0 "$pid" 2>/dev/null || rm -f "$f"
+    ps -p "$pid" >/dev/null 2>&1 || rm -f "$f"
   done
   compgen -G "$_CBOX_SESSION_DIR/.cbox-active-${name}-*" >/dev/null 2>&1
 }

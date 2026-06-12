@@ -256,6 +256,30 @@ _cbox_resolve_path() {
 }
 
 # ---------------------------------------------------------
+# session tracking (multi-instance safety)
+# ---------------------------------------------------------
+
+_CBOX_SESSION_DIR="${TMPDIR:-/tmp}"
+
+_cbox_session_start() {
+  touch "$_CBOX_SESSION_DIR/.cbox-active-${1}-$$"
+}
+
+# Removes this session's marker, cleans stale markers (dead PIDs), and
+# returns 0 if other live sessions for this container remain, 1 if this
+# was the last one.
+_cbox_session_end() {
+  local name="$1" f pid
+  rm -f "$_CBOX_SESSION_DIR/.cbox-active-${name}-$$"
+  for f in "$_CBOX_SESSION_DIR/.cbox-active-${name}-"*; do
+    [[ -f "$f" ]] || continue
+    pid="${f##*-}"
+    ps -p "$pid" >/dev/null 2>&1 || rm -f "$f"
+  done
+  compgen -G "$_CBOX_SESSION_DIR/.cbox-active-${name}-*" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------
 # audio (voice mode)
 # ---------------------------------------------------------
 
@@ -321,23 +345,27 @@ _cbox_audio_start() {
 
   _cbox_audio_ensure_config
 
-  if lsof -i :4713 >/dev/null 2>&1; then
-    return 0
+  if ! lsof -i :4713 >/dev/null 2>&1; then
+    echo "Starting PulseAudio for voice mode..."
+    nohup pulseaudio --daemonize=no > /tmp/cbox-pulse.log 2>&1 &
+    disown
+    _CBOX_AUDIO_STARTED=1
+
+    local _i
+    for _i in $(seq 1 20); do
+      sleep 0.3
+      lsof -i :4713 >/dev/null 2>&1 && break
+    done
+
+    if ! lsof -i :4713 >/dev/null 2>&1; then
+      echo "⚠  PulseAudio did not start — check /tmp/cbox-pulse.log"
+      return 1
+    fi
   fi
 
-  echo "Starting PulseAudio for voice mode..."
-  nohup pulseaudio --daemonize=no > /tmp/cbox-pulse.log 2>&1 &
-  disown
-  _CBOX_AUDIO_STARTED=1
-
-  local _i
-  for _i in $(seq 1 20); do
-    sleep 0.3
-    lsof -i :4713 >/dev/null 2>&1 && return 0
-  done
-
-  echo "⚠  PulseAudio did not start — check /tmp/cbox-pulse.log"
-  return 1
+  # module-suspend-on-idle parks sources after a few seconds; voice mode needs
+  # the mic source to stay active, so unload it whenever PulseAudio is running.
+  PULSE_SERVER=tcp:localhost:4713 pactl unload-module module-suspend-on-idle 2>/dev/null || true
 }
 
 _cbox_audio_stop() {
@@ -540,6 +568,8 @@ _cbox_enter() {
   [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]] && \
     _exec_args+=(-e "PULSE_SERVER=$(_cbox_audio_pulse_server)")
 
+  _cbox_session_start "$name"
+
   $_CBOX_CMD exec "${_exec_args[@]}" "$name" zsh -ic "$command"
 
   if [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]]; then
@@ -556,15 +586,24 @@ _cbox_enter() {
     fi
   fi
 
+  local _last_session=1
+  _cbox_session_end "$name" && _last_session=0
+
   if [[ "$stop_on_exit" == "yes" ]]; then
-    echo "Stopping container '$name'..."
-    $_CBOX_CMD stop "$name" >/dev/null
+    if (( _last_session )); then
+      echo "Stopping container '$name'..."
+      $_CBOX_CMD stop "$name" >/dev/null
+    else
+      echo "Session closed. Container '$name' kept alive (other sessions still active)."
+    fi
   fi
 
-  local _cache_base="${XDG_CACHE_HOME:-$HOME/.cache}"
-  [[ -n "$CBOX_SHARE_DIR" && ( "$CBOX_SHARE_DIR" == /tmp/* || "$CBOX_SHARE_DIR" == "$_cache_base"/* ) ]] && \
-    find "$CBOX_SHARE_DIR" -mindepth 1 -delete 2>/dev/null || true
-  unset _cache_base
+  if (( _last_session )); then
+    local _cache_base="${XDG_CACHE_HOME:-$HOME/.cache}"
+    [[ -n "$CBOX_SHARE_DIR" && ( "$CBOX_SHARE_DIR" == /tmp/* || "$CBOX_SHARE_DIR" == "$_cache_base"/* ) ]] && \
+      find "$CBOX_SHARE_DIR" -mindepth 1 -delete 2>/dev/null || true
+    unset _cache_base
+  fi
 }
 
 # ---------------------------------------------------------

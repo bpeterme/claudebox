@@ -256,3 +256,28 @@ setup() {
   [ -f "$BATS_TMPDIR/.cbox-active-otherproject-1" ]
   rm -f "$BATS_TMPDIR/.cbox-active-otherproject-1"
 }
+
+# ---------------------------------------------------------------------------
+# _cbox_list_names
+# ---------------------------------------------------------------------------
+
+@test "_cbox_list_names: returns only names from _cbox_rt_list output" {
+  _cbox_rt_list() { printf "alpha running\nbeta stopped\n"; }
+  run _cbox_list_names
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf 'alpha\nbeta')" ]
+}
+
+@test "_cbox_list_names: returns empty output when no containers exist" {
+  _cbox_rt_list() { return 0; }
+  run _cbox_list_names
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "_cbox_list_names: tolerates _cbox_rt_list failure gracefully" {
+  _cbox_rt_list() { return 1; }
+  run _cbox_list_names
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}

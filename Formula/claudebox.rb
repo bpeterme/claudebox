@@ -13,6 +13,7 @@ class Claudebox < Formula
     bin.install "cbox.sh" => "cbox"
     (share/"claudebox").install "dockerfile"
     (share/"claudebox").install "cbox.env.example"
+    zsh_completion.install "completions/_cbox"
   end
 
   def caveats

@@ -269,14 +269,23 @@ _cbox_audio_ensure_config() {
   mkdir -p "$pulse_conf_dir"
 
   if [[ ! -f "$default_pa" ]]; then
-    local _brew_pa="" _candidate
-    for _candidate in /opt/homebrew/etc/pulse/default.pa /usr/local/etc/pulse/default.pa; do
-      [[ -f "$_candidate" ]] && _brew_pa="$_candidate" && break
-    done
+    local _brew_pa="" _candidate _brew_prefix
+    if [[ -n "${HOMEBREW_PREFIX:-}" ]]; then
+      # Explicit custom Homebrew install — trust it and don't look elsewhere
+      [[ -f "$HOMEBREW_PREFIX/etc/pulse/default.pa" ]] && _brew_pa="$HOMEBREW_PREFIX/etc/pulse/default.pa"
+    else
+      _brew_prefix=$(brew --prefix 2>/dev/null) || _brew_prefix=""
+      for _candidate in \
+          "${_brew_prefix:+$_brew_prefix/etc/pulse/default.pa}" \
+          /opt/homebrew/etc/pulse/default.pa \
+          /usr/local/etc/pulse/default.pa; do
+        [[ -n "$_candidate" && -f "$_candidate" ]] && _brew_pa="$_candidate" && break
+      done
+    fi
     { [[ -n "$_brew_pa" ]] && echo ".include $_brew_pa"; \
       echo "load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1;10.0.0.0/8;172.16.0.0/12;192.168.0.0/16"; \
     } > "$default_pa"
-    unset _brew_pa _candidate
+    unset _brew_pa _candidate _brew_prefix
   else
     if ! grep -q "module-native-protocol-tcp" "$default_pa"; then
       echo "load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1;10.0.0.0/8;172.16.0.0/12;192.168.0.0/16" >> "$default_pa"

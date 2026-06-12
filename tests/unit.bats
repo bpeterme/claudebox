@@ -130,6 +130,25 @@ setup() {
   _cbox_audio_ensure_config
   run grep "module-native-protocol-tcp" "$XDG_CONFIG_HOME/pulse/default.pa"
   [ "$status" -eq 0 ]
+  run grep "module-coreaudio" "$XDG_CONFIG_HOME/pulse/default.pa"
+  [ "$status" -eq 0 ]
+}
+
+@test "_cbox_audio_ensure_config: uses HOMEBREW_PREFIX over global brew paths" {
+  export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config-hbp"
+  local fake_brew="$BATS_TMPDIR/fakebrew"
+  mkdir -p "$fake_brew/etc/pulse"
+  echo "# custom brew default.pa" > "$fake_brew/etc/pulse/default.pa"
+  # Also create a decoy at the standard path to confirm it is not used
+  mkdir -p "$BATS_TMPDIR/opt-homebrew/etc/pulse"
+  echo "# global brew default.pa" > "$BATS_TMPDIR/opt-homebrew/etc/pulse/default.pa"
+  HOMEBREW_PREFIX="$fake_brew" _cbox_audio_ensure_config
+  # Generated file must .include the custom brew path
+  run grep "$fake_brew" "$XDG_CONFIG_HOME/pulse/default.pa"
+  [ "$status" -eq 0 ]
+  # The global decoy path must not be referenced
+  run grep "opt-homebrew" "$XDG_CONFIG_HOME/pulse/default.pa"
+  [ "$status" -ne 0 ]
 }
 
 @test "_cbox_audio_ensure_config: appends TCP module to existing default.pa without overwriting" {
@@ -141,15 +160,29 @@ setup() {
   [ "$status" -eq 0 ]
   run grep "module-native-protocol-tcp" "$XDG_CONFIG_HOME/pulse/default.pa"
   [ "$status" -eq 0 ]
+  run grep "module-coreaudio" "$XDG_CONFIG_HOME/pulse/default.pa"
+  [ "$status" -eq 0 ]
 }
 
-@test "_cbox_audio_ensure_config: does not modify default.pa if TCP module already present" {
+@test "_cbox_audio_ensure_config: does not duplicate TCP module if already present" {
   export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config3"
   mkdir -p "$XDG_CONFIG_HOME/pulse"
   echo "load-module module-native-protocol-tcp" > "$XDG_CONFIG_HOME/pulse/default.pa"
   _cbox_audio_ensure_config
-  run wc -l < "$XDG_CONFIG_HOME/pulse/default.pa"
+  run grep -c "module-native-protocol-tcp" "$XDG_CONFIG_HOME/pulse/default.pa"
   [ "$output" -eq 1 ]
+  run grep "module-coreaudio" "$XDG_CONFIG_HOME/pulse/default.pa"
+  [ "$status" -eq 0 ]
+}
+
+@test "_cbox_audio_ensure_config: does not add coreaudio if .include already present" {
+  export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config5"
+  mkdir -p "$XDG_CONFIG_HOME/pulse"
+  printf ".include /opt/homebrew/etc/pulse/default.pa\nload-module module-native-protocol-tcp\n" \
+    > "$XDG_CONFIG_HOME/pulse/default.pa"
+  _cbox_audio_ensure_config
+  run grep -c "module-coreaudio" "$XDG_CONFIG_HOME/pulse/default.pa"
+  [ "$output" -eq 0 ]
 }
 
 @test "_cbox_audio_ensure_config: adds exit-idle-time to daemon.conf" {

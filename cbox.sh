@@ -321,23 +321,27 @@ _cbox_audio_start() {
 
   _cbox_audio_ensure_config
 
-  if lsof -i :4713 >/dev/null 2>&1; then
-    return 0
+  if ! lsof -i :4713 >/dev/null 2>&1; then
+    echo "Starting PulseAudio for voice mode..."
+    nohup pulseaudio --daemonize=no > /tmp/cbox-pulse.log 2>&1 &
+    disown
+    _CBOX_AUDIO_STARTED=1
+
+    local _i
+    for _i in $(seq 1 20); do
+      sleep 0.3
+      lsof -i :4713 >/dev/null 2>&1 && break
+    done
+
+    if ! lsof -i :4713 >/dev/null 2>&1; then
+      echo "⚠  PulseAudio did not start — check /tmp/cbox-pulse.log"
+      return 1
+    fi
   fi
 
-  echo "Starting PulseAudio for voice mode..."
-  nohup pulseaudio --daemonize=no > /tmp/cbox-pulse.log 2>&1 &
-  disown
-  _CBOX_AUDIO_STARTED=1
-
-  local _i
-  for _i in $(seq 1 20); do
-    sleep 0.3
-    lsof -i :4713 >/dev/null 2>&1 && return 0
-  done
-
-  echo "⚠  PulseAudio did not start — check /tmp/cbox-pulse.log"
-  return 1
+  # module-suspend-on-idle parks sources after a few seconds; voice mode needs
+  # the mic source to stay active, so unload it whenever PulseAudio is running.
+  PULSE_SERVER=tcp:localhost:4713 pactl unload-module module-suspend-on-idle 2>/dev/null || true
 }
 
 _cbox_audio_stop() {

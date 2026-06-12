@@ -25,7 +25,8 @@ RUN apt-get update && apt-get install -y \
     iotop \
     sox \
     libsox-fmt-pulse \
-    pulseaudio-utils
+    pulseaudio-utils \
+    libasound2-plugins
 
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs
@@ -39,6 +40,9 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
       > /etc/apt/sources.list.d/github-cli.list && \
     apt-get update && apt-get install -y gh
+
+# Route ALSA default device through PulseAudio so voice mode works via PULSE_SERVER
+RUN printf 'pcm.!default {\n    type pulse\n}\nctl.!default {\n    type pulse\n}\n' > /etc/asound.conf
 
 ARG HOST_UID=1000
 RUN useradd -ms /bin/zsh -u $HOST_UID claude && \

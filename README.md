@@ -103,6 +103,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_ZSHRC` | *(unset)* | `.zshrc` to source as `~/.zshrc.global` inside the container (**read-only**); unset = none |
 | `CBOX_BUILD_DIR` | cbox.sh directory | Build context for `cbox rebuild` |
 | `BUILD_PLAYWRIGHT` | `0` | Set to `1` to include Playwright + Chromium in the image |
+| `CBOX_AUDIO` | *(unset)* | Set to `1` to enable Claude Code voice mode (requires PulseAudio on host) |
 
 > [!WARNING]
 > **Do not place `CBOX_CLAUDE_DIR` (default `~/.claude`) or your project directories on iCloud Drive, Dropbox Smart Sync, Google Drive Stream, or any on-demand cloud storage.** These services evict file contents to stubs when not recently accessed. A container mounting an evicted path will fail to read files that appear to exist on disk — a subtle failure that is hard to diagnose.
@@ -118,6 +119,7 @@ The image is based on Ubuntu 24.04 and includes:
 - Git, git-crypt, openssh-client
 - ripgrep, fd-find, jq, eza
 - zsh with autosuggestions and syntax highlighting
+- SoX + PulseAudio client (for voice mode)
 - Playwright + Chromium (opt-in via `BUILD_PLAYWRIGHT=1`)
 
 The container user is `claude` (UID matches your host UID to avoid permission issues on mounted volumes).
@@ -125,6 +127,53 @@ The container user is `claude` (UID matches your host UID to avoid permission is
 ## macOS: Screenshot Script
 
 [`macos/screenshot.sh`](macos/screenshot.sh) captures an interactive screenshot (drag to select a region, same as ⇧⌘4) and saves it directly to the container's `~/share/` folder. It reads `~/.config/claudebox/cbox.env` automatically so no path configuration is needed. See [`macos/README.md`](macos/README.md) for how to assign a keyboard shortcut via Automator, Hammerspoon, or Raycast.
+
+## Voice Mode
+
+Claude Code's `/voice` command lets you dictate prompts using your microphone. Inside a container there is no direct audio device, so claudebox bridges your Mac's microphone via PulseAudio over TCP.
+
+### Setup (one time)
+
+**1. Install PulseAudio on your Mac:**
+
+```bash
+brew install pulseaudio
+```
+
+**2. Enable audio in your claudebox config:**
+
+```bash
+# ~/.config/claudebox/cbox.env
+CBOX_AUDIO=1
+```
+
+**3. Rebuild the container image** to include the SoX PulseAudio backend:
+
+```bash
+cbox rebuild
+```
+
+That's it. On every `cbox` session, claudebox automatically starts PulseAudio before entering the container and stops it on exit. Inside the container, run `/voice` to activate dictation.
+
+### Requirements
+
+- Claude.ai account (voice dictation is not available with a raw API key or third-party providers)
+- macOS with Apple Container or Docker Desktop; PulseAudio TCP is not supported in `cbox safe` mode
+
+### Troubleshooting
+
+Run `cbox doctor` to check PulseAudio status. If voice fails inside the container:
+
+```bash
+# Test PulseAudio connectivity from inside the container
+pactl info
+```
+
+If `pactl` cannot connect, PulseAudio may not be running on the host. Start it manually:
+
+```bash
+nohup pulseaudio --daemonize=no > /tmp/cbox-pulse.log 2>&1 &
+```
 
 ## How It Works
 

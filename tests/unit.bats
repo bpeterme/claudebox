@@ -120,3 +120,59 @@ setup() {
   run python3 -c "import json,sys; d=json.load(open('$f')); sys.exit(0 if 'mytool' in d.get('mcpServers',{}) else 1)"
   [ "$status" -eq 0 ]
 }
+
+# ---------------------------------------------------------------------------
+# _cbox_audio_ensure_config
+# ---------------------------------------------------------------------------
+
+@test "_cbox_audio_ensure_config: creates default.pa with TCP module when absent" {
+  export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config"
+  _cbox_audio_ensure_config
+  run grep "module-native-protocol-tcp" "$XDG_CONFIG_HOME/pulse/default.pa"
+  [ "$status" -eq 0 ]
+}
+
+@test "_cbox_audio_ensure_config: appends TCP module to existing default.pa without overwriting" {
+  export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config2"
+  mkdir -p "$XDG_CONFIG_HOME/pulse"
+  echo "existing-content" > "$XDG_CONFIG_HOME/pulse/default.pa"
+  _cbox_audio_ensure_config
+  run grep "existing-content" "$XDG_CONFIG_HOME/pulse/default.pa"
+  [ "$status" -eq 0 ]
+  run grep "module-native-protocol-tcp" "$XDG_CONFIG_HOME/pulse/default.pa"
+  [ "$status" -eq 0 ]
+}
+
+@test "_cbox_audio_ensure_config: does not modify default.pa if TCP module already present" {
+  export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config3"
+  mkdir -p "$XDG_CONFIG_HOME/pulse"
+  echo "load-module module-native-protocol-tcp" > "$XDG_CONFIG_HOME/pulse/default.pa"
+  _cbox_audio_ensure_config
+  run wc -l < "$XDG_CONFIG_HOME/pulse/default.pa"
+  [ "$output" -eq 1 ]
+}
+
+@test "_cbox_audio_ensure_config: adds exit-idle-time to daemon.conf" {
+  export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config4"
+  _cbox_audio_ensure_config
+  run grep "exit-idle-time" "$XDG_CONFIG_HOME/pulse/daemon.conf"
+  [ "$status" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# _cbox_audio_pulse_server
+# ---------------------------------------------------------------------------
+
+@test "_cbox_audio_pulse_server: returns apple gateway for apple runtime" {
+  _CBOX_RUNTIME="apple"
+  run _cbox_audio_pulse_server
+  [ "$status" -eq 0 ]
+  [ "$output" = "tcp:192.168.64.1:4713" ]
+}
+
+@test "_cbox_audio_pulse_server: returns docker hostname for docker runtime" {
+  _CBOX_RUNTIME="docker"
+  run _cbox_audio_pulse_server
+  [ "$status" -eq 0 ]
+  [ "$output" = "tcp:host.docker.internal:4713" ]
+}

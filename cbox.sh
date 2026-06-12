@@ -277,8 +277,16 @@ _cbox_audio_ensure_config() {
       echo "load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1;10.0.0.0/8;172.16.0.0/12;192.168.0.0/16"; \
     } > "$default_pa"
     unset _brew_pa _candidate
-  elif ! grep -q "module-native-protocol-tcp" "$default_pa"; then
-    echo "load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1;10.0.0.0/8;172.16.0.0/12;192.168.0.0/16" >> "$default_pa"
+  else
+    if ! grep -q "module-native-protocol-tcp" "$default_pa"; then
+      echo "load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1;10.0.0.0/8;172.16.0.0/12;192.168.0.0/16" >> "$default_pa"
+    fi
+  fi
+
+  # Ensure CoreAudio device detection is loaded — required on macOS.
+  # A .include of brew's default.pa already covers this; only add explicitly if absent.
+  if ! grep -qE "(\.include|module-coreaudio)" "$default_pa"; then
+    echo "load-module module-coreaudio-detect" >> "$default_pa"
   fi
 
   if ! grep -q "exit-idle-time" "$daemon_conf" 2>/dev/null; then

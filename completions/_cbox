@@ -1,39 +1,20 @@
 #compdef cbox
 
 _cbox() {
-  local state
-  _arguments \
-    '1: :->subcommand' \
-    '2: :->name' && return
+  local -a containers
 
-  case $state in
-    subcommand)
-      local -a subcmds
-      subcmds=(
-        'list:List cbox containers'
-        'stop:Stop current project container'
-        'reset:Remove a container'
-        'prune:Remove stopped cbox containers'
-        'rebuild:Rebuild container image'
-        'update:Force Claude Code update'
-        'doctor:Run environment diagnostics'
-        'safe:Start or enter safe container'
-        'shell:Open zsh shell instead of the container'
-        'keepalive:Keep container alive after exit'
-        'version:Show version'
-        'help:Show help'
-      )
-      _describe 'subcommand' subcmds
+  case $CURRENT in
+    2)
+      compadd list stop reset prune rebuild update doctor safe shell keepalive version help
       ;;
-    name)
+    3)
       if [[ "${words[2]}" == "reset" ]]; then
-        local -a containers
         if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
           containers=($(container ls --all 2>/dev/null | awk 'NR>1 {print $1}'))
         else
           containers=($(docker ps -a --format "{{.Names}}" 2>/dev/null))
         fi
-        _describe 'container' containers
+        (( ${#containers[@]} )) && compadd -a containers
       fi
       ;;
   esac

@@ -881,35 +881,15 @@ _cbox_list_names() {
 
 if [[ -n "${ZSH_VERSION:-}" ]]; then
   _cbox_zsh_complete() {
-    local state
-    _arguments \
-      '1: :->subcommand' \
-      '2: :->name' && return
-
-    case $state in
-      subcommand)
-        local -a subcmds
-        subcmds=(
-          'list:List cbox containers'
-          'stop:Stop current project container'
-          'reset:Remove a container'
-          'prune:Remove stopped cbox containers'
-          'rebuild:Rebuild container image'
-          'update:Force Claude Code update'
-          'doctor:Run environment diagnostics'
-          'safe:Start or enter safe container'
-          'shell:Open zsh shell instead of the container'
-          'keepalive:Keep container alive after exit'
-          'version:Show version'
-          'help:Show help'
-        )
-        _describe 'subcommand' subcmds
+    case $CURRENT in
+      2)
+        compadd list stop reset prune rebuild update doctor safe shell keepalive version help
         ;;
-      name)
+      3)
         if [[ "${words[2]}" == "reset" ]]; then
           local -a containers
           containers=($(_cbox_list_names))
-          _describe 'container' containers
+          (( ${#containers[@]} )) && compadd -a containers
         fi
         ;;
     esac

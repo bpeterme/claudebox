@@ -255,7 +255,80 @@ _cbox_resolve_path() {
   echo "$path"
 }
 
+# ---------------------------------------------------------
+# audio (voice mode)
+# ---------------------------------------------------------
 
+_CBOX_AUDIO_STARTED=0
+
+_cbox_audio_ensure_config() {
+  local pulse_conf_dir="${XDG_CONFIG_HOME:-$HOME/.config}/pulse"
+  local default_pa="$pulse_conf_dir/default.pa"
+  local daemon_conf="$pulse_conf_dir/daemon.conf"
+
+  mkdir -p "$pulse_conf_dir"
+
+  if [[ ! -f "$default_pa" ]]; then
+    local _brew_pa="" _candidate
+    for _candidate in /opt/homebrew/etc/pulse/default.pa /usr/local/etc/pulse/default.pa; do
+      [[ -f "$_candidate" ]] && _brew_pa="$_candidate" && break
+    done
+    { [[ -n "$_brew_pa" ]] && echo ".include $_brew_pa"; \
+      echo "load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1;10.0.0.0/8;172.16.0.0/12;192.168.0.0/16"; \
+    } > "$default_pa"
+    unset _brew_pa _candidate
+  elif ! grep -q "module-native-protocol-tcp" "$default_pa"; then
+    echo "load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1;10.0.0.0/8;172.16.0.0/12;192.168.0.0/16" >> "$default_pa"
+  fi
+
+  if ! grep -q "exit-idle-time" "$daemon_conf" 2>/dev/null; then
+    echo "exit-idle-time = -1" >> "$daemon_conf"
+  fi
+}
+
+_cbox_audio_pulse_server() {
+  if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
+    echo "tcp:192.168.64.1:4713"
+  else
+    echo "tcp:host.docker.internal:4713"
+  fi
+}
+
+_cbox_audio_start() {
+  _CBOX_AUDIO_STARTED=0
+
+  command -v pulseaudio >/dev/null 2>&1 || {
+    echo "⚠  CBOX_AUDIO set but PulseAudio not found — install: brew install pulseaudio"
+    return 1
+  }
+
+  _cbox_audio_ensure_config
+
+  if lsof -i :4713 >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "Starting PulseAudio for voice mode..."
+  nohup pulseaudio --daemonize=no > /tmp/cbox-pulse.log 2>&1 &
+  disown
+  _CBOX_AUDIO_STARTED=1
+
+  local _i
+  for _i in $(seq 1 20); do
+    sleep 0.3
+    lsof -i :4713 >/dev/null 2>&1 && return 0
+  done
+
+  echo "⚠  PulseAudio did not start — check /tmp/cbox-pulse.log"
+  return 1
+}
+
+_cbox_audio_stop() {
+  [[ "${_CBOX_AUDIO_STARTED:-0}" == "1" ]] || return 0
+  echo "Stopping PulseAudio..."
+  pulseaudio --kill 2>/dev/null || true
+  _CBOX_AUDIO_STARTED=0
+}
 
 # ---------------------------------------------------------
 # container creation
@@ -440,9 +513,21 @@ _cbox_enter() {
     fi
   fi
 
+  if [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]]; then
+    _cbox_audio_start || true
+  fi
+
   echo "Entering container '$name'..."
 
-  $_CBOX_CMD exec -it -w "/Workspace/$name" "$name" zsh -ic "$command"
+  local _exec_args=(-it -w "/Workspace/$name")
+  [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]] && \
+    _exec_args+=(-e "PULSE_SERVER=$(_cbox_audio_pulse_server)")
+
+  $_CBOX_CMD exec "${_exec_args[@]}" "$name" zsh -ic "$command"
+
+  if [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]]; then
+    _cbox_audio_stop
+  fi
 
   if [[ "$command" == "claude" && "$mode" != "safe" ]]; then
     if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
@@ -516,6 +601,17 @@ _cbox_doctor_inline() {
       || echo "✘ custom zshrc missing ($CBOX_ZSHRC)"
   else
     echo "ℹ no custom zshrc configured (CBOX_ZSHRC unset)"
+  fi
+
+  if [[ -n "${CBOX_AUDIO:-}" ]]; then
+    command -v pulseaudio >/dev/null 2>&1 \
+      && echo "✔ PulseAudio installed" \
+      || echo "✘ PulseAudio not found (CBOX_AUDIO set) — install: brew install pulseaudio"
+    lsof -i :4713 >/dev/null 2>&1 \
+      && echo "✔ PulseAudio listening on :4713" \
+      || echo "ℹ PulseAudio not running (will auto-start on next cbox session)"
+  else
+    echo "ℹ voice mode disabled (set CBOX_AUDIO=1 in cbox.env to enable)"
   fi
 }
 

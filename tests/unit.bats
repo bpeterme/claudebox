@@ -209,3 +209,50 @@ setup() {
   [ "$status" -eq 0 ]
   [ "$output" = "tcp:host.docker.internal:4713" ]
 }
+
+# ---------------------------------------------------------------------------
+# _cbox_session_start / _cbox_session_end
+# ---------------------------------------------------------------------------
+
+@test "_cbox_session_start: creates marker file for the current PID" {
+  _CBOX_SESSION_DIR="$BATS_TMPDIR"
+  _cbox_session_start "myproject"
+  [ -f "$BATS_TMPDIR/.cbox-active-myproject-$$" ]
+  rm -f "$BATS_TMPDIR/.cbox-active-myproject-$$"
+}
+
+@test "_cbox_session_end: removes own marker and returns 1 when no other sessions" {
+  _CBOX_SESSION_DIR="$BATS_TMPDIR"
+  touch "$BATS_TMPDIR/.cbox-active-myproject-$$"
+  run _cbox_session_end "myproject"
+  [ "$status" -eq 1 ]
+  [ ! -f "$BATS_TMPDIR/.cbox-active-myproject-$$" ]
+}
+
+@test "_cbox_session_end: returns 0 when another live session exists" {
+  _CBOX_SESSION_DIR="$BATS_TMPDIR"
+  touch "$BATS_TMPDIR/.cbox-active-myproject-$$"
+  # Simulate a second session owned by the current shell's parent (init/PID 1 always alive)
+  touch "$BATS_TMPDIR/.cbox-active-myproject-1"
+  run _cbox_session_end "myproject"
+  [ "$status" -eq 0 ]
+  rm -f "$BATS_TMPDIR/.cbox-active-myproject-1"
+}
+
+@test "_cbox_session_end: cleans up stale marker files from dead PIDs" {
+  _CBOX_SESSION_DIR="$BATS_TMPDIR"
+  touch "$BATS_TMPDIR/.cbox-active-myproject-$$"
+  # Use a PID that is guaranteed to not exist
+  touch "$BATS_TMPDIR/.cbox-active-myproject-999999999"
+  _cbox_session_end "myproject" || true
+  [ ! -f "$BATS_TMPDIR/.cbox-active-myproject-999999999" ]
+}
+
+@test "_cbox_session_end: does not remove markers from a different container" {
+  _CBOX_SESSION_DIR="$BATS_TMPDIR"
+  touch "$BATS_TMPDIR/.cbox-active-myproject-$$"
+  touch "$BATS_TMPDIR/.cbox-active-otherproject-1"
+  _cbox_session_end "myproject" || true
+  [ -f "$BATS_TMPDIR/.cbox-active-otherproject-1" ]
+  rm -f "$BATS_TMPDIR/.cbox-active-otherproject-1"
+}

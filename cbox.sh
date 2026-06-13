@@ -871,6 +871,47 @@ cbox() {
   esac
 }
 
+# ---------------------------------------------------------
+# shell completions (sourced case)
+# ---------------------------------------------------------
+
+_cbox_list_names() {
+  _cbox_rt_list 2>/dev/null | awk '{print $1}'
+}
+
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+  _cbox_zsh_complete() {
+    case $CURRENT in
+      2)
+        compadd list stop reset prune rebuild update doctor safe shell keepalive version help
+        ;;
+      3)
+        if [[ "${words[2]}" == "reset" ]]; then
+          local -a containers
+          containers=($(_cbox_list_names))
+          (( ${#containers[@]} )) && compadd -a containers
+        fi
+        ;;
+    esac
+  }
+  (( ${+functions[compdef]} )) && compdef _cbox_zsh_complete cbox
+elif [[ -n "${BASH_VERSION:-}" ]]; then
+  _cbox_bash_complete() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local prev="${COMP_WORDS[COMP_CWORD-1]}"
+    COMPREPLY=()
+
+    if [[ $COMP_CWORD -eq 1 ]]; then
+      COMPREPLY=( $(compgen -W \
+        "list stop reset prune rebuild update doctor safe shell keepalive version help" \
+        -- "$cur") )
+    elif [[ $COMP_CWORD -eq 2 && "$prev" == "reset" ]]; then
+      COMPREPLY=( $(compgen -W "$(_cbox_list_names)" -- "$cur") )
+    fi
+  }
+  complete -F _cbox_bash_complete cbox
+fi
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   set -euo pipefail
   cbox "$@"

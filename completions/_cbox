@@ -1,0 +1,23 @@
+#compdef cbox
+
+_cbox() {
+  local -a containers
+
+  case $CURRENT in
+    2)
+      compadd list stop reset prune rebuild update doctor safe shell keepalive version help
+      ;;
+    3)
+      if [[ "${words[2]}" == "reset" ]]; then
+        if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
+          containers=($(container ls --all 2>/dev/null | awk 'NR>1 {print $1}'))
+        else
+          containers=($(docker ps -a --format "{{.Names}}" 2>/dev/null))
+        fi
+        (( ${#containers[@]} )) && compadd -a containers
+      fi
+      ;;
+  esac
+}
+
+_cbox "$@"

@@ -164,15 +164,18 @@ _cbox_mode() {
 
 _cbox_generate_claude_json() {
   local name="$1"
+  local portmap="$CBOX_DATA_DIR/.mcp-portmap-$name.json"
+  local gateway
+  gateway=$(_cbox_mcp_host_gateway)
 
   mkdir -p "$CBOX_DATA_DIR"
 
   local claude_json="$CBOX_DATA_DIR/.claude-$name.json"
 
-  python3 - "$claude_json" "$name" <<'PYEOF'
+  python3 - "$claude_json" "$name" "$portmap" "$gateway" <<'PYEOF'
 import json, sys, os
 
-project_file, name = sys.argv[1], sys.argv[2]
+project_file, name, portmap_file, gateway = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
 try:
     with open(project_file) as f:
@@ -186,9 +189,38 @@ try:
 except (FileNotFoundError, json.JSONDecodeError):
     host = {}
 
-# Host wins for mcpServers (user-wide config); omit key if host has none
+try:
+    with open(portmap_file) as f:
+        portmap = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    portmap = {}
+
+def is_native(cmd):
+    if not cmd:
+        return False
+    home = os.path.expanduser("~")
+    expanded = os.path.expanduser(str(cmd))
+    return (
+        expanded.startswith("/Applications/") or
+        expanded.startswith(home + "/Library/") or
+        expanded.startswith(home + "/Applications/") or
+        ".app/Contents/" in expanded
+    )
+
+# Host wins for mcpServers; native entries are rewritten to SSE via proxy
 if "mcpServers" in host:
-    project["mcpServers"] = host["mcpServers"]
+    container_mcp = {}
+    for sname, scfg in host["mcpServers"].items():
+        cmd = scfg.get("command", "")
+        if is_native(cmd) and sname in portmap:
+            port = portmap[sname]["port"]
+            container_mcp[sname] = {
+                "type": "sse",
+                "url": f"http://{gateway}:{port}/sse"
+            }
+        else:
+            container_mcp[sname] = scfg
+    project["mcpServers"] = container_mcp
 
 # Ensure required container defaults
 project["hasCompletedOnboarding"] = True
@@ -373,6 +405,164 @@ _cbox_audio_stop() {
   echo "Stopping PulseAudio..."
   pulseaudio --kill 2>/dev/null || true
   _CBOX_AUDIO_STARTED=0
+}
+
+# ---------------------------------------------------------
+# MCP host-native proxy
+# ---------------------------------------------------------
+
+_cbox_mcp_host_gateway() {
+  if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
+    echo "192.168.64.1"
+  else
+    echo "host.docker.internal"
+  fi
+}
+
+# Detects host-native MCP servers, starts supergateway proxies for each, and
+# writes a portmap file ($CBOX_DATA_DIR/.mcp-portmap-$name.json) recording
+# {server_name: {port, pid}} so _cbox_generate_claude_json can rewrite entries.
+_cbox_mcp_proxies_ensure() {
+  local name="$1"
+  local portmap="$CBOX_DATA_DIR/.mcp-portmap-$name.json"
+
+  command -v npx >/dev/null 2>&1 || return 0
+
+  python3 - "$portmap" "$CBOX_DATA_DIR" <<'PYEOF'
+import json, os, sys, subprocess, time, socket, glob, shlex
+
+portmap_file, data_dir = sys.argv[1], sys.argv[2]
+
+try:
+    with open(portmap_file) as f:
+        portmap = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    portmap = {}
+
+try:
+    with open(os.path.expanduser("~/.claude.json")) as f:
+        host = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    host = {}
+
+def is_native(cmd):
+    if not cmd:
+        return False
+    home = os.path.expanduser("~")
+    expanded = os.path.expanduser(str(cmd))
+    return (
+        expanded.startswith("/Applications/") or
+        expanded.startswith(home + "/Library/") or
+        expanded.startswith(home + "/Applications/") or
+        ".app/Contents/" in expanded
+    )
+
+def is_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+def next_port():
+    used = set()
+    for pf in glob.glob(os.path.join(data_dir, ".mcp-portmap-*.json")):
+        try:
+            with open(pf) as f:
+                pm = json.load(f)
+            for v in pm.values():
+                if "port" in v:
+                    used.add(v["port"])
+        except Exception:
+            pass
+    p = 39100
+    while p in used:
+        p += 1
+    return p
+
+def wait_for_port(port, timeout=8.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=0.2)
+            s.close()
+            return True
+        except OSError:
+            time.sleep(0.3)
+    return False
+
+mcp_servers = host.get("mcpServers", {})
+new_portmap = {}
+
+for sname, scfg in mcp_servers.items():
+    cmd = scfg.get("command", "")
+    if not is_native(cmd):
+        continue
+
+    existing = portmap.get(sname, {})
+    if existing and is_alive(existing.get("pid", 0)):
+        new_portmap[sname] = existing
+        continue
+
+    port = next_port()
+    args = scfg.get("args", [])
+    env_vars = scfg.get("env", {})
+
+    env_prefix = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_vars.items())
+    arg_str = " ".join(shlex.quote(str(a)) for a in args)
+    full_cmd = " ".join(filter(None, [env_prefix, shlex.quote(cmd), arg_str]))
+
+    log_path = f"/tmp/cbox-mcp-{sname}.log"
+    try:
+        proc = subprocess.Popen(
+            ["npx", "-y", "supergateway", "--stdio", full_cmd, "--port", str(port)],
+            stdout=open(log_path, "w"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except Exception as e:
+        print(f"  ⚠  MCP proxy '{sname}' failed to launch: {e}")
+        continue
+
+    if wait_for_port(port):
+        new_portmap[sname] = {"port": port, "pid": proc.pid}
+        print(f"  ✔ MCP proxy '{sname}' on :{port}")
+    else:
+        print(f"  ⚠  MCP proxy '{sname}' did not start — check {log_path}")
+        proc.terminate()
+
+with open(portmap_file, "w") as f:
+    json.dump(new_portmap, f)
+PYEOF
+}
+
+_cbox_mcp_proxies_stop() {
+  local name="$1"
+  local portmap="$CBOX_DATA_DIR/.mcp-portmap-$name.json"
+  [[ -f "$portmap" ]] || return 0
+
+  python3 - "$portmap" <<'PYEOF'
+import json, os, sys, signal
+
+portmap_file = sys.argv[1]
+try:
+    with open(portmap_file) as f:
+        portmap = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    sys.exit(0)
+
+for sname, info in portmap.items():
+    pid = info.get("pid")
+    if not pid:
+        continue
+    try:
+        pgid = os.getpgid(int(pid))
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+os.remove(portmap_file)
+PYEOF
 }
 
 # ---------------------------------------------------------
@@ -562,6 +752,11 @@ _cbox_enter() {
     _cbox_audio_start || true
   fi
 
+  if [[ "$mode" != "safe" ]]; then
+    _cbox_mcp_proxies_ensure "$name"
+    _cbox_generate_claude_json "$name"
+  fi
+
   echo "Entering container '$name'..."
 
   local _exec_args=(-it -w "/Workspace/$name")
@@ -599,6 +794,7 @@ _cbox_enter() {
   fi
 
   if (( _last_session )); then
+    _cbox_mcp_proxies_stop "$name"
     local _cache_base="${XDG_CACHE_HOME:-$HOME/.cache}"
     [[ -n "$CBOX_SHARE_DIR" && ( "$CBOX_SHARE_DIR" == /tmp/* || "$CBOX_SHARE_DIR" == "$_cache_base"/* ) ]] && \
       find "$CBOX_SHARE_DIR" -mindepth 1 -delete 2>/dev/null || true
@@ -726,6 +922,37 @@ _cbox_doctor() {
   else
     echo "ℹ container does not exist yet"
   fi
+
+  echo
+  echo "[mcp proxies]"
+  local _portmap="$CBOX_DATA_DIR/.mcp-portmap-$name.json"
+  if [[ -f "$_portmap" ]]; then
+    python3 - "$_portmap" <<'PYEOF'
+import json, os, sys
+
+portmap_file = sys.argv[1]
+try:
+    with open(portmap_file) as f:
+        portmap = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    portmap = {}
+
+if not portmap:
+    print("ℹ no host-native MCP proxies active")
+else:
+    for sname, info in portmap.items():
+        pid = info.get("pid", 0)
+        port = info.get("port", "?")
+        try:
+            os.kill(int(pid), 0)
+            print(f"✔ {sname}: running on :{port} (pid {pid})")
+        except (OSError, ValueError):
+            print(f"✘ {sname}: dead (was on :{port}, pid {pid})")
+PYEOF
+  else
+    echo "ℹ no host-native MCP proxies active"
+  fi
+  unset _portmap
 }
 
 # ---------------------------------------------------------

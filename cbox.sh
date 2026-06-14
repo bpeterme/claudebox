@@ -30,7 +30,7 @@ Usage:
 
 Container Management:
   cbox list             List cbox containers
-  cbox stop             Stop current project container
+  cbox stop [name]      Stop current (or named) container
   cbox reset            Remove current project container
   cbox prune            Remove stopped cbox containers
   cbox rebuild          Rebuild container image
@@ -1016,12 +1016,13 @@ cbox() {
       ;;
 
     stop)
-      if ! _cbox_exists "$name"; then
-        echo "No container found for '$name'."
+      local stop_target="${2:-$name}"
+      if ! _cbox_exists "$stop_target"; then
+        echo "No container found for '$stop_target'."
         return 0
       fi
-      echo "Stopping container '$name'..."
-      $_CBOX_CMD stop "$name" >/dev/null
+      echo "Stopping container '$stop_target'..."
+      $_CBOX_CMD stop "$stop_target" >/dev/null
       ;;
 
     reset)
@@ -1149,7 +1150,7 @@ if [[ -n "${ZSH_VERSION:-}" ]]; then
         compadd list stop reset prune rebuild update doctor safe shell keepalive version help
         ;;
       3)
-        if [[ "${words[2]}" == "reset" ]]; then
+        if [[ "${words[2]}" == "reset" || "${words[2]}" == "stop" ]]; then
           local -a containers
           containers=($(_cbox_list_names))
           (( ${#containers[@]} )) && compadd -a containers
@@ -1168,7 +1169,7 @@ elif [[ -n "${BASH_VERSION:-}" ]]; then
       COMPREPLY=( $(compgen -W \
         "list stop reset prune rebuild update doctor safe shell keepalive version help" \
         -- "$cur") )
-    elif [[ $COMP_CWORD -eq 2 && "$prev" == "reset" ]]; then
+    elif [[ $COMP_CWORD -eq 2 && ( "$prev" == "reset" || "$prev" == "stop" ) ]]; then
       COMPREPLY=( $(compgen -W "$(_cbox_list_names)" -- "$cur") )
     fi
   }

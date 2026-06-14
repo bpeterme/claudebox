@@ -23,10 +23,13 @@ _cbox_help() {
 cbox - Claude Container Runtime
 
 Usage:
-  cbox                  Start or enter normal container
+  cbox [-v]             Start or enter normal container
   cbox safe             Start or enter safe container
   cbox shell            Open zsh shell instead of the container
   cbox keepalive        Keep container alive for 10 minutes after exit
+
+Options:
+  -v, --verbose         Show full output (updates, sync, MCP proxy status)
 
 Container Management:
   cbox list             List cbox containers
@@ -67,6 +70,7 @@ _CBOX_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
 [[ -f "$_CBOX_CONFIG" ]] && . "$_CBOX_CONFIG"
 unset _CBOX_CONFIG
 
+CBOX_VERBOSE="${CBOX_VERBOSE:-0}"
 CBOX_DATA_DIR="${CBOX_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/claudebox}"
 CBOX_CLAUDE_DIR="${CBOX_CLAUDE_DIR:-$HOME/.claude}"
 CBOX_HOST_CONFIG_DIR="${CBOX_HOST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}}"
@@ -99,6 +103,8 @@ fi
 # ---------------------------------------------------------
 # helpers
 # ---------------------------------------------------------
+
+_cbox_log() { [[ "${CBOX_VERBOSE:-0}" == "1" ]] && echo "$@" || true; }
 
 _cbox_name() {
   local name
@@ -246,11 +252,14 @@ _cbox_maybe_update() {
   local stamp="${TMPDIR:-/tmp}/.cbox-update-$(date +%Y-%m-%d)"
 
   if [[ ! -f "$stamp" ]]; then
-    echo "Updating Claude Code..."
-
-    $_CBOX_CMD exec --user root "$name" \
-      npm update -g --no-fund @anthropic-ai/claude-code
-
+    _cbox_log "Updating Claude Code..."
+    if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+      $_CBOX_CMD exec --user root "$name" \
+        npm update -g --no-fund @anthropic-ai/claude-code
+    else
+      $_CBOX_CMD exec --user root "$name" \
+        npm update -g --no-fund @anthropic-ai/claude-code >/dev/null 2>&1
+    fi
     touch "$stamp"
   fi
 }
@@ -438,8 +447,9 @@ _cbox_mcp_proxies_ensure() {
 
   command -v npx >/dev/null 2>&1 || return 0
 
-  python3 - "$portmap" "$CBOX_DATA_DIR" "$container_json" "$native_index" <<'PYEOF'
+  CBOX_VERBOSE="${CBOX_VERBOSE:-0}" python3 - "$portmap" "$CBOX_DATA_DIR" "$container_json" "$native_index" <<'PYEOF'
 import json, os, sys, subprocess, time, socket, glob, shlex
+verbose = os.environ.get("CBOX_VERBOSE", "0") == "1"
 
 portmap_file, data_dir, container_json_path, native_index_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
@@ -558,7 +568,8 @@ for sname, scfg in native_index.items():
 
     if wait_for_port(port):
         new_portmap[sname] = {"port": port, "pid": proc.pid}
-        print(f"  ✔ MCP proxy '{sname}' on :{port}")
+        if verbose:
+            print(f"  ✔ MCP proxy '{sname}' on :{port}")
     else:
         print(f"  ⚠  MCP proxy '{sname}' did not start — check {log_path}")
         proc.terminate()
@@ -740,7 +751,11 @@ _cbox_ensure() {
 
   if ! _cbox_running "$name"; then
     echo "Starting container '$name'..."
-    $_CBOX_CMD start "$name"
+    if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+      $_CBOX_CMD start "$name"
+    else
+      $_CBOX_CMD start "$name" >/dev/null
+    fi
   fi
 }
 
@@ -772,11 +787,20 @@ _cbox_enter() {
   if [[ "$command" == "claude" ]]; then
     _cbox_maybe_update "$name"
     if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
-      cdot _pull
-      [[ "$mode" != "safe" ]] && cdot _pull-history "$name"
+      if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+        cdot _pull
+        [[ "$mode" != "safe" ]] && cdot _pull-history "$name"
+      else
+        cdot _pull >/dev/null 2>&1
+        [[ "$mode" != "safe" ]] && cdot _pull-history "$name" >/dev/null 2>&1
+      fi
     fi
     if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]] && _cbox_check_companion_api flux "$_CBOX_FLUX_API"; then
-      flux _pull
+      if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+        flux _pull
+      else
+        flux _pull >/dev/null 2>&1
+      fi
     fi
   fi
 
@@ -805,11 +829,20 @@ _cbox_enter() {
 
   if [[ "$command" == "claude" && "$mode" != "safe" ]]; then
     if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
-      cdot _push
-      cdot _push-history "$name"
+      if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+        cdot _push
+        cdot _push-history "$name"
+      else
+        cdot _push >/dev/null 2>&1
+        cdot _push-history "$name" >/dev/null 2>&1
+      fi
     fi
     if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]] && _cbox_check_companion_api flux "$_CBOX_FLUX_API"; then
-      flux _push
+      if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+        flux _push
+      else
+        flux _push >/dev/null 2>&1
+      fi
     fi
   fi
 
@@ -992,6 +1025,13 @@ PYEOF
 # ---------------------------------------------------------
 
 cbox() {
+  while [[ "${1:-}" == -* ]]; do
+    case "$1" in
+      -v|--verbose) local CBOX_VERBOSE=1; shift ;;
+      *) echo "Unknown flag: $1"; return 1 ;;
+    esac
+  done
+
   local subcommand="${1:-}"
 
   local name
@@ -1147,7 +1187,7 @@ if [[ -n "${ZSH_VERSION:-}" ]]; then
   _cbox_zsh_complete() {
     case $CURRENT in
       2)
-        compadd list stop reset prune rebuild update doctor safe shell keepalive version help
+        compadd -v --verbose list stop reset prune rebuild update doctor safe shell keepalive version help
         ;;
       3)
         if [[ "${words[2]}" == "reset" || "${words[2]}" == "stop" ]]; then
@@ -1167,7 +1207,7 @@ elif [[ -n "${BASH_VERSION:-}" ]]; then
 
     if [[ $COMP_CWORD -eq 1 ]]; then
       COMPREPLY=( $(compgen -W \
-        "list stop reset prune rebuild update doctor safe shell keepalive version help" \
+        "-v --verbose list stop reset prune rebuild update doctor safe shell keepalive version help" \
         -- "$cur") )
     elif [[ $COMP_CWORD -eq 2 && ( "$prev" == "reset" || "$prev" == "stop" ) ]]; then
       COMPREPLY=( $(compgen -W "$(_cbox_list_names)" -- "$cur") )

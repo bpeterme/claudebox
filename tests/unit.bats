@@ -281,3 +281,50 @@ setup() {
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
+
+# ---------------------------------------------------------------------------
+# _cbox_rt_label (Apple Container path via python3)
+# ---------------------------------------------------------------------------
+
+_label_from_json() {
+  # helper: simulate _cbox_rt_label python logic against a given JSON string
+  local json="$1" label="$2"
+  echo "$json" \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); e=d[0] if isinstance(d,list) else d; c=e.get('configuration') or e.get('Config') or e; l=c.get('labels') or c.get('Labels') or {}; print(l.get(sys.argv[1],'') if isinstance(l,dict) else '')" "$label"
+}
+
+@test "_cbox_rt_label python: reads label from array with configuration.labels" {
+  run _label_from_json '[{"configuration":{"labels":{"cbox.project":"true"}}}]' "cbox.project"
+  [ "$status" -eq 0 ]
+  [ "$output" = "true" ]
+}
+
+@test "_cbox_rt_label python: reads label from single object with configuration.labels" {
+  run _label_from_json '{"configuration":{"labels":{"cbox.project":"true"}}}' "cbox.project"
+  [ "$status" -eq 0 ]
+  [ "$output" = "true" ]
+}
+
+@test "_cbox_rt_label python: reads label from flat labels key" {
+  run _label_from_json '[{"labels":{"cbox.project":"true"}}]' "cbox.project"
+  [ "$status" -eq 0 ]
+  [ "$output" = "true" ]
+}
+
+@test "_cbox_rt_label python: reads label from Config.Labels (Docker-like)" {
+  run _label_from_json '[{"Config":{"Labels":{"cbox.project":"true"}}}]' "cbox.project"
+  [ "$status" -eq 0 ]
+  [ "$output" = "true" ]
+}
+
+@test "_cbox_rt_label python: returns empty string when label absent" {
+  run _label_from_json '[{"configuration":{"labels":{}}}]' "cbox.project"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "_cbox_rt_label python: returns empty string when labels missing entirely" {
+  run _label_from_json '[{"configuration":{}}]' "cbox.project"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}

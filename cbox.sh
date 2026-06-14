@@ -131,7 +131,7 @@ _cbox_rt_label() {
   local name="$1" label="$2"
   if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
     container inspect "$name" 2>/dev/null \
-      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('configuration',{}).get('labels',{}).get(sys.argv[1],''))" "$label"
+      | python3 -c "import sys,json; d=json.load(sys.stdin); e=d[0] if isinstance(d,list) else d; c=e.get('configuration') or e.get('Config') or e; l=c.get('labels') or c.get('Labels') or {}; print(l.get(sys.argv[1],'') if isinstance(l,dict) else '')" "$label"
   else
     docker inspect "$name" 2>/dev/null \
       | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('Config',{}).get('Labels',{}).get(sys.argv[1],''))" "$label"
@@ -1080,7 +1080,11 @@ cbox() {
           | awk '$2 != "running" {print $1}')
       fi
 
-      [[ -n "$stopped" ]] && echo "$stopped" | xargs "$_CBOX_CMD" rm -f
+      if [[ -n "$stopped" ]]; then
+        echo "$stopped" | xargs "$_CBOX_CMD" rm -f
+      else
+        echo "Nothing to prune."
+      fi
       ;;
 
     "")

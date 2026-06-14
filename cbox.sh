@@ -557,7 +557,7 @@ for sname, scfg in native_index.items():
     log_path = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"cbox-mcp-{sname}.log")
     try:
         proc = subprocess.Popen(
-            ["npx", "-y", "supergateway", "--stdio", full_cmd, "--port", str(port), "--outputTransport", "streamableHttp"],
+            ["npx", "-y", "supergateway", "--stdio", full_cmd, "--port", str(port), "--outputTransport", "streamableHttp", "--stateful"],
             stdout=open(log_path, "w"),
             stderr=subprocess.STDOUT,
             start_new_session=True,

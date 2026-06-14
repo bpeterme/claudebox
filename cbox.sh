@@ -113,7 +113,7 @@ _cbox_name() {
 # Normalises Apple Container tabular output and Docker --format output to the same shape.
 _cbox_rt_list() {
   if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
-    container ls --all "$@" | awk 'NR>1 {print $1, $2}'
+    container ls --all "$@" | awk 'NR==1{for(i=1;i<=NF;i++)if($i=="STATE")col=i;next} col&&NR>1{print $1,$col}'
   else
     docker ps -a "$@" --format "{{.Names}} {{.State}}"
   fi

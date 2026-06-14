@@ -283,6 +283,31 @@ setup() {
 }
 
 # ---------------------------------------------------------------------------
+# _cbox_rt_list STATE column parsing (Apple Container 1.0.0 format)
+# ---------------------------------------------------------------------------
+
+_rt_list_awk() {
+  # apply the same awk as _cbox_rt_list uses for Apple Container
+  awk 'NR==1{for(i=1;i<=NF;i++)if($i=="STATE")col=i;next} col&&NR>1{print $1,$col}'
+}
+
+@test "_cbox_rt_list awk: extracts name and STATE from 1.0.0 header format" {
+  local input
+  input=$(printf "ID IMAGE OS ARCH STATE IP CPUS MEMORY STARTED\nmy-app claudebox:latest linux arm64 stopped  4 1024 MB 2026-01-01\nbuildkit builder:0.12.0 linux arm64 running 192.168.64.5/24 2 2048 MB 2026-01-01\n")
+  run bash -c "echo '$input' | $(_rt_list_awk_cmd)"
+  # use helper inline
+  run bash -c "printf 'ID IMAGE OS ARCH STATE IP CPUS MEMORY STARTED\nmy-app claudebox:latest linux arm64 stopped  4 1024 MB 2026-01-01\nbuildkit builder:0.12.0 linux arm64 running 192.168.64.5/24 2 2048 MB 2026-01-01\n' | awk 'NR==1{for(i=1;i<=NF;i++)if(\$i==\"STATE\")col=i;next} col&&NR>1{print \$1,\$col}'"
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf 'my-app stopped\nbuildkit running')" ]
+}
+
+@test "_cbox_rt_list awk: tolerates STATE column being absent" {
+  run bash -c "printf 'NAME STATUS\nmy-app stopped\n' | awk 'NR==1{for(i=1;i<=NF;i++)if(\$i==\"STATE\")col=i;next} col&&NR>1{print \$1,\$col}'"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+# ---------------------------------------------------------------------------
 # _cbox_rt_label (Apple Container path via python3)
 # ---------------------------------------------------------------------------
 

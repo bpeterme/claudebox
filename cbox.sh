@@ -23,14 +23,17 @@ _cbox_help() {
 cbox - Claude Container Runtime
 
 Usage:
-  cbox                  Start or enter normal container
+  cbox [-v]             Start or enter normal container
   cbox safe             Start or enter safe container
   cbox shell            Open zsh shell instead of the container
   cbox keepalive        Keep container alive for 10 minutes after exit
 
+Options:
+  -v, --verbose         Show full output (updates, sync, MCP proxy status)
+
 Container Management:
   cbox list             List cbox containers
-  cbox stop             Stop current project container
+  cbox stop [name]      Stop current (or named) container
   cbox reset            Remove current project container
   cbox prune            Remove stopped cbox containers
   cbox rebuild          Rebuild container image
@@ -67,6 +70,7 @@ _CBOX_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
 [[ -f "$_CBOX_CONFIG" ]] && . "$_CBOX_CONFIG"
 unset _CBOX_CONFIG
 
+CBOX_VERBOSE="${CBOX_VERBOSE:-0}"
 CBOX_DATA_DIR="${CBOX_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/claudebox}"
 CBOX_CLAUDE_DIR="${CBOX_CLAUDE_DIR:-$HOME/.claude}"
 CBOX_HOST_CONFIG_DIR="${CBOX_HOST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}}"
@@ -100,6 +104,8 @@ fi
 # helpers
 # ---------------------------------------------------------
 
+_cbox_log() { [[ "${CBOX_VERBOSE:-0}" == "1" ]] && echo "$@" || true; }
+
 _cbox_name() {
   local name
   name=$(basename "$PWD" \
@@ -113,7 +119,7 @@ _cbox_name() {
 # Normalises Apple Container tabular output and Docker --format output to the same shape.
 _cbox_rt_list() {
   if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
-    container ls --all "$@" | awk 'NR>1 {print $1, $2}'
+    container ls --all "$@" | awk 'NR==1{for(i=1;i<=NF;i++)if($i=="STATE")col=i;next} col&&NR>1{print $1,$col}'
   else
     docker ps -a "$@" --format "{{.Names}} {{.State}}"
   fi
@@ -131,7 +137,7 @@ _cbox_rt_label() {
   local name="$1" label="$2"
   if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
     container inspect "$name" 2>/dev/null \
-      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('configuration',{}).get('labels',{}).get(sys.argv[1],''))" "$label"
+      | python3 -c "import sys,json; d=json.load(sys.stdin); e=d[0] if isinstance(d,list) else d; c=e.get('configuration') or e.get('Config') or e; l=c.get('labels') or c.get('Labels') or {}; print(l.get(sys.argv[1],'') if isinstance(l,dict) else '')" "$label"
   else
     docker inspect "$name" 2>/dev/null \
       | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('Config',{}).get('Labels',{}).get(sys.argv[1],''))" "$label"
@@ -164,15 +170,19 @@ _cbox_mode() {
 
 _cbox_generate_claude_json() {
   local name="$1"
+  local portmap="$CBOX_DATA_DIR/.mcp-portmap-$name.json"
+  local native_index="$CBOX_DATA_DIR/.mcp-native-$name.json"
+  local gateway
+  gateway=$(_cbox_mcp_host_gateway)
 
   mkdir -p "$CBOX_DATA_DIR"
 
   local claude_json="$CBOX_DATA_DIR/.claude-$name.json"
 
-  python3 - "$claude_json" "$name" <<'PYEOF'
+  python3 - "$claude_json" "$name" "$portmap" "$gateway" "$native_index" <<'PYEOF'
 import json, sys, os
 
-project_file, name = sys.argv[1], sys.argv[2]
+project_file, name, portmap_file, gateway, native_index_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 
 try:
     with open(project_file) as f:
@@ -186,9 +196,43 @@ try:
 except (FileNotFoundError, json.JSONDecodeError):
     host = {}
 
-# Host wins for mcpServers (user-wide config); omit key if host has none
+try:
+    with open(portmap_file) as f:
+        portmap = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    portmap = {}
+
+try:
+    with open(native_index_path) as f:
+        native_index = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    native_index = {}
+
+# Build the final mcpServers set: host wins over project for shared keys
 if "mcpServers" in host:
-    project["mcpServers"] = host["mcpServers"]
+    final_mcp = {**project.get("mcpServers", {}), **host["mcpServers"]}
+else:
+    final_mcp = project.get("mcpServers")
+
+if final_mcp is not None:
+    container_mcp = {}
+    for sname, scfg in final_mcp.items():
+        if sname in portmap:
+            # Proxy is running — rewrite to Streamable HTTP
+            container_mcp[sname] = {
+                "type": "http",
+                "url": f"http://{gateway}:{portmap[sname]['port']}/mcp"
+            }
+        elif sname in native_index:
+            # Known native but proxy not running — restore original stdio config
+            ni = native_index[sname]
+            entry = {"command": ni["command"], "args": ni.get("args", [])}
+            if ni.get("env"):
+                entry["env"] = ni["env"]
+            container_mcp[sname] = entry
+        else:
+            container_mcp[sname] = scfg
+    project["mcpServers"] = container_mcp
 
 # Ensure required container defaults
 project["hasCompletedOnboarding"] = True
@@ -205,14 +249,17 @@ PYEOF
 _cbox_maybe_update() {
   local name="$1"
 
-  local stamp="/tmp/.cbox-update-$(date +%Y-%m-%d)"
+  local stamp="${TMPDIR:-/tmp}/.cbox-update-$(date +%Y-%m-%d)"
 
   if [[ ! -f "$stamp" ]]; then
-    echo "Updating Claude Code..."
-
-    $_CBOX_CMD exec --user root "$name" \
-      npm update -g --no-fund @anthropic-ai/claude-code
-
+    _cbox_log "Updating Claude Code..."
+    if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+      $_CBOX_CMD exec --user root "$name" \
+        npm update -g --no-fund @anthropic-ai/claude-code
+    else
+      $_CBOX_CMD exec --user root "$name" \
+        npm update -g --no-fund @anthropic-ai/claude-code >/dev/null 2>&1
+    fi
     touch "$stamp"
   fi
 }
@@ -347,7 +394,7 @@ _cbox_audio_start() {
 
   if ! lsof -i :4713 >/dev/null 2>&1; then
     echo "Starting PulseAudio for voice mode..."
-    nohup pulseaudio --daemonize=no > /tmp/cbox-pulse.log 2>&1 &
+    nohup pulseaudio --daemonize=no > "${TMPDIR:-/tmp}/cbox-pulse.log" 2>&1 &
     disown
     _CBOX_AUDIO_STARTED=1
 
@@ -358,7 +405,7 @@ _cbox_audio_start() {
     done
 
     if ! lsof -i :4713 >/dev/null 2>&1; then
-      echo "⚠  PulseAudio did not start — check /tmp/cbox-pulse.log"
+      echo "⚠  PulseAudio did not start — check ${TMPDIR:-/tmp}/cbox-pulse.log"
       return 1
     fi
   fi
@@ -373,6 +420,192 @@ _cbox_audio_stop() {
   echo "Stopping PulseAudio..."
   pulseaudio --kill 2>/dev/null || true
   _CBOX_AUDIO_STARTED=0
+}
+
+# ---------------------------------------------------------
+# MCP host-native proxy
+# ---------------------------------------------------------
+
+_cbox_mcp_host_gateway() {
+  if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
+    echo "192.168.64.1"
+  else
+    echo "host.docker.internal"
+  fi
+}
+
+# Detects host-native MCP servers, starts supergateway proxies for each, and
+# writes a portmap file ($CBOX_DATA_DIR/.mcp-portmap-$name.json) recording
+# {server_name: {port, pid}} so _cbox_generate_claude_json can rewrite entries.
+# A persistent native index ($CBOX_DATA_DIR/.mcp-native-$name.json) remembers
+# which servers are native across sessions so the stdio→SSE cycle stays correct.
+_cbox_mcp_proxies_ensure() {
+  local name="$1"
+  local portmap="$CBOX_DATA_DIR/.mcp-portmap-$name.json"
+  local native_index="$CBOX_DATA_DIR/.mcp-native-$name.json"
+  local container_json="$CBOX_DATA_DIR/.claude-$name.json"
+
+  command -v npx >/dev/null 2>&1 || return 0
+
+  CBOX_VERBOSE="${CBOX_VERBOSE:-0}" python3 - "$portmap" "$CBOX_DATA_DIR" "$container_json" "$native_index" <<'PYEOF'
+import json, os, sys, subprocess, time, socket, glob, shlex
+verbose = os.environ.get("CBOX_VERBOSE", "0") == "1"
+
+portmap_file, data_dir, container_json_path, native_index_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+try:
+    with open(portmap_file) as f:
+        portmap = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    portmap = {}
+
+try:
+    with open(native_index_path) as f:
+        native_index = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    native_index = {}
+
+def is_native(cmd):
+    if not cmd:
+        return False
+    home = os.path.expanduser("~")
+    expanded = os.path.expanduser(str(cmd))
+    return (
+        expanded.startswith("/Applications/") or
+        expanded.startswith(home + "/Library/") or
+        expanded.startswith(home + "/Applications/") or
+        ".app/Contents/" in expanded
+    )
+
+def is_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+def next_port():
+    used = set()
+    for pf in glob.glob(os.path.join(data_dir, ".mcp-portmap-*.json")):
+        try:
+            with open(pf) as f:
+                pm = json.load(f)
+            for v in pm.values():
+                if "port" in v:
+                    used.add(v["port"])
+        except Exception:
+            pass
+    p = 39100
+    while p in used:
+        p += 1
+    return p
+
+def wait_for_port(port, timeout=8.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=0.2)
+            s.close()
+            return True
+        except OSError:
+            time.sleep(0.3)
+    return False
+
+# Collect all configured MCP servers from container JSON and host ~/.claude.json
+all_mcp = {}
+try:
+    with open(container_json_path) as f:
+        all_mcp.update(json.load(f).get("mcpServers", {}))
+except (FileNotFoundError, json.JSONDecodeError):
+    pass
+try:
+    with open(os.path.expanduser("~/.claude.json")) as f:
+        all_mcp.update(json.load(f).get("mcpServers", {}))
+except (FileNotFoundError, json.JSONDecodeError):
+    pass
+
+# Update native index with any newly detected native servers
+for sname, scfg in all_mcp.items():
+    cmd = scfg.get("command", "")
+    if is_native(cmd):
+        native_index[sname] = {
+            "command": cmd,
+            "args": scfg.get("args", []),
+            "env": scfg.get("env", {}),
+        }
+
+with open(native_index_path, "w") as f:
+    json.dump(native_index, f)
+
+# Start/reuse proxies for all known native servers
+new_portmap = {}
+for sname, scfg in native_index.items():
+    existing = portmap.get(sname, {})
+    if existing and is_alive(existing.get("pid", 0)):
+        new_portmap[sname] = existing
+        continue
+
+    port = next_port()
+    cmd = scfg["command"]
+    args = scfg.get("args", [])
+    env_vars = scfg.get("env", {})
+
+    env_prefix = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_vars.items())
+    arg_str = " ".join(shlex.quote(str(a)) for a in args)
+    full_cmd = " ".join(filter(None, [env_prefix, shlex.quote(cmd), arg_str]))
+
+    log_path = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"cbox-mcp-{sname}.log")
+    try:
+        proc = subprocess.Popen(
+            ["npx", "-y", "supergateway", "--stdio", full_cmd, "--port", str(port), "--outputTransport", "streamableHttp", "--stateful"],
+            stdout=open(log_path, "w"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except Exception as e:
+        print(f"  ⚠  MCP proxy '{sname}' failed to launch: {e}")
+        continue
+
+    if wait_for_port(port):
+        new_portmap[sname] = {"port": port, "pid": proc.pid}
+        if verbose:
+            print(f"  ✔ MCP proxy '{sname}' on :{port}")
+    else:
+        print(f"  ⚠  MCP proxy '{sname}' did not start — check {log_path}")
+        proc.terminate()
+
+with open(portmap_file, "w") as f:
+    json.dump(new_portmap, f)
+PYEOF
+}
+
+_cbox_mcp_proxies_stop() {
+  local name="$1"
+  local portmap="$CBOX_DATA_DIR/.mcp-portmap-$name.json"
+  [[ -f "$portmap" ]] || return 0
+
+  python3 - "$portmap" <<'PYEOF'
+import json, os, sys, signal
+
+portmap_file = sys.argv[1]
+try:
+    with open(portmap_file) as f:
+        portmap = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    sys.exit(0)
+
+for sname, info in portmap.items():
+    pid = info.get("pid")
+    if not pid:
+        continue
+    try:
+        pgid = os.getpgid(int(pid))
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+os.remove(portmap_file)
+PYEOF
 }
 
 # ---------------------------------------------------------
@@ -518,7 +751,11 @@ _cbox_ensure() {
 
   if ! _cbox_running "$name"; then
     echo "Starting container '$name'..."
-    $_CBOX_CMD start "$name"
+    if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+      $_CBOX_CMD start "$name"
+    else
+      $_CBOX_CMD start "$name" >/dev/null
+    fi
   fi
 }
 
@@ -550,16 +787,30 @@ _cbox_enter() {
   if [[ "$command" == "claude" ]]; then
     _cbox_maybe_update "$name"
     if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
-      cdot _pull
-      [[ "$mode" != "safe" ]] && cdot _pull-history "$name"
+      if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+        cdot _pull
+        [[ "$mode" != "safe" ]] && cdot _pull-history "$name"
+      else
+        cdot _pull >/dev/null 2>&1
+        [[ "$mode" != "safe" ]] && cdot _pull-history "$name" >/dev/null 2>&1
+      fi
     fi
     if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]] && _cbox_check_companion_api flux "$_CBOX_FLUX_API"; then
-      flux _pull
+      if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+        flux _pull
+      else
+        flux _pull >/dev/null 2>&1
+      fi
     fi
   fi
 
   if [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]]; then
     _cbox_audio_start || true
+  fi
+
+  if [[ "$mode" != "safe" ]]; then
+    _cbox_mcp_proxies_ensure "$name"
+    _cbox_generate_claude_json "$name"
   fi
 
   echo "Entering container '$name'..."
@@ -578,11 +829,20 @@ _cbox_enter() {
 
   if [[ "$command" == "claude" && "$mode" != "safe" ]]; then
     if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
-      cdot _push
-      cdot _push-history "$name"
+      if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+        cdot _push
+        cdot _push-history "$name"
+      else
+        cdot _push >/dev/null 2>&1
+        cdot _push-history "$name" >/dev/null 2>&1
+      fi
     fi
     if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]] && _cbox_check_companion_api flux "$_CBOX_FLUX_API"; then
-      flux _push
+      if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+        flux _push
+      else
+        flux _push >/dev/null 2>&1
+      fi
     fi
   fi
 
@@ -599,6 +859,7 @@ _cbox_enter() {
   fi
 
   if (( _last_session )); then
+    _cbox_mcp_proxies_stop "$name"
     local _cache_base="${XDG_CACHE_HOME:-$HOME/.cache}"
     [[ -n "$CBOX_SHARE_DIR" && ( "$CBOX_SHARE_DIR" == /tmp/* || "$CBOX_SHARE_DIR" == "$_cache_base"/* ) ]] && \
       find "$CBOX_SHARE_DIR" -mindepth 1 -delete 2>/dev/null || true
@@ -726,6 +987,37 @@ _cbox_doctor() {
   else
     echo "ℹ container does not exist yet"
   fi
+
+  echo
+  echo "[mcp proxies]"
+  local _portmap="$CBOX_DATA_DIR/.mcp-portmap-$name.json"
+  if [[ -f "$_portmap" ]]; then
+    python3 - "$_portmap" <<'PYEOF'
+import json, os, sys
+
+portmap_file = sys.argv[1]
+try:
+    with open(portmap_file) as f:
+        portmap = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    portmap = {}
+
+if not portmap:
+    print("ℹ no host-native MCP proxies active")
+else:
+    for sname, info in portmap.items():
+        pid = info.get("pid", 0)
+        port = info.get("port", "?")
+        try:
+            os.kill(int(pid), 0)
+            print(f"✔ {sname}: running on :{port} (pid {pid})")
+        except (OSError, ValueError):
+            print(f"✘ {sname}: dead (was on :{port}, pid {pid})")
+PYEOF
+  else
+    echo "ℹ no host-native MCP proxies active"
+  fi
+  unset _portmap
 }
 
 # ---------------------------------------------------------
@@ -733,6 +1025,13 @@ _cbox_doctor() {
 # ---------------------------------------------------------
 
 cbox() {
+  while [[ "${1:-}" == -* ]]; do
+    case "$1" in
+      -v|--verbose) local CBOX_VERBOSE=1; shift ;;
+      *) echo "Unknown flag: $1"; return 1 ;;
+    esac
+  done
+
   local subcommand="${1:-}"
 
   local name
@@ -757,12 +1056,13 @@ cbox() {
       ;;
 
     stop)
-      if ! _cbox_exists "$name"; then
-        echo "No container found for '$name'."
+      local stop_target="${2:-$name}"
+      if ! _cbox_exists "$stop_target"; then
+        echo "No container found for '$stop_target'."
         return 0
       fi
-      echo "Stopping container '$name'..."
-      $_CBOX_CMD stop "$name" >/dev/null
+      echo "Stopping container '$stop_target'..."
+      $_CBOX_CMD stop "$stop_target" >/dev/null
       ;;
 
     reset)
@@ -821,7 +1121,11 @@ cbox() {
           | awk '$2 != "running" {print $1}')
       fi
 
-      [[ -n "$stopped" ]] && echo "$stopped" | xargs "$_CBOX_CMD" rm -f
+      if [[ -n "$stopped" ]]; then
+        echo "$stopped" | xargs "$_CBOX_CMD" rm -f
+      else
+        echo "Nothing to prune."
+      fi
       ;;
 
     "")
@@ -883,10 +1187,10 @@ if [[ -n "${ZSH_VERSION:-}" ]]; then
   _cbox_zsh_complete() {
     case $CURRENT in
       2)
-        compadd list stop reset prune rebuild update doctor safe shell keepalive version help
+        compadd -v --verbose list stop reset prune rebuild update doctor safe shell keepalive version help
         ;;
       3)
-        if [[ "${words[2]}" == "reset" ]]; then
+        if [[ "${words[2]}" == "reset" || "${words[2]}" == "stop" ]]; then
           local -a containers
           containers=($(_cbox_list_names))
           (( ${#containers[@]} )) && compadd -a containers
@@ -903,9 +1207,9 @@ elif [[ -n "${BASH_VERSION:-}" ]]; then
 
     if [[ $COMP_CWORD -eq 1 ]]; then
       COMPREPLY=( $(compgen -W \
-        "list stop reset prune rebuild update doctor safe shell keepalive version help" \
+        "-v --verbose list stop reset prune rebuild update doctor safe shell keepalive version help" \
         -- "$cur") )
-    elif [[ $COMP_CWORD -eq 2 && "$prev" == "reset" ]]; then
+    elif [[ $COMP_CWORD -eq 2 && ( "$prev" == "reset" || "$prev" == "stop" ) ]]; then
       COMPREPLY=( $(compgen -W "$(_cbox_list_names)" -- "$cur") )
     fi
   }

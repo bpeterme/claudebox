@@ -281,3 +281,75 @@ setup() {
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
+
+# ---------------------------------------------------------------------------
+# _cbox_rt_list STATE column parsing (Apple Container 1.0.0 format)
+# ---------------------------------------------------------------------------
+
+_rt_list_awk() {
+  # apply the same awk as _cbox_rt_list uses for Apple Container
+  awk 'NR==1{for(i=1;i<=NF;i++)if($i=="STATE")col=i;next} col&&NR>1{print $1,$col}'
+}
+
+@test "_cbox_rt_list awk: extracts name and STATE from 1.0.0 header format" {
+  local input
+  input=$(printf "ID IMAGE OS ARCH STATE IP CPUS MEMORY STARTED\nmy-app claudebox:latest linux arm64 stopped  4 1024 MB 2026-01-01\nbuildkit builder:0.12.0 linux arm64 running 192.168.64.5/24 2 2048 MB 2026-01-01\n")
+  run bash -c "echo '$input' | $(_rt_list_awk_cmd)"
+  # use helper inline
+  run bash -c "printf 'ID IMAGE OS ARCH STATE IP CPUS MEMORY STARTED\nmy-app claudebox:latest linux arm64 stopped  4 1024 MB 2026-01-01\nbuildkit builder:0.12.0 linux arm64 running 192.168.64.5/24 2 2048 MB 2026-01-01\n' | awk 'NR==1{for(i=1;i<=NF;i++)if(\$i==\"STATE\")col=i;next} col&&NR>1{print \$1,\$col}'"
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf 'my-app stopped\nbuildkit running')" ]
+}
+
+@test "_cbox_rt_list awk: tolerates STATE column being absent" {
+  run bash -c "printf 'NAME STATUS\nmy-app stopped\n' | awk 'NR==1{for(i=1;i<=NF;i++)if(\$i==\"STATE\")col=i;next} col&&NR>1{print \$1,\$col}'"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+# ---------------------------------------------------------------------------
+# _cbox_rt_label (Apple Container path via python3)
+# ---------------------------------------------------------------------------
+
+_label_from_json() {
+  # helper: simulate _cbox_rt_label python logic against a given JSON string
+  local json="$1" label="$2"
+  echo "$json" \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); e=d[0] if isinstance(d,list) else d; c=e.get('configuration') or e.get('Config') or e; l=c.get('labels') or c.get('Labels') or {}; print(l.get(sys.argv[1],'') if isinstance(l,dict) else '')" "$label"
+}
+
+@test "_cbox_rt_label python: reads label from array with configuration.labels" {
+  run _label_from_json '[{"configuration":{"labels":{"cbox.project":"true"}}}]' "cbox.project"
+  [ "$status" -eq 0 ]
+  [ "$output" = "true" ]
+}
+
+@test "_cbox_rt_label python: reads label from single object with configuration.labels" {
+  run _label_from_json '{"configuration":{"labels":{"cbox.project":"true"}}}' "cbox.project"
+  [ "$status" -eq 0 ]
+  [ "$output" = "true" ]
+}
+
+@test "_cbox_rt_label python: reads label from flat labels key" {
+  run _label_from_json '[{"labels":{"cbox.project":"true"}}]' "cbox.project"
+  [ "$status" -eq 0 ]
+  [ "$output" = "true" ]
+}
+
+@test "_cbox_rt_label python: reads label from Config.Labels (Docker-like)" {
+  run _label_from_json '[{"Config":{"Labels":{"cbox.project":"true"}}}]' "cbox.project"
+  [ "$status" -eq 0 ]
+  [ "$output" = "true" ]
+}
+
+@test "_cbox_rt_label python: returns empty string when label absent" {
+  run _label_from_json '[{"configuration":{"labels":{}}}]' "cbox.project"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "_cbox_rt_label python: returns empty string when labels missing entirely" {
+  run _label_from_json '[{"configuration":{}}]' "cbox.project"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}

@@ -243,7 +243,7 @@ PYEOF
 _cbox_maybe_update() {
   local name="$1"
 
-  local stamp="/tmp/.cbox-update-$(date +%Y-%m-%d)"
+  local stamp="${TMPDIR:-/tmp}/.cbox-update-$(date +%Y-%m-%d)"
 
   if [[ ! -f "$stamp" ]]; then
     echo "Updating Claude Code..."
@@ -385,7 +385,7 @@ _cbox_audio_start() {
 
   if ! lsof -i :4713 >/dev/null 2>&1; then
     echo "Starting PulseAudio for voice mode..."
-    nohup pulseaudio --daemonize=no > /tmp/cbox-pulse.log 2>&1 &
+    nohup pulseaudio --daemonize=no > "${TMPDIR:-/tmp}/cbox-pulse.log" 2>&1 &
     disown
     _CBOX_AUDIO_STARTED=1
 
@@ -396,7 +396,7 @@ _cbox_audio_start() {
     done
 
     if ! lsof -i :4713 >/dev/null 2>&1; then
-      echo "⚠  PulseAudio did not start — check /tmp/cbox-pulse.log"
+      echo "⚠  PulseAudio did not start — check ${TMPDIR:-/tmp}/cbox-pulse.log"
       return 1
     fi
   fi
@@ -544,7 +544,7 @@ for sname, scfg in native_index.items():
     arg_str = " ".join(shlex.quote(str(a)) for a in args)
     full_cmd = " ".join(filter(None, [env_prefix, shlex.quote(cmd), arg_str]))
 
-    log_path = f"/tmp/cbox-mcp-{sname}.log"
+    log_path = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"cbox-mcp-{sname}.log")
     try:
         proc = subprocess.Popen(
             ["npx", "-y", "supergateway", "--stdio", full_cmd, "--port", str(port)],

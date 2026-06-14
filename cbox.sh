@@ -165,6 +165,7 @@ _cbox_mode() {
 _cbox_generate_claude_json() {
   local name="$1"
   local portmap="$CBOX_DATA_DIR/.mcp-portmap-$name.json"
+  local native_index="$CBOX_DATA_DIR/.mcp-native-$name.json"
   local gateway
   gateway=$(_cbox_mcp_host_gateway)
 
@@ -172,10 +173,10 @@ _cbox_generate_claude_json() {
 
   local claude_json="$CBOX_DATA_DIR/.claude-$name.json"
 
-  python3 - "$claude_json" "$name" "$portmap" "$gateway" <<'PYEOF'
+  python3 - "$claude_json" "$name" "$portmap" "$gateway" "$native_index" <<'PYEOF'
 import json, sys, os
 
-project_file, name, portmap_file, gateway = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+project_file, name, portmap_file, gateway, native_index_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 
 try:
     with open(project_file) as f:
@@ -195,29 +196,34 @@ try:
 except (FileNotFoundError, json.JSONDecodeError):
     portmap = {}
 
-def is_native(cmd):
-    if not cmd:
-        return False
-    home = os.path.expanduser("~")
-    expanded = os.path.expanduser(str(cmd))
-    return (
-        expanded.startswith("/Applications/") or
-        expanded.startswith(home + "/Library/") or
-        expanded.startswith(home + "/Applications/") or
-        ".app/Contents/" in expanded
-    )
+try:
+    with open(native_index_path) as f:
+        native_index = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    native_index = {}
 
-# Host wins for mcpServers; native entries are rewritten to SSE via proxy
+# Build the final mcpServers set: host wins over project for shared keys
 if "mcpServers" in host:
+    final_mcp = {**project.get("mcpServers", {}), **host["mcpServers"]}
+else:
+    final_mcp = project.get("mcpServers")
+
+if final_mcp is not None:
     container_mcp = {}
-    for sname, scfg in host["mcpServers"].items():
-        cmd = scfg.get("command", "")
-        if is_native(cmd) and sname in portmap:
-            port = portmap[sname]["port"]
+    for sname, scfg in final_mcp.items():
+        if sname in portmap:
+            # Proxy is running — rewrite to SSE
             container_mcp[sname] = {
                 "type": "sse",
-                "url": f"http://{gateway}:{port}/sse"
+                "url": f"http://{gateway}:{portmap[sname]['port']}/sse"
             }
+        elif sname in native_index:
+            # Known native but proxy not running — restore original stdio config
+            ni = native_index[sname]
+            entry = {"command": ni["command"], "args": ni.get("args", [])}
+            if ni.get("env"):
+                entry["env"] = ni["env"]
+            container_mcp[sname] = entry
         else:
             container_mcp[sname] = scfg
     project["mcpServers"] = container_mcp
@@ -422,16 +428,20 @@ _cbox_mcp_host_gateway() {
 # Detects host-native MCP servers, starts supergateway proxies for each, and
 # writes a portmap file ($CBOX_DATA_DIR/.mcp-portmap-$name.json) recording
 # {server_name: {port, pid}} so _cbox_generate_claude_json can rewrite entries.
+# A persistent native index ($CBOX_DATA_DIR/.mcp-native-$name.json) remembers
+# which servers are native across sessions so the stdio→SSE cycle stays correct.
 _cbox_mcp_proxies_ensure() {
   local name="$1"
   local portmap="$CBOX_DATA_DIR/.mcp-portmap-$name.json"
+  local native_index="$CBOX_DATA_DIR/.mcp-native-$name.json"
+  local container_json="$CBOX_DATA_DIR/.claude-$name.json"
 
   command -v npx >/dev/null 2>&1 || return 0
 
-  python3 - "$portmap" "$CBOX_DATA_DIR" <<'PYEOF'
+  python3 - "$portmap" "$CBOX_DATA_DIR" "$container_json" "$native_index" <<'PYEOF'
 import json, os, sys, subprocess, time, socket, glob, shlex
 
-portmap_file, data_dir = sys.argv[1], sys.argv[2]
+portmap_file, data_dir, container_json_path, native_index_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
 try:
     with open(portmap_file) as f:
@@ -440,10 +450,10 @@ except (FileNotFoundError, json.JSONDecodeError):
     portmap = {}
 
 try:
-    with open(os.path.expanduser("~/.claude.json")) as f:
-        host = json.load(f)
+    with open(native_index_path) as f:
+        native_index = json.load(f)
 except (FileNotFoundError, json.JSONDecodeError):
-    host = {}
+    native_index = {}
 
 def is_native(cmd):
     if not cmd:
@@ -491,20 +501,42 @@ def wait_for_port(port, timeout=8.0):
             time.sleep(0.3)
     return False
 
-mcp_servers = host.get("mcpServers", {})
-new_portmap = {}
+# Collect all configured MCP servers from container JSON and host ~/.claude.json
+all_mcp = {}
+try:
+    with open(container_json_path) as f:
+        all_mcp.update(json.load(f).get("mcpServers", {}))
+except (FileNotFoundError, json.JSONDecodeError):
+    pass
+try:
+    with open(os.path.expanduser("~/.claude.json")) as f:
+        all_mcp.update(json.load(f).get("mcpServers", {}))
+except (FileNotFoundError, json.JSONDecodeError):
+    pass
 
-for sname, scfg in mcp_servers.items():
+# Update native index with any newly detected native servers
+for sname, scfg in all_mcp.items():
     cmd = scfg.get("command", "")
-    if not is_native(cmd):
-        continue
+    if is_native(cmd):
+        native_index[sname] = {
+            "command": cmd,
+            "args": scfg.get("args", []),
+            "env": scfg.get("env", {}),
+        }
 
+with open(native_index_path, "w") as f:
+    json.dump(native_index, f)
+
+# Start/reuse proxies for all known native servers
+new_portmap = {}
+for sname, scfg in native_index.items():
     existing = portmap.get(sname, {})
     if existing and is_alive(existing.get("pid", 0)):
         new_portmap[sname] = existing
         continue
 
     port = next_port()
+    cmd = scfg["command"]
     args = scfg.get("args", [])
     env_vars = scfg.get("env", {})
 

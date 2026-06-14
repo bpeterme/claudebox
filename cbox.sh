@@ -218,10 +218,10 @@ if final_mcp is not None:
     container_mcp = {}
     for sname, scfg in final_mcp.items():
         if sname in portmap:
-            # Proxy is running — rewrite to SSE
+            # Proxy is running — rewrite to Streamable HTTP
             container_mcp[sname] = {
-                "type": "sse",
-                "url": f"http://{gateway}:{portmap[sname]['port']}/sse"
+                "type": "http",
+                "url": f"http://{gateway}:{portmap[sname]['port']}/mcp"
             }
         elif sname in native_index:
             # Known native but proxy not running — restore original stdio config
@@ -557,7 +557,7 @@ for sname, scfg in native_index.items():
     log_path = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"cbox-mcp-{sname}.log")
     try:
         proc = subprocess.Popen(
-            ["npx", "-y", "supergateway", "--stdio", full_cmd, "--port", str(port)],
+            ["npx", "-y", "supergateway", "--stdio", full_cmd, "--port", str(port), "--outputTransport", "http"],
             stdout=open(log_path, "w"),
             stderr=subprocess.STDOUT,
             start_new_session=True,

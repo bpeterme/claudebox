@@ -797,9 +797,9 @@ _cbox_enter() {
     fi
     if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]] && _cbox_check_companion_api flux "$_CBOX_FLUX_API"; then
       if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-        flux _pull
+        flux _pull || true
       else
-        flux _pull >/dev/null 2>&1
+        flux _pull >/dev/null 2>&1 || true
       fi
     fi
   fi
@@ -839,9 +839,9 @@ _cbox_enter() {
     fi
     if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]] && _cbox_check_companion_api flux "$_CBOX_FLUX_API"; then
       if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-        flux _push
+        flux _push || true
       else
-        flux _push >/dev/null 2>&1
+        flux _push >/dev/null 2>&1 || true
       fi
     fi
   fi

@@ -69,7 +69,7 @@ CBOX_IMAGE="${CBOX_IMAGE:-claudebox}"
 CBOX_LABEL="${CBOX_LABEL:-cbox.project=true}"
 CBOX_KEEPALIVE_SECONDS="${CBOX_KEEPALIVE_SECONDS:-600}"
 # Minimum plumbing API versions required from companion tools
-_CBOX_CDOT_API=1
+_CBOX_CDOT_API=2
 _CBOX_FLUX_API=1
 
 # Source user config if present (~/.config/claudebox/cbox.env)
@@ -815,14 +815,20 @@ _cbox_enter() {
 
   if [[ "$command" != "zsh" ]]; then
     _cbox_maybe_update "$name"
-    if [[ "$agent_bin" == "claude" ]]; then
-      if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
+    if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
+      if [[ "$agent_bin" == "claude" ]]; then
         if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
           cdot _pull
           [[ "$mode" != "safe" ]] && cdot _pull-history "$name"
         else
           cdot _pull >/dev/null 2>&1
           [[ "$mode" != "safe" ]] && cdot _pull-history "$name" >/dev/null 2>&1
+        fi
+      elif [[ "$agent_bin" == "opencode" ]]; then
+        if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+          cdot _pull-opencode
+        else
+          cdot _pull-opencode >/dev/null 2>&1
         fi
       fi
     fi
@@ -859,14 +865,20 @@ _cbox_enter() {
   fi
 
   if [[ "$command" != "zsh" && "$mode" != "safe" ]]; then
-    if [[ "$agent_bin" == "claude" ]]; then
-      if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
+    if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
+      if [[ "$agent_bin" == "claude" ]]; then
         if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
           cdot _push
           cdot _push-history "$name"
         else
           cdot _push >/dev/null 2>&1
           cdot _push-history "$name" >/dev/null 2>&1
+        fi
+      elif [[ "$agent_bin" == "opencode" ]]; then
+        if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+          cdot _push-opencode
+        else
+          cdot _push-opencode >/dev/null 2>&1
         fi
       fi
     fi

@@ -20,13 +20,20 @@
 _cbox_help() {
     clear
     cat <<'EOF'
-cbox - Claude Container Runtime
+cbox - AI Coding Agent Container Runtime
 
 Usage:
-  cbox [-v]             Start or enter normal container
+  cbox [-v]             Start or enter normal container (Claude Code)
   cbox safe             Start or enter safe container
   cbox shell            Open zsh shell instead of the container
   cbox keepalive        Keep container alive for 10 minutes after exit
+  cbox oc [...]         Same as above but use opencode instead of Claude Code
+
+Agent:
+  CBOX_AGENT=opencode   Use opencode instead of Claude Code (set in cbox.env)
+  cbox oc               Shorthand: one-off opencode session
+  cbox oc safe          opencode in safe mode
+  cbox oc shell         zsh shell (opencode-mode container)
 
 Options:
   -v, --verbose         Show full output (updates, sync, MCP proxy status)
@@ -39,7 +46,7 @@ Container Management:
   cbox rebuild          Rebuild container image
 
 Maintenance:
-  cbox update           Force Claude Code update
+  cbox update           Force agent update (Claude Code or opencode)
   cbox doctor           Run environment diagnostics
   cbox version          Show version
 
@@ -71,6 +78,7 @@ _CBOX_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
 unset _CBOX_CONFIG
 
 CBOX_VERBOSE="${CBOX_VERBOSE:-0}"
+CBOX_AGENT="${CBOX_AGENT:-claude}"
 CBOX_DATA_DIR="${CBOX_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/claudebox}"
 CBOX_CLAUDE_DIR="${CBOX_CLAUDE_DIR:-$HOME/.claude}"
 CBOX_HOST_CONFIG_DIR="${CBOX_HOST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}}"
@@ -105,6 +113,9 @@ fi
 # ---------------------------------------------------------
 
 _cbox_log() { [[ "${CBOX_VERBOSE:-0}" == "1" ]] && echo "$@" || true; }
+
+_cbox_agent_bin() { [[ "${CBOX_AGENT:-claude}" == "opencode" ]] && echo "opencode" || echo "claude"; }
+_cbox_agent_pkg() { [[ "${CBOX_AGENT:-claude}" == "opencode" ]] && echo "opencode-ai" || echo "@anthropic-ai/claude-code"; }
 
 _cbox_name() {
   local name
@@ -249,16 +260,20 @@ PYEOF
 _cbox_maybe_update() {
   local name="$1"
 
-  local stamp="${TMPDIR:-/tmp}/.cbox-update-$(date +%Y-%m-%d)"
+  local agent_bin agent_pkg
+  agent_bin=$(_cbox_agent_bin)
+  agent_pkg=$(_cbox_agent_pkg)
+
+  local stamp="${TMPDIR:-/tmp}/.cbox-update-${agent_bin}-$(date +%Y-%m-%d)"
 
   if [[ ! -f "$stamp" ]]; then
-    _cbox_log "Updating Claude Code..."
+    _cbox_log "Updating ${agent_bin}..."
     if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
       $_CBOX_CMD exec --user root "$name" \
-        npm update -g --no-fund @anthropic-ai/claude-code
+        npm update -g --no-fund "$agent_pkg"
     else
       $_CBOX_CMD exec --user root "$name" \
-        npm update -g --no-fund @anthropic-ai/claude-code >/dev/null 2>&1
+        npm update -g --no-fund "$agent_pkg" >/dev/null 2>&1
     fi
     touch "$stamp"
   fi
@@ -278,10 +293,14 @@ _cbox_force_update() {
     $_CBOX_CMD start "$name"
   fi
 
-  echo "Updating Claude Code..."
+  local agent_bin agent_pkg
+  agent_bin=$(_cbox_agent_bin)
+  agent_pkg=$(_cbox_agent_pkg)
+
+  echo "Updating ${agent_bin}..."
 
   $_CBOX_CMD exec --user root "$name" \
-    npm update -g --no-fund @anthropic-ai/claude-code
+    npm update -g --no-fund "$agent_pkg"
 }
 
 _cbox_create_network() {
@@ -616,13 +635,17 @@ _cbox_create() {
   local name="$1"
   local mode="$2"
 
-  _cbox_generate_claude_json "$name"
+  local agent_bin
+  agent_bin=$(_cbox_agent_bin)
+
+  if [[ "$agent_bin" == "claude" ]]; then
+    _cbox_generate_claude_json "$name"
+    mkdir -p "$CBOX_CLAUDE_DIR/projects"
+  fi
 
   local claude_json="$CBOX_DATA_DIR/.claude-$name.json"
 
-  mkdir -p "$CBOX_CLAUDE_DIR/projects"
-
-  echo "Creating $mode container '$name'..."
+  echo "Creating $mode container '$name' ($agent_bin)..."
 
   local args=(
     run -d
@@ -630,14 +653,17 @@ _cbox_create() {
 
     --label "$CBOX_LABEL"
     --label "cbox.mode=$mode"
+    --label "cbox.agent=$agent_bin"
 
     -v "$PWD:/Workspace/$name"
     -w "/Workspace/$name"
 
-    -v "$claude_json:/home/claude/.claude.json"
-
     -e ZDOTDIR=/home/claude
   )
+
+  if [[ "$agent_bin" == "claude" ]]; then
+    args+=(-v "$claude_json:/home/claude/.claude.json")
+  fi
 
   if [[ -n "${CBOX_ZSHRC:-}" ]]; then
     local _zshrc_real
@@ -784,15 +810,20 @@ _cbox_enter() {
   local mode
   mode=$(_cbox_mode "$name")
 
-  if [[ "$command" == "claude" ]]; then
+  local agent_bin
+  agent_bin=$(_cbox_agent_bin)
+
+  if [[ "$command" != "zsh" ]]; then
     _cbox_maybe_update "$name"
-    if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
-      if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-        cdot _pull
-        [[ "$mode" != "safe" ]] && cdot _pull-history "$name"
-      else
-        cdot _pull >/dev/null 2>&1
-        [[ "$mode" != "safe" ]] && cdot _pull-history "$name" >/dev/null 2>&1
+    if [[ "$agent_bin" == "claude" ]]; then
+      if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
+        if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+          cdot _pull
+          [[ "$mode" != "safe" ]] && cdot _pull-history "$name"
+        else
+          cdot _pull >/dev/null 2>&1
+          [[ "$mode" != "safe" ]] && cdot _pull-history "$name" >/dev/null 2>&1
+        fi
       fi
     fi
     if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]] && _cbox_check_companion_api flux "$_CBOX_FLUX_API"; then
@@ -804,11 +835,11 @@ _cbox_enter() {
     fi
   fi
 
-  if [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]]; then
+  if [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]] && [[ "$agent_bin" == "claude" ]]; then
     _cbox_audio_start || true
   fi
 
-  if [[ "$mode" != "safe" ]]; then
+  if [[ "$mode" != "safe" ]] && [[ "$agent_bin" == "claude" ]]; then
     _cbox_mcp_proxies_ensure "$name"
     _cbox_generate_claude_json "$name"
   fi
@@ -816,25 +847,27 @@ _cbox_enter() {
   echo "Entering container '$name'..."
 
   local _exec_args=(-it -w "/Workspace/$name")
-  [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]] && \
+  [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]] && [[ "$agent_bin" == "claude" ]] && \
     _exec_args+=(-e "PULSE_SERVER=$(_cbox_audio_pulse_server)")
 
   _cbox_session_start "$name"
 
   $_CBOX_CMD exec "${_exec_args[@]}" "$name" zsh -ic "$command"
 
-  if [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]]; then
+  if [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]] && [[ "$agent_bin" == "claude" ]]; then
     _cbox_audio_stop
   fi
 
-  if [[ "$command" == "claude" && "$mode" != "safe" ]]; then
-    if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
-      if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-        cdot _push
-        cdot _push-history "$name"
-      else
-        cdot _push >/dev/null 2>&1
-        cdot _push-history "$name" >/dev/null 2>&1
+  if [[ "$command" != "zsh" && "$mode" != "safe" ]]; then
+    if [[ "$agent_bin" == "claude" ]]; then
+      if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
+        if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+          cdot _push
+          cdot _push-history "$name"
+        else
+          cdot _push >/dev/null 2>&1
+          cdot _push-history "$name" >/dev/null 2>&1
+        fi
       fi
     fi
     if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]] && _cbox_check_companion_api flux "$_CBOX_FLUX_API"; then
@@ -908,9 +941,17 @@ _cbox_doctor_inline() {
     && echo "✔ image '$CBOX_IMAGE' exists" \
     || echo "✘ image '$CBOX_IMAGE' missing"
 
+  echo "Active agent: $(_cbox_agent_bin) (CBOX_AGENT=${CBOX_AGENT:-claude})"
+
   [[ -d "$CBOX_CLAUDE_DIR" ]] \
     && echo "✔ Claude config dir exists ($CBOX_CLAUDE_DIR)" \
     || echo "✘ Claude config dir missing ($CBOX_CLAUDE_DIR)"
+
+  local _opencode_cfg="${CBOX_HOST_CONFIG_DIR}/opencode"
+  [[ -d "$_opencode_cfg" ]] \
+    && echo "✔ opencode config dir exists ($_opencode_cfg)" \
+    || echo "ℹ opencode config dir absent ($_opencode_cfg) — created on first run"
+  unset _opencode_cfg
 
   if [[ -n "${CBOX_ZSHRC:-}" ]]; then
     [[ -f "$CBOX_ZSHRC" ]] \
@@ -939,6 +980,7 @@ _cbox_doctor() {
 
   echo "== cbox doctor =="
   echo "Version: $_CBOX_VERSION"
+  echo "Agent:   $(_cbox_agent_bin)"
 
   echo
   echo "[environment]"
@@ -1039,9 +1081,16 @@ cbox() {
 
   case "$subcommand" in
 
+    oc|opencode)
+      local CBOX_AGENT=opencode
+      shift
+      cbox "$@"
+      return
+      ;;
+
     safe)
       _cbox_ensure "$name" "safe" || return 1
-      _cbox_enter "$name" "claude"
+      _cbox_enter "$name" "$(_cbox_agent_bin)"
       ;;
 
     shell)
@@ -1051,7 +1100,7 @@ cbox() {
 
     keepalive)
       _cbox_ensure "$name" "normal" || return 1
-      _cbox_enter "$name" "claude" "no"
+      _cbox_enter "$name" "$(_cbox_agent_bin)" "no"
       _cbox_keepalive "$name"
       ;;
 
@@ -1131,7 +1180,7 @@ cbox() {
     "")
 
       _cbox_ensure "$name" "normal" || return 1
-      _cbox_enter "$name" "claude"
+      _cbox_enter "$name" "$(_cbox_agent_bin)"
       ;;
 
     version)
@@ -1187,7 +1236,7 @@ if [[ -n "${ZSH_VERSION:-}" ]]; then
   _cbox_zsh_complete() {
     case $CURRENT in
       2)
-        compadd -v --verbose list stop reset prune rebuild update doctor safe shell keepalive version help
+        compadd -v --verbose list stop reset prune rebuild update doctor safe shell keepalive oc opencode version help
         ;;
       3)
         if [[ "${words[2]}" == "reset" || "${words[2]}" == "stop" ]]; then
@@ -1207,7 +1256,7 @@ elif [[ -n "${BASH_VERSION:-}" ]]; then
 
     if [[ $COMP_CWORD -eq 1 ]]; then
       COMPREPLY=( $(compgen -W \
-        "-v --verbose list stop reset prune rebuild update doctor safe shell keepalive version help" \
+        "-v --verbose list stop reset prune rebuild update doctor safe shell keepalive oc opencode version help" \
         -- "$cur") )
     elif [[ $COMP_CWORD -eq 2 && ( "$prev" == "reset" || "$prev" == "stop" ) ]]; then
       COMPREPLY=( $(compgen -W "$(_cbox_list_names)" -- "$cur") )

@@ -1,8 +1,8 @@
 # claudebox
 
-A shell utility that runs [Claude Code](https://github.com/anthropics/claude-code) inside an isolated container, scoped to your current project directory. Uses [Apple Container](https://github.com/apple/container) on macOS and Docker on Linux.
+A shell utility that runs AI coding agents ([Claude Code](https://github.com/anthropics/claude-code) or [opencode](https://github.com/opencode-ai/opencode)) inside an isolated container, scoped to your current project directory. Uses [Apple Container](https://github.com/apple/container) on macOS and Docker on Linux.
 
-Each project gets its own container, named after the directory. Two modes are available: **normal** (full access to your Claude config and SSH keys) and **safe** (sandboxed with dropped capabilities, memory/CPU limits, and an isolated network).
+Each project gets its own container, named after the directory. Two modes are available: **normal** (full access to your config and SSH keys) and **safe** (sandboxed with dropped capabilities, memory/CPU limits, and an isolated network).
 
 ## Prerequisites
 
@@ -44,16 +44,19 @@ cd ~/my-project
 cbox           # start Claude Code in a container for this project
 cbox safe      # same, but sandboxed
 cbox shell     # open a zsh shell instead of Claude Code
+cbox oc        # use opencode instead of Claude Code
+cbox oc safe   # opencode in safe mode
 ```
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `cbox` | Start or enter normal container for the current directory |
+| `cbox` | Start or enter normal container (Claude Code) |
 | `cbox safe` | Start or enter sandboxed container |
-| `cbox shell` | Open a zsh shell in the container instead of Claude Code |
-| `cbox keepalive` | Run Claude Code; keep container alive for 10 min after exit |
+| `cbox shell` | Open a zsh shell in the container |
+| `cbox keepalive` | Run agent; keep container alive for 10 min after exit |
+| `cbox oc [...]` | Same as above but use opencode (e.g. `cbox oc safe`, `cbox oc shell`) |
 
 **Container management**
 
@@ -69,7 +72,7 @@ cbox shell     # open a zsh shell instead of Claude Code
 
 | Command | Description |
 |---------|-------------|
-| `cbox update` | Force-update Claude Code inside a running container |
+| `cbox update` | Force-update the active agent inside a running container |
 | `cbox doctor` | Run environment diagnostics (includes companion tool status) |
 | `cbox version` | Show version |
 
@@ -79,12 +82,12 @@ cbox shell     # open a zsh shell instead of Claude Code
 - Mounts your Claude config and optionally SSH keys and dotfiles
 - Intended for trusted development work
 
-### Safe mode (`cbox safe`)
+### Safe mode (`cbox safe`, `cbox oc safe`)
 - All Linux capabilities dropped (`--cap-drop=ALL`)
 - No privilege escalation (`--security-opt no-new-privileges`)
 - 4 GB memory limit, 2 CPU cores, 512 max PIDs
 - Isolated network bridge (`cbox-bridge`)
-- Claude config mounted read-only
+- Agent config mounted read-only
 
 ## Configuration
 
@@ -92,6 +95,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `CBOX_AGENT` | `claude` | Agent to run: `claude` (Claude Code) or `opencode`. Can also be set per-invocation with `cbox oc` |
 | `CBOX_IMAGE` | `claudebox` | Docker image name |
 | `CBOX_LABEL` | `cbox.project=true` | Label applied to all cbox containers |
 | `CBOX_KEEPALIVE_SECONDS` | `600` | Seconds container stays alive before auto-stop in keepalive mode |
@@ -114,7 +118,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 
 The image is based on Ubuntu 24.04 and includes:
 
-- Node.js 22, Claude Code
+- Node.js 22, Claude Code, opencode
 - Python 3, [uv](https://github.com/astral-sh/uv)
 - Git, git-crypt, openssh-client
 - ripgrep, fd-find, jq, eza
@@ -129,6 +133,9 @@ The container user is `claude` (UID matches your host UID to avoid permission is
 [`macos/screenshot.sh`](macos/screenshot.sh) captures an interactive screenshot (drag to select a region, same as ⇧⌘4) and saves it directly to the container's `~/share/` folder. It reads `~/.config/claudebox/cbox.env` automatically so no path configuration is needed. See [`macos/README.md`](macos/README.md) for how to assign a keyboard shortcut via Automator, Hammerspoon, or Raycast.
 
 ## Voice Mode
+
+> [!NOTE]
+> Voice mode is Claude Code only. It has no equivalent in opencode and is not activated for `cbox oc` sessions.
 
 Claude Code's `/voice` command lets you dictate prompts using your microphone. Inside a container there is no direct audio device, so claudebox bridges your Mac's microphone via PulseAudio over TCP.
 
@@ -179,11 +186,12 @@ nohup pulseaudio --daemonize=no > /tmp/cbox-pulse.log 2>&1 &
 
 - Container name is derived from the current directory name (e.g. `my-project`)
 - Project directory is mounted at `/Workspace/<name>` inside the container
-- Claude Code is updated automatically once per day on first use
+- The active agent (`claude` or `opencode`) is updated automatically once per day on first use; each agent has its own independent update stamp
+- `cbox oc` (or `CBOX_AGENT=opencode` in `cbox.env`) selects opencode for the session; opencode reads its config from `~/.config/opencode`, which is already available via the `CBOX_HOST_CONFIG_DIR` mount
 - On exit, the container is stopped and the share folder is cleared
 - `cbox keepalive` leaves the container running for 10 minutes (useful for follow-up `exec` calls)
 - Authentication is automatic — credentials are mounted from the host, so no re-authentication is needed inside the container
-- If [claudedot](https://github.com/bpeterme/claudedot) is installed, config and history sync runs automatically at session start and exit
+- If [claudedot](https://github.com/bpeterme/claudedot) is installed, Claude config and history sync runs automatically at session start and exit (Claude sessions only)
 - If [flux](https://github.com/bpeterme/flux) is installed and the project has a `.dvc/` directory, large-file sync runs automatically at session boundaries
 
 ## Companion Tools

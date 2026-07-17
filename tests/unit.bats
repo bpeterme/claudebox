@@ -353,3 +353,69 @@ _label_from_json() {
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
+
+# ---------------------------------------------------------------------------
+# _cbox_agent_bin / _cbox_agent_pkg
+# ---------------------------------------------------------------------------
+
+@test "_cbox_agent_bin: returns claude by default" {
+  unset CBOX_AGENT
+  run _cbox_agent_bin
+  [ "$status" -eq 0 ]
+  [ "$output" = "claude" ]
+}
+
+@test "_cbox_agent_bin: returns claude when CBOX_AGENT=claude" {
+  CBOX_AGENT=claude run _cbox_agent_bin
+  [ "$status" -eq 0 ]
+  [ "$output" = "claude" ]
+}
+
+@test "_cbox_agent_bin: returns opencode when CBOX_AGENT=opencode" {
+  CBOX_AGENT=opencode run _cbox_agent_bin
+  [ "$status" -eq 0 ]
+  [ "$output" = "opencode" ]
+}
+
+@test "_cbox_agent_pkg: returns claude package by default" {
+  unset CBOX_AGENT
+  run _cbox_agent_pkg
+  [ "$status" -eq 0 ]
+  [ "$output" = "@anthropic-ai/claude-code" ]
+}
+
+@test "_cbox_agent_pkg: returns opencode-ai when CBOX_AGENT=opencode" {
+  CBOX_AGENT=opencode run _cbox_agent_pkg
+  [ "$status" -eq 0 ]
+  [ "$output" = "opencode-ai" ]
+}
+
+# ---------------------------------------------------------------------------
+# cbox oc dispatch
+# ---------------------------------------------------------------------------
+
+@test "cbox oc: sets CBOX_AGENT=opencode for the session" {
+  _cbox_ensure() { true; }
+  _cbox_enter() {
+    echo "agent=$(_cbox_agent_bin)"
+  }
+  run bash -c "
+    source '$CBOX_SH'
+    _cbox_ensure() { true; }
+    _cbox_enter() { echo \"agent=\$(_cbox_agent_bin)\"; }
+    cbox oc
+  "
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"agent=opencode"* ]]
+}
+
+@test "cbox oc safe: sets CBOX_AGENT=opencode for safe mode" {
+  run bash -c "
+    source '$CBOX_SH'
+    _cbox_ensure() { true; }
+    _cbox_enter() { echo \"agent=\$(_cbox_agent_bin) mode=\$2\"; }
+    cbox oc safe
+  "
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"agent=opencode"* ]]
+}

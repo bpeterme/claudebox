@@ -1174,7 +1174,14 @@ cbox() {
         stopped=$(
           _cbox_rt_list | while read -r cname cstate; do
             [[ "$cstate" == "running" ]] && continue
-            [[ "$(_cbox_rt_label "$cname" "cbox.project")" == "true" ]] && echo "$cname"
+            # Use an explicit if (not && echo): under `set -euo pipefail` a
+            # trailing false [[ … ]] would make the loop — and thus this
+            # command substitution — exit non-zero, aborting prune before it
+            # removes anything. This bites whenever the last listed container
+            # is a stopped non-cbox one (e.g. Apple Container's buildkit).
+            if [[ "$(_cbox_rt_label "$cname" "cbox.project")" == "true" ]]; then
+              echo "$cname"
+            fi
           done
         )
       else
@@ -1197,6 +1204,11 @@ cbox() {
 
     version)
       echo "cbox $_CBOX_VERSION"
+      # Show which script is actually executing. The Homebrew install is a
+      # frozen snapshot of cbox.sh, so this disambiguates it from a repo
+      # checkout when debugging — resolving brew's bin shim to the versioned
+      # Cellar path.
+      echo "path: $(_cbox_resolve_path "${BASH_SOURCE[0]}")"
       ;;
 
     help|--help|-h)

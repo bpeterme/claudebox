@@ -1206,15 +1206,9 @@ cbox() {
       echo "cbox $_CBOX_VERSION"
       # Show which script is actually executing. The Homebrew install is a
       # frozen snapshot of cbox.sh, so this disambiguates it from a repo
-      # checkout when debugging. Resolve symlinks portably (macOS readlink
-      # has no -f), e.g. brew's bin shim -> the versioned Cellar path.
-      local src="${BASH_SOURCE[0]}"
-      while [[ -L "$src" ]]; do
-        local tgt
-        tgt=$(readlink "$src")
-        [[ "$tgt" == /* ]] && src="$tgt" || src="$(dirname "$src")/$tgt"
-      done
-      echo "path: $src"
+      # checkout when debugging — resolving brew's bin shim to the versioned
+      # Cellar path.
+      echo "path: $(_cbox_resolve_path "${BASH_SOURCE[0]}")"
       ;;
 
     help|--help|-h)

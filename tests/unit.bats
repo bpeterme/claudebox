@@ -355,6 +355,61 @@ _label_from_json() {
 }
 
 # ---------------------------------------------------------------------------
+# prune loop robustness under `set -euo pipefail` (Homebrew executable path)
+# ---------------------------------------------------------------------------
+
+# Mirrors the Apple Container prune loop, including the `stopped=$(…)`
+# assignment, under the same `set -euo pipefail` the script applies when run as
+# an installed executable. Regression: a stopped, unlabeled container listed
+# LAST (e.g. Apple Container's `buildkit`) left the loop with a non-zero exit
+# status; under `set -e` that aborted prune before it removed anything, with no
+# "Nothing to prune." message. Runs in a subshell so the shell options and stub
+# functions do not leak into the rest of the suite.
+_prune_collect() {
+  (
+    set -euo pipefail
+    _cbox_rt_list() {
+      printf '%s\n' \
+        "Temp stopped" \
+        "companyon-apps running" \
+        "Genesis stopped" \
+        "buildkit stopped"
+    }
+    _cbox_rt_label() {
+      # only cbox containers carry cbox.project=true; buildkit does not
+      case "$1" in
+        buildkit) echo "" ;;
+        *) echo "true" ;;
+      esac
+    }
+    local stopped
+    stopped=$(
+      _cbox_rt_list | while read -r cname cstate; do
+        [[ "$cstate" == "running" ]] && continue
+        if [[ "$(_cbox_rt_label "$cname" "cbox.project")" == "true" ]]; then
+          echo "$cname"
+        fi
+      done
+    )
+    # Reaching here means the substitution did not abort under set -e.
+    printf '%s\n' "$stopped"
+  )
+}
+
+@test "prune loop: does not abort under set -e when last container is stopped and unlabeled" {
+  run _prune_collect
+  [ "$status" -eq 0 ]
+}
+
+@test "prune loop: collects stopped cbox containers, skips running and unlabeled" {
+  run _prune_collect
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "Temp" ]
+  [ "${lines[1]}" = "Genesis" ]
+  [ "${#lines[@]}" -eq 2 ]
+}
+
+# ---------------------------------------------------------------------------
 # _cbox_agent_bin / _cbox_agent_pkg
 # ---------------------------------------------------------------------------
 

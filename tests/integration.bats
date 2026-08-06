@@ -79,6 +79,17 @@ _mounts() {
   [[ "$output" == *"$target_dir/settings.json:$target_dir/settings.json"* ]]
 }
 
+@test "symlink target one level deep (e.g. output-styles/foo.md) is mounted at its own path" {
+  local target_dir="$BATS_TMPDIR/dotfiles"
+  mkdir -p "$target_dir" "$CBOX_CLAUDE_DIR/output-styles"
+  echo "# ELI5" > "$target_dir/ELI5.md"
+  ln -sf "$target_dir/ELI5.md" "$CBOX_CLAUDE_DIR/output-styles/ELI5.md"
+
+  _cbox_create "$TEST_NAME" "normal"
+  run _mounts
+  [[ "$output" == *"$target_dir/ELI5.md:$target_dir/ELI5.md"* ]]
+}
+
 @test "symlink target inside workspace is not double-mounted" {
   local inner="$TEST_WORKDIR/inner"
   mkdir -p "$inner"

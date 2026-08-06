@@ -733,6 +733,8 @@ _cbox_create() {
   # mount that target at its own absolute path inside the container. The symlink
   # in ~/.claude points to e.g. /Users/work/.config/dotfiles/claude/settings.json;
   # mounting that path at the same path in the container lets the symlink resolve.
+  # maxdepth 2 also covers symlinks one level down (e.g. output-styles/ELI5.md,
+  # commands/foo.md) without recursing into large trees like projects/.
   local _ro="" _link _target
   [[ "$mode" == "safe" ]] && _ro=":ro"
   while IFS= read -r _link; do
@@ -741,7 +743,7 @@ _cbox_create() {
     [[ "$_target" == "$CBOX_CLAUDE_DIR"* ]] && continue
     [[ "$_target" == "$PWD" || "$_target" == "$PWD/"* ]] && continue
     args+=(-v "$_target:$_target$_ro")
-  done < <(find "$CBOX_CLAUDE_DIR" -maxdepth 1 -type l 2>/dev/null)
+  done < <(find "$CBOX_CLAUDE_DIR" -maxdepth 2 -type l 2>/dev/null)
   unset _ro _link _target
 
   args+=(

@@ -1,5 +1,4 @@
-FROM ubuntu:24.04
-# FROM ubuntu:26.04 - playwright not ready yet
+FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -31,7 +30,12 @@ RUN apt-get update && apt-get install -y \
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs
 
-RUN npm install -g @anthropic-ai/claude-code opencode-ai
+# npm doesn't fail this install if a platform-native optionalDependency
+# fails to download, so verify both binaries actually work here — otherwise
+# a silently broken image only surfaces later when a container is entered.
+RUN npm install -g @anthropic-ai/claude-code opencode-ai && \
+    claude --version && \
+    opencode --version
 
 # gh CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \

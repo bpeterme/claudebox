@@ -25,8 +25,7 @@ RUN apt-get update && apt-get install -y \
     sox \
     libsox-fmt-pulse \
     pulseaudio-utils \
-    libasound2-plugins \
-    keyutils
+    libasound2-plugins
 
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs

@@ -179,6 +179,14 @@ _cbox_mode() {
   _cbox_rt_label "$name" "cbox.mode"
 }
 
+_cbox_machine_supported() {
+  [[ "$_CBOX_RUNTIME" == "apple" ]] && container help 2>&1 | grep -q "machine"
+}
+
+_cbox_machine_running() {
+  container machine status >/dev/null 2>&1
+}
+
 _cbox_generate_claude_json() {
   local name="$1"
   local portmap="$CBOX_DATA_DIR/.mcp-portmap-$name.json"
@@ -762,6 +770,15 @@ _cbox_ensure() {
   local name="$1"
   local requested_mode="$2"
 
+  if _cbox_machine_supported && ! _cbox_machine_running; then
+    echo "Starting container machine..."
+    if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+      container machine start
+    else
+      container machine start >/dev/null 2>&1
+    fi
+  fi
+
   if ! _cbox_exists "$name"; then
     _cbox_create "$name" "$requested_mode"
     return
@@ -943,11 +960,11 @@ _cbox_doctor_inline() {
     || echo "✘ $_CBOX_CMD command missing"
 
   # Apple Container 1.0.0+ manages a container machine; check it is running
-  if [[ "$_CBOX_RUNTIME" == "apple" ]] && container help 2>&1 | grep -q "machine"; then
-    if container machine status >/dev/null 2>&1; then
+  if _cbox_machine_supported; then
+    if _cbox_machine_running; then
       echo "✔ container machine running"
     else
-      echo "✘ container machine not running — run: container machine start"
+      echo "✘ container machine not running (cbox will start it automatically)"
     fi
   fi
 

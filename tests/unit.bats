@@ -258,6 +258,43 @@ setup() {
 }
 
 # ---------------------------------------------------------------------------
+# _cbox_flux_push
+# ---------------------------------------------------------------------------
+
+@test "_cbox_flux_push: non-verbose, success stays silent" {
+  unset CBOX_VERBOSE
+  flux() { return 0; }
+  run _cbox_flux_push
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "_cbox_flux_push: non-verbose, failure is always surfaced" {
+  unset CBOX_VERBOSE
+  flux() { echo "dvc push: access denied" >&2; return 1; }
+  run _cbox_flux_push
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"⚠  flux push failed:"* ]]
+  [[ "$output" == *"dvc push: access denied"* ]]
+}
+
+@test "_cbox_flux_push: verbose, failure is shown and does not abort the caller" {
+  CBOX_VERBOSE=1
+  flux() { echo "dvc push: access denied" >&2; return 1; }
+  run _cbox_flux_push
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"dvc push: access denied"* ]]
+}
+
+@test "_cbox_flux_push: verbose, success output is shown" {
+  CBOX_VERBOSE=1
+  flux() { echo "Pushed to Git remote."; return 0; }
+  run _cbox_flux_push
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Pushed to Git remote."* ]]
+}
+
+# ---------------------------------------------------------------------------
 # _cbox_list_names
 # ---------------------------------------------------------------------------
 

@@ -819,6 +819,25 @@ _cbox_check_companion_api() {
 }
 
 # ---------------------------------------------------------
+# flux push — session-close sync for flux-managed repos
+# ---------------------------------------------------------
+
+# Runs `flux _push` (auto-commits any dirty work, then pushes git + DVC).
+# Failures must always be visible — CBOX_VERBOSE only controls whether the
+# routine success output is shown too, never whether failures are silenced.
+_cbox_flux_push() {
+  if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+    flux _push || true
+  else
+    local _out
+    if ! _out=$(flux _push 2>&1); then
+      echo "⚠  flux push failed:"
+      echo "$_out" | sed 's/^/    /'
+    fi
+  fi
+}
+
+# ---------------------------------------------------------
 # enter container
 # ---------------------------------------------------------
 
@@ -902,11 +921,7 @@ _cbox_enter() {
       fi
     fi
     if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]] && _cbox_check_companion_api flux "$_CBOX_FLUX_API"; then
-      if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-        flux _push || true
-      else
-        flux _push >/dev/null 2>&1 || true
-      fi
+      _cbox_flux_push
     fi
   fi
 

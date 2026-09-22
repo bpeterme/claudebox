@@ -12,6 +12,7 @@ setup() {
   export CBOX_CLAUDE_DIR="$BATS_TMPDIR/claude"
   export CBOX_HOST_CONFIG_DIR="$BATS_TMPDIR/config"
   export CBOX_SHARE_DIR="$BATS_TMPDIR/share"
+  export CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/ms-playwright"
   mkdir -p "$CBOX_DATA_DIR" "$CBOX_CLAUDE_DIR/projects" "$CBOX_HOST_CONFIG_DIR" "$CBOX_SHARE_DIR"
   export TEST_WORKDIR="$BATS_TMPDIR/workdir"
   mkdir -p "$TEST_WORKDIR"
@@ -27,6 +28,13 @@ teardown() {
 _mounts() {
   docker inspect --format \
     '{{range .Mounts}}{{printf "%s:%s\n" .Source .Destination}}{{end}}' \
+    "$TEST_NAME"
+}
+
+# Same as _mounts but appends the writability flag, as "<source>:<dest>:<rw>".
+_mounts_rw() {
+  docker inspect --format \
+    '{{range .Mounts}}{{printf "%s:%s:%v\n" .Source .Destination .RW}}{{end}}' \
     "$TEST_NAME"
 }
 
@@ -62,6 +70,31 @@ _mounts() {
   local expected="$CBOX_DATA_DIR/.claude-$TEST_NAME.json"
   run _mounts
   [[ "$output" == *"$expected:/home/claude/.claude.json"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# playwright browser cache
+# ---------------------------------------------------------------------------
+
+@test "playwright cache is created on the host and mounted at /opt/ms-playwright" {
+  rm -rf "$CBOX_PLAYWRIGHT_DIR"
+  _cbox_create "$TEST_NAME" "normal"
+  [ -d "$CBOX_PLAYWRIGHT_DIR" ]
+  run _mounts
+  [[ "$output" == *"$CBOX_PLAYWRIGHT_DIR:/opt/ms-playwright"* ]]
+}
+
+@test "playwright cache is writable in normal mode" {
+  _cbox_create "$TEST_NAME" "normal"
+  run _mounts_rw
+  [[ "$output" == *"$CBOX_PLAYWRIGHT_DIR:/opt/ms-playwright:true"* ]]
+}
+
+@test "playwright cache written inside the container lands on the host" {
+  rm -rf "$CBOX_PLAYWRIGHT_DIR"
+  _cbox_create "$TEST_NAME" "normal"
+  docker exec "$TEST_NAME" sh -c 'echo ok > /opt/ms-playwright/chromium-test'
+  [ -f "$CBOX_PLAYWRIGHT_DIR/chromium-test" ]
 }
 
 # ---------------------------------------------------------------------------

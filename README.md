@@ -103,10 +103,11 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_CLAUDE_DIR` | `~/.claude` | Claude Code config, mounted as `~/.claude` (read-write; read-only in safe mode) |
 | `CBOX_HOST_CONFIG_DIR` | `~/.config` | Host config dir, mounted as `~/.config` in container (normal mode, read-write) |
 | `CBOX_SHARE_DIR` | `~/.cache/claudebox/share` | Share folder, mounted as `~/share` in container; cleared on exit (read-write) |
+| `CBOX_PLAYWRIGHT_DIR` | `$CBOX_DATA_DIR/ms-playwright` | Playwright browser cache, mounted as `/opt/ms-playwright` (read-write; read-only in safe mode). Shared by all projects, kept across resets and rebuilds |
 | `CBOX_SSH_DIR` | *(unset)* | SSH dir to mount as `~/.ssh` in container (normal mode, **read-only**); unset = no SSH mount |
 | `CBOX_ZSHRC` | *(unset)* | `.zshrc` to source as `~/.zshrc.global` inside the container (**read-only**); unset = none |
 | `CBOX_BUILD_DIR` | cbox.sh directory | Build context for `cbox rebuild` |
-| `BUILD_PLAYWRIGHT` | `0` | Set to `1` to include Playwright + Chromium in the image |
+| `BUILD_PLAYWRIGHT` | `0` | Set to `1` to bake Playwright + Chromium into the image on the next `cbox rebuild`, and seed `CBOX_PLAYWRIGHT_DIR` from it |
 | `CBOX_AUDIO` | *(unset)* | Set to `1` to enable Claude Code voice mode (requires PulseAudio on host) |
 
 > [!WARNING]
@@ -124,7 +125,10 @@ The image is based on Ubuntu 24.04 and includes:
 - ripgrep, fd-find, jq, eza
 - zsh with autosuggestions and syntax highlighting
 - SoX + PulseAudio client (for voice mode)
-- Playwright + Chromium (opt-in via `BUILD_PLAYWRIGHT=1`)
+- Playwright + Chromium (opt-in via `BUILD_PLAYWRIGHT=1`), installed into
+  `/opt/ms-playwright`. That path is bind-mounted from `CBOX_PLAYWRIGHT_DIR` on the
+  host, so browsers are downloaded once per machine rather than once per container —
+  and survive `cbox reset`, `cbox prune` and image rebuilds
 
 The container user is `claude` (UID matches your host UID to avoid permission issues on mounted volumes).
 

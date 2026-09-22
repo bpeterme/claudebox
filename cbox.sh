@@ -83,6 +83,10 @@ CBOX_DATA_DIR="${CBOX_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/claudebox}"
 CBOX_CLAUDE_DIR="${CBOX_CLAUDE_DIR:-$HOME/.claude}"
 CBOX_HOST_CONFIG_DIR="${CBOX_HOST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}}"
 CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/claudebox/share}"
+# Playwright browser cache, mounted over the image's /opt/ms-playwright. Lives in
+# CBOX_DATA_DIR, not CBOX_SHARE_DIR: the share dir is wiped when the last session
+# closes, and these browsers are ~660 MB we never want to re-download.
+CBOX_PLAYWRIGHT_DIR="${CBOX_PLAYWRIGHT_DIR:-$CBOX_DATA_DIR/ms-playwright}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
@@ -636,6 +640,46 @@ PYEOF
 }
 
 # ---------------------------------------------------------
+# playwright browser cache
+# ---------------------------------------------------------
+
+# Chromium is baked into the image's /opt/ms-playwright when BUILD_PLAYWRIGHT=1,
+# but a bind-mount over that path would hide it and force a fresh ~115 MB
+# download on first use. So when the host directory is still empty, copy the
+# image's browsers into it once.
+#
+# After that the cache is per-machine rather than per-container: it survives
+# `cbox reset`, `cbox prune` and image rebuilds, and every project shares it.
+# Without the mount, anything a container installs itself lives in that
+# container's writable layer and is lost the moment the container is removed —
+# so each project re-downloaded the same browsers.
+#
+# With BUILD_PLAYWRIGHT=0 there is nothing to seed and this is skipped; the mount
+# simply starts empty, and the first container to install playwright fills it for
+# every later container on this machine.
+_cbox_seed_playwright() {
+  mkdir -p "$CBOX_PLAYWRIGHT_DIR"
+
+  [[ "${BUILD_PLAYWRIGHT:-0}" == "1" ]] || return 0
+  # Already seeded, or already filled from inside a container.
+  [[ -n "$(ls -A "$CBOX_PLAYWRIGHT_DIR" 2>/dev/null)" ]] && return 0
+
+  echo "Seeding Playwright browser cache ($CBOX_PLAYWRIGHT_DIR)..."
+
+  # `cp -a` of the directory *contents*; tolerate an image built before the
+  # browsers were baked, where /opt/ms-playwright exists but is empty.
+  local _out
+  if ! _out=$($_CBOX_CMD run --rm \
+        -v "$CBOX_PLAYWRIGHT_DIR:/seed" \
+        "$CBOX_IMAGE" \
+        sh -c 'cp -a /opt/ms-playwright/. /seed/ 2>/dev/null || true' 2>&1); then
+    echo "⚠  Could not seed the Playwright cache from the image:"
+    echo "$_out" | sed 's/^/    /'
+    echo "    Browsers will be downloaded inside the container on first use."
+  fi
+}
+
+# ---------------------------------------------------------
 # container creation
 # ---------------------------------------------------------
 
@@ -680,6 +724,11 @@ _cbox_create() {
     unset _zshrc_real
   fi
 
+  # Both modes mount the Playwright cache, so it must exist (and be seeded)
+  # before either branch adds it — a missing host path would be created
+  # root-owned by the runtime.
+  _cbox_seed_playwright
+
   if [[ "$mode" == "normal" ]]; then
     if [[ -n "${CBOX_SSH_DIR:-}" ]]; then
       # Mount each file individually so ~/.ssh/ itself is not a volume mount.
@@ -716,6 +765,7 @@ _cbox_create() {
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude"
       -v "$CBOX_HOST_CONFIG_DIR:/home/claude/.config"
       -v "$CBOX_SHARE_DIR:/home/claude/share"
+      -v "$CBOX_PLAYWRIGHT_DIR:/opt/ms-playwright"
     )
   fi
 
@@ -727,6 +777,11 @@ _cbox_create() {
       --memory=4g
       --cpus=2
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude:ro"
+      # Read-only for the same reason .claude is: safe mode must not be able to
+      # write host state shared with every other container. Baked browsers still
+      # work; a playwright self-install inside the container will fail, which is
+      # the intended trade-off for this mode.
+      -v "$CBOX_PLAYWRIGHT_DIR:/opt/ms-playwright:ro"
     )
     # --security-opt and --pids-limit are not supported by Apple's container CLI
     if [[ "$_CBOX_RUNTIME" != "apple" ]]; then
@@ -992,6 +1047,19 @@ _cbox_doctor_inline() {
   [[ -d "$CBOX_CLAUDE_DIR" ]] \
     && echo "✔ Claude config dir exists ($CBOX_CLAUDE_DIR)" \
     || echo "✘ Claude config dir missing ($CBOX_CLAUDE_DIR)"
+
+  # Nothing prunes this cache automatically: unlike an image layer it survives
+  # rebuilds, so every playwright upgrade leaves its old chromium-<id> behind.
+  # Report the size so it stays visible and the user can clear it deliberately.
+  if [[ -d "$CBOX_PLAYWRIGHT_DIR" ]] && [[ -n "$(ls -A "$CBOX_PLAYWRIGHT_DIR" 2>/dev/null)" ]]; then
+    local _pw_size
+    _pw_size=$(du -sh "$CBOX_PLAYWRIGHT_DIR" 2>/dev/null | cut -f1)
+    echo "✔ Playwright cache present ($CBOX_PLAYWRIGHT_DIR, ${_pw_size:-unknown})"
+    echo "  ℹ never pruned automatically — clear with: rm -rf $CBOX_PLAYWRIGHT_DIR"
+    unset _pw_size
+  else
+    echo "ℹ Playwright cache empty ($CBOX_PLAYWRIGHT_DIR) — filled on first use"
+  fi
 
   local _opencode_cfg="${CBOX_HOST_CONFIG_DIR}/opencode"
   [[ -d "$_opencode_cfg" ]] \

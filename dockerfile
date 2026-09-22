@@ -77,6 +77,11 @@ RUN git clone --depth=1 https://github.com/zsh-users/zsh-autosuggestions \
         /home/claude/.zsh/zsh-syntax-highlighting && \
     chown -R claude:claude /home/claude/.zsh
 
+# Playwright browsers live outside $HOME so the path is stable and inspectable,
+# and so cbox can bind-mount a host directory over it to make the cache
+# per-machine instead of per-container (see _cbox_create in cbox.sh).
+RUN mkdir -p /opt/ms-playwright && chown claude:claude /opt/ms-playwright
+
 USER claude
 
 RUN mkdir -p /home/claude/.ssh && chmod 700 /home/claude/.ssh
@@ -92,12 +97,31 @@ ENV PATH="/home/claude/.local/bin:$PATH"
 # dvc — required by flux for R2-routed files
 RUN uv tool install "dvc[s3]"
 
-# playwright — installs Python package and its own Chromium binary
+# playwright — installs Chromium into PLAYWRIGHT_BROWSERS_PATH
 # Enable with: cbox rebuild (after setting BUILD_PLAYWRIGHT=1 in ~/.config/claudebox/cbox.env)
+#
+# Deliberately unpinned, like the dvc install above: playwright ties each
+# of its releases to one exact Chromium build id, so a pin here would have to be
+# hand-synced against every script that resolves playwright at run time (e.g. an
+# unpinned PEP 723 header under `uv run`). When they drift, the failure reads
+# "Looks like Playwright was just installed or updated" — which sounds transient
+# and is not.
+#
+# Install and smoke test share a single `uv run`, so the build cannot resolve one
+# playwright for the install and a different one for the check. The test launches
+# channel="chromium" rather than the headless_shell build, because that is what
+# real fetchers use — headless_shell is fingerprinted and refused by Cloudflare.
 ARG BUILD_PLAYWRIGHT=0
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 RUN if [ "$BUILD_PLAYWRIGHT" = "1" ]; then \
-      uv tool install playwright && \
-      playwright install --with-deps chromium; \
+      uv run --no-project --with playwright python -c "\
+import subprocess, sys; \
+subprocess.run([sys.executable, '-m', 'playwright', 'install', '--with-deps', 'chromium'], check=True); \
+from playwright.sync_api import sync_playwright; \
+p = sync_playwright().start(); \
+b = p.chromium.launch(channel='chromium', args=['--no-sandbox']); \
+print('chromium ok:', b.version); \
+b.close(); p.stop()"; \
     fi
 
 WORKDIR /Workspace

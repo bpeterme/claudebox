@@ -77,9 +77,17 @@ RUN git clone --depth=1 https://github.com/zsh-users/zsh-autosuggestions \
         /home/claude/.zsh/zsh-syntax-highlighting && \
     chown -R claude:claude /home/claude/.zsh
 
-# Playwright browsers live outside $HOME so the path is stable and inspectable,
-# and so cbox can bind-mount a host directory over it to make the cache
-# per-machine instead of per-container (see _cbox_create in cbox.sh).
+# Browser location for playwright — deliberately NOT the default
+# ~/.cache/ms-playwright. In an image built with BUILD_PLAYWRIGHT=1, the apt
+# payload from `playwright install --with-deps` was present while the browser
+# binaries were not: ~/.cache/ms-playwright was empty and /root/.cache/ms-playwright
+# did not exist at all. The root cause was not determinable from inside the
+# container; an explicit non-cache path makes it moot, keeps the result
+# inspectable, and gives cbox a stable path to bind-mount the host cache over
+# (see _cbox_create in cbox.sh).
+#
+# Created here — before `USER claude`, owned by claude — so that both the
+# build-time install below and any runtime install can write it without sudo.
 RUN mkdir -p /opt/ms-playwright && chown claude:claude /opt/ms-playwright
 
 USER claude
@@ -100,12 +108,17 @@ RUN uv tool install "dvc[s3]"
 # playwright — installs Chromium into PLAYWRIGHT_BROWSERS_PATH
 # Enable with: cbox rebuild (after setting BUILD_PLAYWRIGHT=1 in ~/.config/claudebox/cbox.env)
 #
-# Deliberately unpinned, like the dvc install above: playwright ties each
-# of its releases to one exact Chromium build id, so a pin here would have to be
-# hand-synced against every script that resolves playwright at run time (e.g. an
-# unpinned PEP 723 header under `uv run`). When they drift, the failure reads
-# "Looks like Playwright was just installed or updated" — which sounds transient
-# and is not.
+# Deliberately unpinned, like the dvc install above. Playwright ties each of its
+# releases to one exact Chromium build id, and this image is built on a different
+# clock from the one a script resolves playwright on at run time (e.g. an
+# unpinned PEP 723 header under `uv run`). A pin here would only drift against
+# those scripts and would have to be hand-synced. When they drift, the failure
+# reads "Looks like Playwright was just installed or updated" — which sounds
+# transient and is not.
+#
+# So this layer is a warm cache, not a contract: a script that finds its browser
+# missing is expected to install a matching one itself, which keeps the two
+# clocks self-correcting.
 #
 # Install and smoke test share a single `uv run`, so the build cannot resolve one
 # playwright for the install and a different one for the check. The test launches

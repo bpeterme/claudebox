@@ -511,3 +511,168 @@ _prune_collect() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"agent=opencode"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# playwright browser cache
+# ---------------------------------------------------------------------------
+
+@test "CBOX_PLAYWRIGHT_DIR: defaults to a subdir of CBOX_DATA_DIR" {
+  run bash -c "
+    unset CBOX_PLAYWRIGHT_DIR
+    export CBOX_DATA_DIR='$BATS_TMPDIR/data-default'
+    source '$CBOX_SH'
+    echo \"\$CBOX_PLAYWRIGHT_DIR\"
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "$BATS_TMPDIR/data-default/ms-playwright" ]
+}
+
+@test "CBOX_PLAYWRIGHT_DIR: an explicit override is what actually gets mounted" {
+  local capture="$BATS_TMPDIR/override-args"
+  rm -f "$capture"
+  cd "$BATS_TMPDIR"
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/custom-browsers"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+
+  _cbox_create "cbox-unit-override" "normal"
+
+  run cat "$capture"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"$BATS_TMPDIR/custom-browsers:/opt/ms-playwright"* ]]
+  [[ "$output" != *"$CBOX_DATA_DIR/ms-playwright"* ]]
+}
+
+@test "_cbox_seed_playwright: creates the host dir even when there is nothing to seed" {
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-created"
+  rm -rf "$CBOX_PLAYWRIGHT_DIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { true; }
+  run _cbox_seed_playwright
+  [ "$status" -eq 0 ]
+  [ -d "$BATS_TMPDIR/pw-created" ]
+}
+
+@test "_cbox_seed_playwright: stays silent when the image had no browsers" {
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-nothing"
+  rm -rf "$CBOX_PLAYWRIGHT_DIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { true; }   # copies nothing, leaves the dir empty
+  run _cbox_seed_playwright
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+# BUILD_PLAYWRIGHT describes what the next build will do, not what the current
+# image holds, and is usually passed inline to `cbox rebuild` rather than stored
+# in cbox.env. Gating the seed on it let an empty mount shadow a fully baked
+# image, so seeding must not consult it at all.
+@test "_cbox_seed_playwright: seeds even when BUILD_PLAYWRIGHT is unset" {
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-unset-flag"
+  rm -rf "$CBOX_PLAYWRIGHT_DIR"
+  local capture="$BATS_TMPDIR/pw-unset-flag-args"
+  rm -f "$capture"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  unset BUILD_PLAYWRIGHT
+  _cbox_seed_playwright
+
+  run cat "$capture"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"/opt/ms-playwright/."* ]]
+}
+
+@test "_cbox_seed_playwright: seeds even when BUILD_PLAYWRIGHT=0" {
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-flag-zero"
+  rm -rf "$CBOX_PLAYWRIGHT_DIR"
+  local capture="$BATS_TMPDIR/pw-flag-zero-args"
+  rm -f "$capture"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  BUILD_PLAYWRIGHT=0 _cbox_seed_playwright
+
+  run cat "$capture"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"/opt/ms-playwright/."* ]]
+}
+
+@test "_cbox_seed_playwright: copies from the image when the dir is empty" {
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-empty"
+  rm -rf "$CBOX_PLAYWRIGHT_DIR"
+  local capture="$BATS_TMPDIR/pw-empty-args"
+  rm -f "$capture"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  _cbox_seed_playwright
+
+  run cat "$capture"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"run"* ]]
+  [[ "$output" == *"--rm"* ]]
+  [[ "$output" == *"$BATS_TMPDIR/pw-empty:/seed"* ]]
+  [[ "$output" == *"/opt/ms-playwright/."* ]]
+}
+
+@test "_cbox_seed_playwright: leaves an already-populated dir alone" {
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-populated"
+  mkdir -p "$CBOX_PLAYWRIGHT_DIR/chromium-1243"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { echo "RUNTIME CALLED"; }
+  run _cbox_seed_playwright
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"RUNTIME CALLED"* ]]
+}
+
+@test "_cbox_seed_playwright: surfaces a runtime failure without failing the caller" {
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-broken"
+  rm -rf "$CBOX_PLAYWRIGHT_DIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { echo "unknown flag: --rm" >&2; return 1; }
+  run _cbox_seed_playwright
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Could not seed the Playwright cache"* ]]
+  [[ "$output" == *"unknown flag: --rm"* ]]
+  [[ "$output" == *"downloaded inside the container on first use"* ]]
+}
+
+@test "_cbox_create: mounts the playwright cache writable in normal mode" {
+  local capture="$BATS_TMPDIR/create-normal-args"
+  rm -f "$capture"
+  cd "$BATS_TMPDIR"
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-normal"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+
+  _cbox_create "cbox-unit-normal" "normal"
+
+  run cat "$capture"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"$BATS_TMPDIR/pw-normal:/opt/ms-playwright"* ]]
+  [[ "$output" != *"$BATS_TMPDIR/pw-normal:/opt/ms-playwright:ro"* ]]
+}
+
+@test "_cbox_create: mounts the playwright cache read-only in safe mode" {
+  local capture="$BATS_TMPDIR/create-safe-args"
+  rm -f "$capture"
+  cd "$BATS_TMPDIR"
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-safe"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+
+  _cbox_create "cbox-unit-safe" "safe"
+
+  run cat "$capture"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"$BATS_TMPDIR/pw-safe:/opt/ms-playwright:ro"* ]]
+}
+
+@test "_cbox_create: creates the playwright dir before mounting it" {
+  cd "$BATS_TMPDIR"
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-precreate"
+  rm -rf "$CBOX_PLAYWRIGHT_DIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { true; }
+
+  _cbox_create "cbox-unit-precreate" "safe"
+  [ -d "$CBOX_PLAYWRIGHT_DIR" ]
+}

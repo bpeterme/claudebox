@@ -258,6 +258,38 @@ setup() {
 }
 
 # ---------------------------------------------------------------------------
+# _cbox_container_has_sessions
+# ---------------------------------------------------------------------------
+
+@test "_cbox_container_has_sessions: returns 1 when only PID 1 and the probe run with PPID 0" {
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '    1     0 tail\n   61     1 dbus-daemon\n  900     0 ps\n'; }
+  run _cbox_container_has_sessions "myproject"
+  [ "$status" -eq 1 ]
+}
+
+@test "_cbox_container_has_sessions: returns 0 when another exec session is attached" {
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '    1     0 tail\n  134     0 claude\n  900     0 ps\n'; }
+  run _cbox_container_has_sessions "myproject"
+  [ "$status" -eq 0 ]
+}
+
+@test "_cbox_container_has_sessions: returns 2 when the probe fails" {
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { return 1; }
+  run _cbox_container_has_sessions "myproject"
+  [ "$status" -eq 2 ]
+}
+
+@test "_cbox_container_has_sessions: returns 2 when the probe prints nothing" {
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { true; }
+  run _cbox_container_has_sessions "myproject"
+  [ "$status" -eq 2 ]
+}
+
+# ---------------------------------------------------------------------------
 # _cbox_flux_push
 # ---------------------------------------------------------------------------
 

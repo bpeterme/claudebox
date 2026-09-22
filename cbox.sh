@@ -357,6 +357,19 @@ _cbox_session_end() {
   compgen -G "$_CBOX_SESSION_DIR/.cbox-active-${name}-*" >/dev/null 2>&1
 }
 
+# Asks the container itself whether any exec session is still attached.
+# Exec'd processes run with PPID 0 (PID 1 is the keep-alive entrypoint);
+# the probe's own `ps` is excluded. Returns 0 if a session is active,
+# 1 if none, 2 if the probe failed (caller must not treat that as "none").
+# Marker files alone can outlive their session (interrupted cbox in a
+# still-open shell, or macOS PID reuse), so this is the ground truth.
+_cbox_container_has_sessions() {
+  local out
+  out=$($_CBOX_CMD exec "$1" ps -eo pid=,ppid=,comm= 2>/dev/null) || return 2
+  [[ -n "$out" ]] || return 2
+  awk '$2 == 0 && $1 != 1 && $3 != "ps" { found = 1 } END { exit !found }' <<<"$out"
+}
+
 # ---------------------------------------------------------
 # audio (voice mode)
 # ---------------------------------------------------------
@@ -996,6 +1009,16 @@ _cbox_enter() {
 
   local _last_session=1
   _cbox_session_end "$name" && _last_session=0
+
+  # Markers claim another session — verify with the container before keeping it alive.
+  if (( ! _last_session )); then
+    local _probe=0
+    _cbox_container_has_sessions "$name" || _probe=$?
+    if (( _probe == 1 )); then
+      _last_session=1
+      rm -f "$_CBOX_SESSION_DIR/.cbox-active-${name}-"*
+    fi
+  fi
 
   if [[ "$stop_on_exit" == "yes" ]]; then
     if (( _last_session )); then

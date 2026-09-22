@@ -546,19 +546,54 @@ _prune_collect() {
 @test "_cbox_seed_playwright: creates the host dir even when there is nothing to seed" {
   CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-created"
   rm -rf "$CBOX_PLAYWRIGHT_DIR"
-  BUILD_PLAYWRIGHT=0 run _cbox_seed_playwright
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { true; }
+  run _cbox_seed_playwright
   [ "$status" -eq 0 ]
   [ -d "$BATS_TMPDIR/pw-created" ]
 }
 
-@test "_cbox_seed_playwright: does not invoke the runtime when BUILD_PLAYWRIGHT=0" {
-  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-unbaked"
+@test "_cbox_seed_playwright: stays silent when the image had no browsers" {
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-nothing"
   rm -rf "$CBOX_PLAYWRIGHT_DIR"
   _CBOX_CMD=_fake_runtime
-  _fake_runtime() { echo "RUNTIME CALLED"; }
-  BUILD_PLAYWRIGHT=0 run _cbox_seed_playwright
+  _fake_runtime() { true; }   # copies nothing, leaves the dir empty
+  run _cbox_seed_playwright
   [ "$status" -eq 0 ]
-  [[ "$output" != *"RUNTIME CALLED"* ]]
+  [ -z "$output" ]
+}
+
+# BUILD_PLAYWRIGHT describes what the next build will do, not what the current
+# image holds, and is usually passed inline to `cbox rebuild` rather than stored
+# in cbox.env. Gating the seed on it let an empty mount shadow a fully baked
+# image, so seeding must not consult it at all.
+@test "_cbox_seed_playwright: seeds even when BUILD_PLAYWRIGHT is unset" {
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-unset-flag"
+  rm -rf "$CBOX_PLAYWRIGHT_DIR"
+  local capture="$BATS_TMPDIR/pw-unset-flag-args"
+  rm -f "$capture"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  unset BUILD_PLAYWRIGHT
+  _cbox_seed_playwright
+
+  run cat "$capture"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"/opt/ms-playwright/."* ]]
+}
+
+@test "_cbox_seed_playwright: seeds even when BUILD_PLAYWRIGHT=0" {
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-flag-zero"
+  rm -rf "$CBOX_PLAYWRIGHT_DIR"
+  local capture="$BATS_TMPDIR/pw-flag-zero-args"
+  rm -f "$capture"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  BUILD_PLAYWRIGHT=0 _cbox_seed_playwright
+
+  run cat "$capture"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"/opt/ms-playwright/."* ]]
 }
 
 @test "_cbox_seed_playwright: copies from the image when the dir is empty" {
@@ -568,7 +603,7 @@ _prune_collect() {
   rm -f "$capture"
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
-  BUILD_PLAYWRIGHT=1 _cbox_seed_playwright
+  _cbox_seed_playwright
 
   run cat "$capture"
   [ "$status" -eq 0 ]
@@ -583,7 +618,7 @@ _prune_collect() {
   mkdir -p "$CBOX_PLAYWRIGHT_DIR/chromium-1243"
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { echo "RUNTIME CALLED"; }
-  BUILD_PLAYWRIGHT=1 run _cbox_seed_playwright
+  run _cbox_seed_playwright
   [ "$status" -eq 0 ]
   [[ "$output" != *"RUNTIME CALLED"* ]]
 }
@@ -593,7 +628,7 @@ _prune_collect() {
   rm -rf "$CBOX_PLAYWRIGHT_DIR"
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { echo "unknown flag: --rm" >&2; return 1; }
-  BUILD_PLAYWRIGHT=1 run _cbox_seed_playwright
+  run _cbox_seed_playwright
   [ "$status" -eq 0 ]
   [[ "$output" == *"Could not seed the Playwright cache"* ]]
   [[ "$output" == *"unknown flag: --rm"* ]]

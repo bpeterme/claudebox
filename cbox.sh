@@ -654,20 +654,27 @@ PYEOF
 # container's writable layer and is lost the moment the container is removed —
 # so each project re-downloaded the same browsers.
 #
-# With BUILD_PLAYWRIGHT=0 there is nothing to seed and this is skipped; the mount
-# simply starts empty, and the first container to install playwright fills it for
-# every later container on this machine.
+# If the image has no baked browsers there is nothing to copy, the mount simply
+# starts empty, and the first container to install playwright fills it for every
+# later container on this machine.
 _cbox_seed_playwright() {
   mkdir -p "$CBOX_PLAYWRIGHT_DIR"
 
-  [[ "${BUILD_PLAYWRIGHT:-0}" == "1" ]] || return 0
   # Already seeded, or already filled from inside a container.
   [[ -n "$(ls -A "$CBOX_PLAYWRIGHT_DIR" 2>/dev/null)" ]] && return 0
 
-  echo "Seeding Playwright browser cache ($CBOX_PLAYWRIGHT_DIR)..."
-
-  # `cp -a` of the directory *contents*; tolerate an image built before the
-  # browsers were baked, where /opt/ms-playwright exists but is empty.
+  # Whether the image actually has browsers cannot be known without looking
+  # inside it, and BUILD_PLAYWRIGHT does not answer the question: it describes
+  # what the *next* build will do, and it is commonly passed inline to
+  # `cbox rebuild` rather than kept in cbox.env — so it reads as unset here even
+  # when the image is fully baked. Gating on it would skip the copy and let an
+  # empty mount shadow browsers that are really there, which is the exact
+  # failure this function exists to prevent. So always look: copying nothing
+  # costs one short container run, and the empty check above means a machine
+  # that does have browsers pays it only once.
+  #
+  # `cp -a` of the directory *contents*, tolerating an image where
+  # /opt/ms-playwright exists but is empty.
   local _out
   if ! _out=$($_CBOX_CMD run --rm \
         -v "$CBOX_PLAYWRIGHT_DIR:/seed" \
@@ -676,7 +683,14 @@ _cbox_seed_playwright() {
     echo "⚠  Could not seed the Playwright cache from the image:"
     echo "$_out" | sed 's/^/    /'
     echo "    Browsers will be downloaded inside the container on first use."
+    return 0
   fi
+
+  # Only speak up when something was actually copied — an image without baked
+  # browsers is a normal, silent case.
+  [[ -n "$(ls -A "$CBOX_PLAYWRIGHT_DIR" 2>/dev/null)" ]] && \
+    echo "Seeded Playwright browser cache from image ($CBOX_PLAYWRIGHT_DIR)"
+  return 0
 }
 
 # ---------------------------------------------------------

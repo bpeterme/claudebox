@@ -732,3 +732,40 @@ _prune_collect() {
   _cbox_create "cbox-unit-precreate" "safe"
   [ -d "$CBOX_PLAYWRIGHT_DIR" ]
 }
+
+# ---------------------------------------------------------------------------
+# exit path under `set -e` (how the Homebrew install runs cbox)
+# ---------------------------------------------------------------------------
+
+_run_cbox_script_with_fake_docker() {
+  local bin="$BATS_TMPDIR/fake-bin" proj="$BATS_TMPDIR/exitpath"
+  mkdir -p "$bin" "$proj" "$BATS_TMPDIR/exitpath-tmp"
+  rm -f "$BATS_TMPDIR/exitpath-tmp"/.cbox-active-*
+  cat > "$bin/docker" <<'SH'
+#!/bin/bash
+echo "docker $*" >> "$FAKE_LOG"
+case "$1" in
+  ps) echo "exitpath running" ;;
+  inspect) echo '[{"Config":{"Labels":{"cbox.mode":"normal"}}}]' ;;
+  exec) [[ " $* " == *" -it "* ]] && exit "${FAKE_EXEC_RC:-0}" ;;
+esac
+exit 0
+SH
+  chmod +x "$bin/docker"
+  : > "$BATS_TMPDIR/exitpath.log"
+  cd "$proj"
+  FAKE_LOG="$BATS_TMPDIR/exitpath.log" TMPDIR="$BATS_TMPDIR/exitpath-tmp" \
+    PATH="$bin:/usr/bin:/bin" /bin/bash "$CBOX_SH" "$@"
+}
+
+@test "exit path: container is stopped even when the agent exits non-zero" {
+  FAKE_EXEC_RC=130 run _run_cbox_script_with_fake_docker
+  [ "$status" -eq 0 ]
+  grep -qx "docker stop exitpath" "$BATS_TMPDIR/exitpath.log"
+}
+
+@test "exit path: container is stopped when the agent exits cleanly" {
+  FAKE_EXEC_RC=0 run _run_cbox_script_with_fake_docker
+  [ "$status" -eq 0 ]
+  grep -qx "docker stop exitpath" "$BATS_TMPDIR/exitpath.log"
+}

@@ -371,6 +371,7 @@ _cbox_session_markers() {
         pid="${f##*-}"
         [[ "$pid" =~ ^[0-9]+$ && "${f##*/}" == ".cbox-active-${name}-${pid}" ]] && echo "$f"
       done
+  return 0
 }
 
 # Asks the container itself whether any exec session is still attached.
@@ -923,6 +924,20 @@ _cbox_check_companion_api() {
 # Runs `flux _push` (auto-commits any dirty work, then pushes git + DVC).
 # Failures must always be visible — CBOX_VERBOSE only controls whether the
 # routine success output is shown too, never whether failures are silenced.
+# Same contract as _cbox_flux_push: a failed sync is reported, never fatal,
+# so the teardown after it (stopping the container) always runs.
+_cbox_cdot_push() {
+  if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+    cdot "$@" || true
+  else
+    local _out
+    if ! _out=$(cdot "$@" 2>&1); then
+      echo "⚠  cdot $1 failed:"
+      echo "$_out" | sed 's/^/    /'
+    fi
+  fi
+}
+
 _cbox_flux_push() {
   if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
     flux _push || true
@@ -994,7 +1009,10 @@ _cbox_enter() {
 
   _cbox_session_start "$name"
 
-  $_CBOX_CMD exec "${_exec_args[@]}" "$name" zsh -ic "$command"
+  # The agent's exit status is irrelevant here, but under the script's
+  # `set -e` a non-zero one would skip every teardown step below —
+  # including stopping the container.
+  $_CBOX_CMD exec "${_exec_args[@]}" "$name" zsh -ic "$command" || true
 
   if [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]] && [[ "$agent_bin" == "claude" ]]; then
     _cbox_audio_stop
@@ -1003,19 +1021,10 @@ _cbox_enter() {
   if [[ "$command" != "zsh" && "$mode" != "safe" ]]; then
     if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
       if [[ "$agent_bin" == "claude" ]]; then
-        if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-          cdot _push
-          cdot _push-history "$name"
-        else
-          cdot _push >/dev/null 2>&1
-          cdot _push-history "$name" >/dev/null 2>&1
-        fi
+        _cbox_cdot_push _push
+        _cbox_cdot_push _push-history "$name"
       elif [[ "$agent_bin" == "opencode" ]]; then
-        if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-          cdot _push-opencode
-        else
-          cdot _push-opencode >/dev/null 2>&1
-        fi
+        _cbox_cdot_push _push-opencode
       fi
     fi
     if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]] && _cbox_check_companion_api flux "$_CBOX_FLUX_API"; then
@@ -1040,7 +1049,7 @@ _cbox_enter() {
   if [[ "$stop_on_exit" == "yes" ]]; then
     if (( _last_session )); then
       echo "Stopping container '$name'..."
-      $_CBOX_CMD stop "$name" >/dev/null
+      $_CBOX_CMD stop "$name" >/dev/null || echo "⚠  Failed to stop container '$name' — run: cbox stop"
     else
       echo "Session closed. Container '$name' kept alive (other sessions still active)."
     fi

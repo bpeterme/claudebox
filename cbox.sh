@@ -183,12 +183,12 @@ _cbox_mode() {
   _cbox_rt_label "$name" "cbox.mode"
 }
 
-_cbox_machine_supported() {
-  [[ "$_CBOX_RUNTIME" == "apple" ]] && container help 2>&1 | grep -q "machine"
-}
-
-_cbox_machine_running() {
-  container machine status >/dev/null 2>&1
+# Apple Container's API server (container-apiserver). It is started by
+# `container system start`, possibly late via a delayed launchagent.
+# Not to be confused with `container machine`, a separate persistent VM
+# that cbox does not use.
+_cbox_system_running() {
+  container system status >/dev/null 2>&1
 }
 
 _cbox_generate_claude_json() {
@@ -347,14 +347,30 @@ _cbox_session_start() {
 # returns 0 if other live sessions for this container remain, 1 if this
 # was the last one.
 _cbox_session_end() {
-  local name="$1" f pid
+  local name="$1" f pid others=1
   rm -f "$_CBOX_SESSION_DIR/.cbox-active-${name}-$$"
-  for f in "$_CBOX_SESSION_DIR/.cbox-active-${name}-"*; do
-    [[ -f "$f" ]] || continue
+  while IFS= read -r f; do
     pid="${f##*-}"
-    ps -p "$pid" >/dev/null 2>&1 || rm -f "$f"
-  done
-  compgen -G "$_CBOX_SESSION_DIR/.cbox-active-${name}-*" >/dev/null 2>&1
+    if ps -p "$pid" >/dev/null 2>&1; then
+      others=0
+    else
+      rm -f "$f"
+    fi
+  done < <(_cbox_session_markers "$name")
+  return $others
+}
+
+# Prints this container's marker paths. Uses find instead of a shell glob:
+# zsh aborts the whole calling function on a glob with no matches, and
+# compgen is bash-only. Filters out markers of containers whose name merely
+# starts with "$name-".
+_cbox_session_markers() {
+  local name="$1" f pid
+  find "$_CBOX_SESSION_DIR" -maxdepth 1 -name ".cbox-active-${name}-*" 2>/dev/null \
+    | while IFS= read -r f; do
+        pid="${f##*-}"
+        [[ "$pid" =~ ^[0-9]+$ && "${f##*/}" == ".cbox-active-${name}-${pid}" ]] && echo "$f"
+      done
 }
 
 # Asks the container itself whether any exec session is still attached.
@@ -852,12 +868,12 @@ _cbox_ensure() {
   local name="$1"
   local requested_mode="$2"
 
-  if _cbox_machine_supported && ! _cbox_machine_running; then
-    echo "Starting container machine..."
+  if [[ "$_CBOX_RUNTIME" == "apple" ]] && ! _cbox_system_running; then
+    echo "Starting container system..."
     if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-      container machine start
+      container system start
     else
-      container machine start >/dev/null 2>&1
+      container system start >/dev/null 2>&1
     fi
   fi
 
@@ -1016,7 +1032,8 @@ _cbox_enter() {
     _cbox_container_has_sessions "$name" || _probe=$?
     if (( _probe == 1 )); then
       _last_session=1
-      rm -f "$_CBOX_SESSION_DIR/.cbox-active-${name}-"*
+      local _m
+      _cbox_session_markers "$name" | while IFS= read -r _m; do rm -f "$_m"; done
     fi
   fi
 
@@ -1066,12 +1083,11 @@ _cbox_doctor_inline() {
     && echo "✔ $_CBOX_CMD command found" \
     || echo "✘ $_CBOX_CMD command missing"
 
-  # Apple Container 1.0.0+ manages a container machine; check it is running
-  if _cbox_machine_supported; then
-    if _cbox_machine_running; then
-      echo "✔ container machine running"
+  if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
+    if _cbox_system_running; then
+      echo "✔ container system running"
     else
-      echo "✘ container machine not running (cbox will start it automatically)"
+      echo "✘ container system not running (cbox will start it automatically)"
     fi
   fi
 

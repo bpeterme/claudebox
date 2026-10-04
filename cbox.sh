@@ -36,7 +36,7 @@ Agent:
   cbox oc shell         zsh shell (opencode-mode container)
 
 Options:
-  -v, --verbose         Show full output (updates, sync, MCP proxy status)
+  -v, --verbose         Show full output (updates, sync, MCP relay status)
 
 Container Management:
   cbox list             List cbox containers
@@ -44,6 +44,10 @@ Container Management:
   cbox reset            Remove current project container
   cbox prune            Remove stopped cbox containers
   cbox rebuild          Rebuild container image
+
+MCP servers on the host (~/.config/claudebox/mcp.json):
+  cbox mcp              Show configured host MCP servers and relay status
+  cbox mcp import       Import servers from Claude Desktop / Claude Code
 
 Maintenance:
   cbox update           Force agent update (Claude Code or opencode)
@@ -87,6 +91,10 @@ CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/claudebox/shar
 # CBOX_DATA_DIR, not CBOX_SHARE_DIR: the share dir is wiped when the last session
 # closes, and these browsers are ~660 MB we never want to re-download.
 CBOX_PLAYWRIGHT_DIR="${CBOX_PLAYWRIGHT_DIR:-$CBOX_DATA_DIR/ms-playwright}"
+# Host MCP servers relayed into the container (see "MCP relay" below)
+CBOX_MCP_CONFIG="${CBOX_MCP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/mcp.json}"
+_CBOX_MCP_RELAY="/home/claude/.local/bin/cbox-mcp-relay"
+_CBOX_MCP_SLOTS=2
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
@@ -191,82 +199,20 @@ _cbox_system_running() {
   container system status >/dev/null 2>&1
 }
 
+# Writes the per-project ~/.claude.json the container mounts. Host MCP servers
+# come from $CBOX_MCP_CONFIG only — never from a host Claude installation, which
+# may not exist. See the "MCP relay" section for how they reach the container.
 _cbox_generate_claude_json() {
   local name="$1"
-  local portmap="$CBOX_DATA_DIR/.mcp-portmap-$name.json"
-  local native_index="$CBOX_DATA_DIR/.mcp-native-$name.json"
-  local gateway
-  gateway=$(_cbox_mcp_host_gateway)
+  local mode="${2:-normal}"
 
   mkdir -p "$CBOX_DATA_DIR"
 
   local claude_json="$CBOX_DATA_DIR/.claude-$name.json"
+  local managed="$CBOX_DATA_DIR/.mcp-managed-$name.json"
 
-  python3 - "$claude_json" "$name" "$portmap" "$gateway" "$native_index" <<'PYEOF'
-import json, sys, os
-
-project_file, name, portmap_file, gateway, native_index_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
-
-try:
-    with open(project_file) as f:
-        project = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError):
-    project = {}
-
-try:
-    with open(os.path.expanduser("~/.claude.json")) as f:
-        host = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError):
-    host = {}
-
-try:
-    with open(portmap_file) as f:
-        portmap = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError):
-    portmap = {}
-
-try:
-    with open(native_index_path) as f:
-        native_index = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError):
-    native_index = {}
-
-# Build the final mcpServers set: host wins over project for shared keys
-if "mcpServers" in host:
-    final_mcp = {**project.get("mcpServers", {}), **host["mcpServers"]}
-else:
-    final_mcp = project.get("mcpServers")
-
-if final_mcp is not None:
-    container_mcp = {}
-    for sname, scfg in final_mcp.items():
-        if sname in portmap:
-            # Proxy is running — rewrite to Streamable HTTP
-            container_mcp[sname] = {
-                "type": "http",
-                "url": f"http://{gateway}:{portmap[sname]['port']}/mcp"
-            }
-        elif sname in native_index:
-            # Known native but proxy not running — restore original stdio config
-            ni = native_index[sname]
-            entry = {"command": ni["command"], "args": ni.get("args", [])}
-            if ni.get("env"):
-                entry["env"] = ni["env"]
-            container_mcp[sname] = entry
-        else:
-            container_mcp[sname] = scfg
-    project["mcpServers"] = container_mcp
-
-# Ensure required container defaults
-project["hasCompletedOnboarding"] = True
-project["installMethod"] = "npm"
-project.setdefault("projects", {}).setdefault(
-    f"/Workspace/{name}", {}
-)["hasTrustDialogAccepted"] = True
-
-with open(project_file, "w") as f:
-    json.dump(project, f)
-PYEOF
+  python3 -c "$(_cbox_mcp_py)" claude-json \
+    "$claude_json" "$name" "$CBOX_MCP_CONFIG" "$managed" "$_CBOX_MCP_RELAY" "$mode"
 }
 
 _cbox_maybe_update() {
@@ -484,189 +430,649 @@ _cbox_audio_stop() {
 }
 
 # ---------------------------------------------------------
-# MCP host-native proxy
+# MCP relay
 # ---------------------------------------------------------
+#
+# Host MCP servers (anything that needs macOS: iMCP, Keychain, local apps) are
+# configured in $CBOX_MCP_CONFIG and reach the container without any network
+# listener — on the host or in the container:
+#
+#   claude ─stdio─▶ cbox-mcp-relay connect NAME ─unix socket─▶ cbox-mcp-relay accept NAME
+#                   (in container)                             (in container)
+#                                                                     │ stdio over `container exec -i`
+#   host: relay supervisor ◀──────────────────────────────────────────┘
+#         └─ starts the server command when a client connects and pipes both ways
+#
+# The supervisor keeps $_CBOX_MCP_SLOTS pending `accept`s per server, so that
+# many concurrent clients (sessions) per container are served. Each connection
+# gets a fresh server process, exactly like a native stdio MCP server. Bytes are
+# passed through untouched — there is no protocol translation.
+#
+# Servers that work on file paths (filesystem, git, …) do not belong here: they
+# would see host paths, not /Workspace. Run those inside the container instead
+# (project .mcp.json or `claude mcp add`).
 
-_cbox_mcp_host_gateway() {
-  if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
-    echo "192.168.64.1"
-  else
-    echo "host.docker.internal"
-  fi
+# Host-side logic: claude.json generation, the relay supervisor, `cbox mcp`.
+# Emitted by a function (not stored in a variable) so the heredoc parses the
+# same in bash 3.2 and zsh. Run as: python3 -c "$(_cbox_mcp_py)" <command> ...
+_cbox_mcp_py() {
+  cat <<'PYEOF'
+import json, os, re, select, signal, subprocess, sys, threading, time
+from urllib.parse import urlsplit
+
+NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1", "0.0.0.0")
+MARKER = b"\x01"  # sent by `accept` once a client has connected
+
+
+def load_servers(path, warn=True):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        if warn:
+            print(f"⚠  {path} is not valid JSON ({e}) — host MCP servers skipped")
+        return {}
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    return servers if isinstance(servers, dict) else {}
+
+
+def kind(cfg):
+    """stdio: run on the host via the relay. remote: URL the container reaches
+    directly. local-url: URL on the host's loopback — not reachable, unsupported."""
+    if not isinstance(cfg, dict):
+        return "invalid"
+    if cfg.get("command"):
+        return "stdio"
+    url = cfg.get("url")
+    if isinstance(url, str) and url:
+        host = (urlsplit(url).hostname or "").lower()
+        return "local-url" if host in LOCAL_HOSTS else "remote"
+    return "invalid"
+
+
+def relay_servers(path):
+    return {n: c for n, c in load_servers(path, warn=False).items()
+            if NAME_RE.match(n) and kind(c) == "stdio"}
+
+
+def is_macos_path(cmd):
+    cmd = str(cmd)
+    return (cmd.startswith(("/Applications/", "~/Applications/", "~/Library/"))
+            or re.match(r"^/Users/[^/]+/(Applications|Library)/", cmd) is not None
+            or ".app/Contents/" in cmd)
+
+
+def is_legacy(cfg, relay):
+    """Entries written by earlier cbox versions: the supergateway proxy design
+    (HTTP on the host gateway) or its fallback of a raw macOS command, which
+    cannot run in the Linux container anyway."""
+    if not isinstance(cfg, dict):
+        return False
+    if cfg.get("command") == relay:
+        return True
+    url = cfg.get("url")
+    if isinstance(url, str) and re.match(
+            r"^http://(192\.168\.64\.1|host\.docker\.internal):\d+/mcp$", url):
+        return True
+    return is_macos_path(cfg.get("command", ""))
+
+
+# --- claude-json ------------------------------------------------------------
+
+def cmd_claude_json(project_file, name, config, managed_file, relay, mode):
+    try:
+        with open(project_file) as f:
+            project = json.load(f)
+    except (FileNotFoundError, ValueError):
+        project = {}
+    try:
+        with open(managed_file) as f:
+            managed_before = set(json.load(f))
+    except (FileNotFoundError, ValueError, TypeError):
+        managed_before = set()
+
+    existing = project.get("mcpServers")
+    servers = dict(existing) if isinstance(existing, dict) else {}
+
+    # Drop everything cbox wrote earlier; servers the user added inside the
+    # container (`claude mcp add`) are left alone.
+    for sname in list(servers):
+        if sname in managed_before or is_legacy(servers[sname], relay):
+            del servers[sname]
+
+    managed_now = []
+    if mode != "safe":
+        for sname, cfg in load_servers(config).items():
+            k = kind(cfg)
+            if not NAME_RE.match(sname):
+                print(f"⚠  MCP server '{sname}': name may only contain letters, digits, '.', '_' and '-' — skipped")
+            elif k == "stdio":
+                servers[sname] = {"type": "stdio", "command": relay, "args": ["connect", sname]}
+                managed_now.append(sname)
+            elif k == "remote":
+                servers[sname] = cfg
+                managed_now.append(sname)
+            elif k == "local-url":
+                print(f"⚠  MCP server '{sname}': URLs on the host's localhost are not reachable from the container — skipped")
+            else:
+                print(f"⚠  MCP server '{sname}': needs a \"command\" or a \"url\" — skipped")
+
+    if servers or existing is not None:
+        project["mcpServers"] = servers
+
+    project["hasCompletedOnboarding"] = True
+    project["installMethod"] = "npm"
+    project.setdefault("projects", {}).setdefault(
+        f"/Workspace/{name}", {}
+    )["hasTrustDialogAccepted"] = True
+
+    with open(project_file, "w") as f:
+        json.dump(project, f)
+    with open(managed_file, "w") as f:
+        json.dump(sorted(managed_now), f)
+
+
+# --- supervise --------------------------------------------------------------
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
+
+def pump(src, dst):
+    """Copy bytes until EOF or error, then close dst so the peer sees EOF."""
+    try:
+        while True:
+            data = os.read(src.fileno(), 65536)
+            if not data:
+                break
+            while data:
+                data = data[os.write(dst.fileno(), data):]
+    except OSError:
+        pass
+    finally:
+        try:
+            dst.close()
+        except OSError:
+            pass
+
+
+def finish(proc, grace=5.0):
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+def serve(sname, cfg, ex):
+    env = dict(os.environ)
+    env.update({str(k): str(v) for k, v in (cfg.get("env") or {}).items()})
+    argv = [os.path.expanduser(str(cfg["command"]))] + [str(a) for a in (cfg.get("args") or [])]
+    try:
+        srv = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=sys.stdout, env=env, bufsize=0,
+                               cwd=os.path.expanduser("~"))
+    except OSError as e:
+        log(f"{sname}: cannot start {argv[0]}: {e}")
+        ex.stdin.close()
+        finish(ex)
+        return
+    log(f"{sname}: client connected — server started (pid {srv.pid})")
+    up = threading.Thread(target=pump, args=(ex.stdout, srv.stdin), daemon=True)
+    down = threading.Thread(target=pump, args=(srv.stdout, ex.stdin), daemon=True)
+    up.start()
+    down.start()
+    # Whichever side ends first, give the other a grace period, then end it.
+    while up.is_alive() and down.is_alive():
+        up.join(0.5)
+    finish(srv)
+    finish(ex)
+    up.join(1)
+    down.join(1)
+    log(f"{sname}: client disconnected — server exited ({srv.returncode})")
+
+
+def slot(stop, runtime, box, config, relay, sname):
+    fails = 0
+    while not stop.is_set():
+        cfg = relay_servers(config).get(sname)
+        if cfg is None:
+            return  # removed from config
+        try:
+            ex = subprocess.Popen([runtime, "exec", "-i", box, relay, "accept", sname],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=sys.stdout, bufsize=0)
+        except OSError as e:
+            log(f"{sname}: cannot run {runtime}: {e}")
+            stop.wait(30)
+            continue
+        # Blocks until a client connects in the container.
+        try:
+            marker = os.read(ex.stdout.fileno(), 1)
+        except OSError:
+            marker = b""
+        if marker != MARKER:
+            # Container stopped, relay missing, or exec failed: back off.
+            ex.stdin.close()
+            finish(ex, grace=1)
+            fails += 1
+            if fails == 1:
+                log(f"{sname}: relay endpoint unavailable in '{box}' (exit {ex.returncode}) — retrying")
+            stop.wait(min(30, 2 ** min(fails, 5)))
+            continue
+        fails = 0
+        serve(sname, cfg, ex)
+
+
+def cmd_supervise(runtime, box, config, relay, slots, pidfile):
+    try:
+        os.setsid()  # own process group, so stop can kill every child at once
+    except OSError:
+        pass  # already a group leader
+    with open(pidfile, "w") as f:
+        f.write(str(os.getpid()))
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    log(f"relay supervisor started for '{box}' (pid {os.getpid()})")
+    workers = {}
+    try:
+        while not stop.is_set():
+            # Re-read the config so servers added later need no restart.
+            for sname in relay_servers(config):
+                alive = [t for t in workers.get(sname, []) if t.is_alive()]
+                while len(alive) < int(slots):
+                    t = threading.Thread(target=slot, daemon=True,
+                                         args=(stop, runtime, box, config, relay, sname))
+                    t.start()
+                    alive.append(t)
+                workers[sname] = alive
+            stop.wait(2)
+    finally:
+        log("relay supervisor stopped")
+        try:
+            os.remove(pidfile)
+        except OSError:
+            pass
+        # Slot threads may still be blocked on children; a normal interpreter
+        # shutdown would race them. The process group is being killed anyway.
+        os._exit(0)
+
+
+# --- has-relay-servers ------------------------------------------------------
+
+def cmd_has_relay_servers(config):
+    sys.exit(0 if relay_servers(config) else 1)
+
+
+# --- list -------------------------------------------------------------------
+
+def describe(cfg):
+    k = kind(cfg)
+    if k == "stdio":
+        return " ".join([str(cfg["command"])] + [str(a) for a in (cfg.get("args") or [])])
+    return str(cfg.get("url", "")) if isinstance(cfg, dict) else ""
+
+
+def shown(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
+def cmd_list(config):
+    shown_config = shown(config)
+    servers = load_servers(config)
+    if not servers:
+        print(f"No host MCP servers configured ({shown_config}).")
+        print("  Import from Claude Desktop / Claude Code:  cbox mcp import")
+        print("  Or add them by hand, in the usual format:")
+        print('    { "mcpServers": { "imcp": { "command": "/Applications/iMCP.app/Contents/MacOS/imcp-server" } } }')
+        return
+    print(f"Host MCP servers ({shown_config}):")
+    width = max(len(n) for n in servers)
+    for sname, cfg in servers.items():
+        k = kind(cfg)
+        if not NAME_RE.match(sname):
+            mark, label = "✘", "invalid name"
+        elif k == "stdio":
+            mark, label = "✔", "host  "
+        elif k == "remote":
+            mark, label = "✔", "remote"
+        elif k == "local-url":
+            mark, label = "✘", "localhost URL, not supported"
+        else:
+            mark, label = "✘", "needs \"command\" or \"url\""
+        print(f"  {mark} {sname.ljust(width)}  {label}  {describe(cfg)}")
+
+
+# --- import -----------------------------------------------------------------
+
+def cmd_import(config):
+    shown_config = shown(config)
+    home = os.path.expanduser("~")
+    sources = [
+        ("Claude Desktop", os.path.join(home, "Library", "Application Support", "Claude",
+                                        "claude_desktop_config.json")),
+        ("Claude Code", os.path.join(home, ".claude.json")),
+    ]
+    candidates = []  # (name, cfg, source)
+    seen = set(load_servers(config))
+    for label, path in sources:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        found = dict(data.get("mcpServers") or {})
+        # Claude Code also keeps servers per project (local scope).
+        for proj in (data.get("projects") or {}).values():
+            if isinstance(proj, dict):
+                for n, c in (proj.get("mcpServers") or {}).items():
+                    found.setdefault(n, c)
+        for n, c in found.items():
+            if n not in seen and kind(c) in ("stdio", "remote") and NAME_RE.match(n):
+                seen.add(n)
+                candidates.append((n, c, label))
+
+    if not candidates:
+        print("Nothing new to import from Claude Desktop or Claude Code.")
+        return
+
+    interactive = sys.stdin.isatty()
+    if not interactive:
+        print("Servers available for import (run in a terminal to choose):")
+    else:
+        print("Host MCP servers run on your Mac. Servers that work on files or")
+        print("repositories (filesystem, git, …) belong inside the container instead.")
+        print()
+    chosen = {}
+    for n, c, label in candidates:
+        native = kind(c) == "stdio" and is_macos_path(c.get("command", ""))
+        line = f"'{n}' from {label}: {describe(c)}"
+        if not interactive:
+            print(f"  {line}")
+            continue
+        hint = "Y/n" if native else "y/N"
+        try:
+            answer = input(f"Import {line}? [{hint}] ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer in ("y", "yes") or (answer == "" and native):
+            chosen[n] = c
+
+    if not chosen:
+        return
+    try:
+        with open(config) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("not a JSON object")
+    except FileNotFoundError:
+        data = {}
+    except (OSError, ValueError) as e:
+        print(f"✘ {shown_config} is not valid JSON ({e}) — fix it first, nothing imported")
+        sys.exit(1)
+    data.setdefault("mcpServers", {}).update(chosen)
+    os.makedirs(os.path.dirname(config), exist_ok=True)
+    # May hold API tokens in "env".
+    fd = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    print(f"✔ Imported {', '.join(chosen)} into {shown_config}")
+    print("  Takes effect with the next cbox session.")
+
+
+# --- legacy-cleanup ---------------------------------------------------------
+
+def cmd_legacy_cleanup(portmap_file, native_index):
+    """Stop supergateway proxies left by earlier cbox versions — they listen on
+    every interface without authentication."""
+    try:
+        with open(portmap_file) as f:
+            portmap = json.load(f)
+    except (OSError, ValueError):
+        portmap = {}
+    for info in (portmap.values() if isinstance(portmap, dict) else []):
+        try:
+            os.killpg(os.getpgid(int(info.get("pid", 0))), signal.SIGTERM)
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    for path in (portmap_file, native_index):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+COMMANDS = {
+    "claude-json": cmd_claude_json,
+    "supervise": cmd_supervise,
+    "has-relay-servers": cmd_has_relay_servers,
+    "list": cmd_list,
+    "import": cmd_import,
+    "legacy-cleanup": cmd_legacy_cleanup,
 }
 
-# Detects host-native MCP servers, starts supergateway proxies for each, and
-# writes a portmap file ($CBOX_DATA_DIR/.mcp-portmap-$name.json) recording
-# {server_name: {port, pid}} so _cbox_generate_claude_json can rewrite entries.
-# A persistent native index ($CBOX_DATA_DIR/.mcp-native-$name.json) remembers
-# which servers are native across sessions so the stdio→SSE cycle stays correct.
-_cbox_mcp_proxies_ensure() {
+if __name__ == "__main__":
+    COMMANDS[sys.argv[1]](*sys.argv[2:])
+PYEOF
+}
+
+# Container-side relay, installed as $_CBOX_MCP_RELAY at every session start so
+# it always matches the host side. Only needs python3 from the image.
+_cbox_mcp_relay_py() {
+  cat <<'PYEOF'
+#!/usr/bin/env python3
+# cbox-mcp-relay — installed by cbox at session start; local edits are overwritten.
+#   connect NAME  stdio command for Claude: reach host MCP server NAME
+#   accept NAME   run by the host over `container exec -i`; serves one client
+import glob, os, select, signal, socket, sys, time
+
+BASE = os.environ.get("CBOX_MCP_SOCKET_DIR", "/tmp/cbox-mcp")
+ACK = b"\x06"     # accept → client: this slot is yours
+MARKER = b"\x01"  # accept → host: a client connected, start the server
+
+
+def write_all(fd, data):
+    while data:
+        data = data[os.write(fd, data):]
+
+
+def pump(in_fd, out_fd, sock, drain):
+    """in_fd → sock and sock → out_fd, passing each EOF on as a half-close.
+    connect ends once the server side closes; accept (drain) also forwards the
+    server's remaining output after the client has stopped sending."""
+    readers = [in_fd, sock]
+    try:
+        while readers:
+            ready, _, _ = select.select(readers, [], [])
+            if in_fd in ready:
+                data = os.read(in_fd, 65536)
+                if data:
+                    sock.sendall(data)
+                else:
+                    sock.shutdown(socket.SHUT_WR)
+                    readers.remove(in_fd)
+            if sock in ready:
+                data = sock.recv(65536)
+                if data:
+                    write_all(out_fd, data)
+                else:
+                    os.close(out_fd)
+                    readers.remove(sock)
+                    if not drain:
+                        return
+    except OSError:
+        return
+    finally:
+        sock.close()
+
+
+def accept(name):
+    d = os.path.join(BASE, name)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    path = os.path.join(d, f"{os.getpid()}.sock")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        srv.bind(path)
+        os.chmod(path, 0o600)
+        srv.listen(1)
+        while True:
+            ready, _, _ = select.select([srv, 0], [], [])
+            if 0 in ready:
+                return 0  # host went away before a client came
+            if srv in ready:
+                conn, _ = srv.accept()
+                break
+    finally:
+        srv.close()
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    try:
+        conn.sendall(ACK)
+    except OSError:
+        return 0
+    write_all(1, MARKER)
+    pump(0, 1, conn, drain=True)
+    return 0
+
+
+def connect(name):
+    d = os.path.join(BASE, name)
+    deadline = time.time() + 15
+    while True:
+        for path in sorted(glob.glob(os.path.join(d, "*.sock"))):
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(3)
+            try:
+                s.connect(path)
+                ok = s.recv(1) == ACK
+            except ConnectionRefusedError:
+                ok = False
+                try:
+                    os.unlink(path)  # no listener: left over from a killed accept
+                except OSError:
+                    pass
+            except OSError:
+                ok = False
+            if ok:
+                s.settimeout(None)
+                pump(0, 1, s, drain=False)
+                return 0
+            s.close()
+        if time.time() > deadline:
+            break
+        time.sleep(0.25)
+    sys.stderr.write(
+        f"cbox-mcp-relay: host MCP server '{name}' is not reachable.\n"
+        "It is relayed from the host by cbox: check that it is listed in\n"
+        "~/.config/claudebox/mcp.json and run `cbox mcp` on the host.\n")
+    return 1
+
+
+if __name__ == "__main__":
+    # Let finally blocks (socket cleanup) run when terminated.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    if len(sys.argv) != 3 or sys.argv[1] not in ("connect", "accept"):
+        sys.stderr.write("usage: cbox-mcp-relay connect|accept NAME\n")
+        sys.exit(2)
+    sys.exit({"connect": connect, "accept": accept}[sys.argv[1]](sys.argv[2]))
+PYEOF
+}
+
+_cbox_mcp_legacy_cleanup() {
   local name="$1"
   local portmap="$CBOX_DATA_DIR/.mcp-portmap-$name.json"
   local native_index="$CBOX_DATA_DIR/.mcp-native-$name.json"
-  local container_json="$CBOX_DATA_DIR/.claude-$name.json"
-
-  command -v npx >/dev/null 2>&1 || return 0
-
-  CBOX_VERBOSE="${CBOX_VERBOSE:-0}" python3 - "$portmap" "$CBOX_DATA_DIR" "$container_json" "$native_index" <<'PYEOF'
-import json, os, sys, subprocess, time, socket, glob, shlex
-verbose = os.environ.get("CBOX_VERBOSE", "0") == "1"
-
-portmap_file, data_dir, container_json_path, native_index_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-
-try:
-    with open(portmap_file) as f:
-        portmap = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError):
-    portmap = {}
-
-try:
-    with open(native_index_path) as f:
-        native_index = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError):
-    native_index = {}
-
-def is_native(cmd):
-    if not cmd:
-        return False
-    home = os.path.expanduser("~")
-    expanded = os.path.expanduser(str(cmd))
-    return (
-        expanded.startswith("/Applications/") or
-        expanded.startswith(home + "/Library/") or
-        expanded.startswith(home + "/Applications/") or
-        ".app/Contents/" in expanded
-    )
-
-def is_alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError):
-        return False
-
-def next_port():
-    used = set()
-    for pf in glob.glob(os.path.join(data_dir, ".mcp-portmap-*.json")):
-        try:
-            with open(pf) as f:
-                pm = json.load(f)
-            for v in pm.values():
-                if "port" in v:
-                    used.add(v["port"])
-        except Exception:
-            pass
-    p = 39100
-    while p in used:
-        p += 1
-    return p
-
-def wait_for_port(port, timeout=8.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            s = socket.create_connection(("127.0.0.1", port), timeout=0.2)
-            s.close()
-            return True
-        except OSError:
-            time.sleep(0.3)
-    return False
-
-# Collect all configured MCP servers from container JSON and host ~/.claude.json
-all_mcp = {}
-try:
-    with open(container_json_path) as f:
-        all_mcp.update(json.load(f).get("mcpServers", {}))
-except (FileNotFoundError, json.JSONDecodeError):
-    pass
-try:
-    with open(os.path.expanduser("~/.claude.json")) as f:
-        all_mcp.update(json.load(f).get("mcpServers", {}))
-except (FileNotFoundError, json.JSONDecodeError):
-    pass
-
-# Update native index with any newly detected native servers
-for sname, scfg in all_mcp.items():
-    cmd = scfg.get("command", "")
-    if is_native(cmd):
-        native_index[sname] = {
-            "command": cmd,
-            "args": scfg.get("args", []),
-            "env": scfg.get("env", {}),
-        }
-
-with open(native_index_path, "w") as f:
-    json.dump(native_index, f)
-
-# Start/reuse proxies for all known native servers
-new_portmap = {}
-for sname, scfg in native_index.items():
-    existing = portmap.get(sname, {})
-    if existing and is_alive(existing.get("pid", 0)):
-        new_portmap[sname] = existing
-        continue
-
-    port = next_port()
-    cmd = scfg["command"]
-    args = scfg.get("args", [])
-    env_vars = scfg.get("env", {})
-
-    env_prefix = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_vars.items())
-    arg_str = " ".join(shlex.quote(str(a)) for a in args)
-    full_cmd = " ".join(filter(None, [env_prefix, shlex.quote(cmd), arg_str]))
-
-    log_path = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"cbox-mcp-{sname}.log")
-    try:
-        proc = subprocess.Popen(
-            ["npx", "-y", "supergateway", "--stdio", full_cmd, "--port", str(port), "--outputTransport", "streamableHttp", "--stateful"],
-            stdout=open(log_path, "w"),
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    except Exception as e:
-        print(f"  ⚠  MCP proxy '{sname}' failed to launch: {e}")
-        continue
-
-    if wait_for_port(port):
-        new_portmap[sname] = {"port": port, "pid": proc.pid}
-        if verbose:
-            print(f"  ✔ MCP proxy '{sname}' on :{port}")
-    else:
-        print(f"  ⚠  MCP proxy '{sname}' did not start — check {log_path}")
-        proc.terminate()
-
-with open(portmap_file, "w") as f:
-    json.dump(new_portmap, f)
-PYEOF
+  [[ -f "$portmap" || -f "$native_index" ]] || return 0
+  python3 -c "$(_cbox_mcp_py)" legacy-cleanup "$portmap" "$native_index"
 }
 
-_cbox_mcp_proxies_stop() {
+_cbox_mcp_relay_pid() {
+  local pidfile="$CBOX_DATA_DIR/.mcp-relay-$1.pid"
+  local pid
+  [[ -f "$pidfile" ]] || return 1
+  pid=$(cat "$pidfile" 2>/dev/null)
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  # Guard against pid reuse: the process must still be our supervisor.
+  ps -p "$pid" -o command= 2>/dev/null | grep -q "supervise" || return 1
+  echo "$pid"
+}
+
+# Installs the container-side relay and starts the host supervisor for the
+# container, unless it is already running (it re-reads the config by itself).
+# Failures are reported, never fatal: the session works without host MCP.
+_cbox_mcp_relay_start() {
   local name="$1"
-  local portmap="$CBOX_DATA_DIR/.mcp-portmap-$name.json"
-  [[ -f "$portmap" ]] || return 0
+  local pidfile="$CBOX_DATA_DIR/.mcp-relay-$name.pid"
+  local logfile="$CBOX_DATA_DIR/.mcp-relay-$name.log"
 
-  python3 - "$portmap" <<'PYEOF'
-import json, os, sys, signal
+  _cbox_mcp_legacy_cleanup "$name"
 
-portmap_file = sys.argv[1]
-try:
-    with open(portmap_file) as f:
-        portmap = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError):
-    sys.exit(0)
+  python3 -c "$(_cbox_mcp_py)" has-relay-servers "$CBOX_MCP_CONFIG" || return 0
 
-for sname, info in portmap.items():
-    pid = info.get("pid")
-    if not pid:
-        continue
-    try:
-        pgid = os.getpgid(int(pid))
-        os.killpg(pgid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
+  # Atomic rename: other sessions may be running the relay right now.
+  # shellcheck disable=SC2016
+  if ! _cbox_mcp_relay_py | $_CBOX_CMD exec -i "$name" sh -c \
+      'mkdir -p "${1%/*}" && cat > "$1.tmp" && chmod 755 "$1.tmp" && mv "$1.tmp" "$1"' \
+      sh "$_CBOX_MCP_RELAY" >/dev/null 2>&1; then
+    echo "⚠  Could not install the MCP relay in '$name' — host MCP servers unavailable this session"
+    return 0
+  fi
 
-os.remove(portmap_file)
-PYEOF
+  if _cbox_mcp_relay_pid "$name" >/dev/null; then
+    return 0
+  fi
+
+  mkdir -p "$CBOX_DATA_DIR"
+  rm -f "$pidfile"
+  # Subshell: no job-control noise in interactive shells, and the supervisor
+  # detaches into its own session so it survives the terminal.
+  ( python3 -c "$(_cbox_mcp_py)" supervise \
+      "$_CBOX_CMD" "$name" "$CBOX_MCP_CONFIG" "$_CBOX_MCP_RELAY" "$_CBOX_MCP_SLOTS" "$pidfile" \
+      </dev/null >"$logfile" 2>&1 & )
+
+  local _i
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    [[ -f "$pidfile" ]] && break
+    sleep 0.2
+  done
+  if [[ -f "$pidfile" ]]; then
+    _cbox_log "✔ MCP relay running (log: $logfile)"
+  else
+    echo "⚠  MCP relay did not start — check $logfile"
+  fi
+}
+
+_cbox_mcp_relay_stop() {
+  local name="$1"
+  local pid
+  _cbox_mcp_legacy_cleanup "$name"
+  pid=$(_cbox_mcp_relay_pid "$name") || return 0
+  # Negative pid: the whole process group — supervisor, exec clients, servers.
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+}
+
+_cbox_mcp_status() {
+  local name="$1"
+  python3 -c "$(_cbox_mcp_py)" list "$CBOX_MCP_CONFIG"
+  python3 -c "$(_cbox_mcp_py)" has-relay-servers "$CBOX_MCP_CONFIG" || return 0
+  local pid
+  if pid=$(_cbox_mcp_relay_pid "$name"); then
+    echo "✔ relay for '$name' running (pid $pid, log: $CBOX_DATA_DIR/.mcp-relay-$name.log)"
+  else
+    echo "ℹ relay for '$name' not running — starts with the next cbox session"
+  fi
 }
 
 # ---------------------------------------------------------
@@ -735,7 +1141,7 @@ _cbox_create() {
   agent_bin=$(_cbox_agent_bin)
 
   if [[ "$agent_bin" == "claude" ]]; then
-    _cbox_generate_claude_json "$name"
+    _cbox_generate_claude_json "$name" "$mode"
     mkdir -p "$CBOX_CLAUDE_DIR/projects"
   fi
 
@@ -996,9 +1402,9 @@ _cbox_enter() {
     _cbox_audio_start || true
   fi
 
-  if [[ "$mode" != "safe" ]] && [[ "$agent_bin" == "claude" ]]; then
-    _cbox_mcp_proxies_ensure "$name"
-    _cbox_generate_claude_json "$name"
+  if [[ "$agent_bin" == "claude" ]]; then
+    [[ "$mode" != "safe" ]] && _cbox_mcp_relay_start "$name"
+    _cbox_generate_claude_json "$name" "$mode"
   fi
 
   echo "Entering container '$name'..."
@@ -1056,7 +1462,7 @@ _cbox_enter() {
   fi
 
   if (( _last_session )); then
-    _cbox_mcp_proxies_stop "$name"
+    _cbox_mcp_relay_stop "$name"
     local _cache_base="${XDG_CACHE_HOME:-$HOME/.cache}"
     [[ -n "$CBOX_SHARE_DIR" && ( "$CBOX_SHARE_DIR" == /tmp/* || "$CBOX_SHARE_DIR" == "$_cache_base"/* ) ]] && \
       find "$CBOX_SHARE_DIR" -mindepth 1 -delete 2>/dev/null || true
@@ -1207,35 +1613,8 @@ _cbox_doctor() {
   fi
 
   echo
-  echo "[mcp proxies]"
-  local _portmap="$CBOX_DATA_DIR/.mcp-portmap-$name.json"
-  if [[ -f "$_portmap" ]]; then
-    python3 - "$_portmap" <<'PYEOF'
-import json, os, sys
-
-portmap_file = sys.argv[1]
-try:
-    with open(portmap_file) as f:
-        portmap = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError):
-    portmap = {}
-
-if not portmap:
-    print("ℹ no host-native MCP proxies active")
-else:
-    for sname, info in portmap.items():
-        pid = info.get("pid", 0)
-        port = info.get("port", "?")
-        try:
-            os.kill(int(pid), 0)
-            print(f"✔ {sname}: running on :{port} (pid {pid})")
-        except (OSError, ValueError):
-            print(f"✘ {sname}: dead (was on :{port}, pid {pid})")
-PYEOF
-  else
-    echo "ℹ no host-native MCP proxies active"
-  fi
-  unset _portmap
+  echo "[mcp]"
+  _cbox_mcp_status "$name"
 }
 
 # ---------------------------------------------------------
@@ -1287,6 +1666,7 @@ cbox() {
         return 0
       fi
       echo "Stopping container '$stop_target'..."
+      _cbox_mcp_relay_stop "$stop_target"
       $_CBOX_CMD stop "$stop_target" >/dev/null
       ;;
 
@@ -1297,6 +1677,7 @@ cbox() {
         return 0
       fi
       echo "Removing container '$reset_target'..."
+      _cbox_mcp_relay_stop "$reset_target"
       $_CBOX_CMD rm -f "$reset_target"
       ;;
 
@@ -1315,6 +1696,18 @@ cbox() {
 
     doctor)
       _cbox_doctor
+      ;;
+
+    mcp)
+      case "${2:-}" in
+        ""|list) _cbox_mcp_status "$name" ;;
+        import)  python3 -c "$(_cbox_mcp_py)" import "$CBOX_MCP_CONFIG" ;;
+        *)
+          echo "Unknown mcp command: $2"
+          echo "Usage: cbox mcp [list|import]"
+          return 1
+          ;;
+      esac
       ;;
 
     _doctor)
@@ -1424,7 +1817,7 @@ if [[ -n "${ZSH_VERSION:-}" ]]; then
   _cbox_zsh_complete() {
     case $CURRENT in
       2)
-        compadd -v --verbose list stop reset prune rebuild update doctor safe shell keepalive oc opencode version help
+        compadd -v --verbose list stop reset prune rebuild update doctor mcp safe shell keepalive oc opencode version help
         ;;
       3)
         if [[ "${words[2]}" == "reset" || "${words[2]}" == "stop" ]]; then
@@ -1444,7 +1837,7 @@ elif [[ -n "${BASH_VERSION:-}" ]]; then
 
     if [[ $COMP_CWORD -eq 1 ]]; then
       COMPREPLY=( $(compgen -W \
-        "-v --verbose list stop reset prune rebuild update doctor safe shell keepalive oc opencode version help" \
+        "-v --verbose list stop reset prune rebuild update doctor mcp safe shell keepalive oc opencode version help" \
         -- "$cur") )
     elif [[ $COMP_CWORD -eq 2 && ( "$prev" == "reset" || "$prev" == "stop" ) ]]; then
       COMPREPLY=( $(compgen -W "$(_cbox_list_names)" -- "$cur") )

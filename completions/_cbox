@@ -5,10 +5,12 @@ _cbox() {
 
   case $CURRENT in
     2)
-      compadd list stop reset prune rebuild update doctor safe shell keepalive version help
+      compadd list stop reset prune rebuild update doctor mcp safe shell keepalive version help
       ;;
     3)
-      if [[ "${words[2]}" == "reset" ]]; then
+      if [[ "${words[2]}" == "mcp" ]]; then
+        compadd list import
+      elif [[ "${words[2]}" == "reset" ]]; then
         if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
           containers=($(container ls --all 2>/dev/null | awk 'NR>1 {print $1}'))
         else

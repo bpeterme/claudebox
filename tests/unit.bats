@@ -9,7 +9,10 @@ setup() {
   export CBOX_CLAUDE_DIR="$BATS_TMPDIR/claude"
   export CBOX_HOST_CONFIG_DIR="$BATS_TMPDIR/config"
   export CBOX_SHARE_DIR="$BATS_TMPDIR/share"
+  export CBOX_MCP_CONFIG="$BATS_TMPDIR/mcp.json"
   mkdir -p "$CBOX_DATA_DIR" "$CBOX_CLAUDE_DIR" "$CBOX_HOST_CONFIG_DIR" "$CBOX_SHARE_DIR"
+  rm -f "$CBOX_MCP_CONFIG" "$CBOX_DATA_DIR"/.claude-*.json "$CBOX_DATA_DIR"/.mcp-*
+  rm -rf "$HOME/Library" "$HOME/.claude.json"
   # shellcheck source=/dev/null
   source "$CBOX_SH"
 }
@@ -112,13 +115,235 @@ setup() {
   [ "$status" -eq 0 ]
 }
 
-@test "_cbox_generate_claude_json: merges mcpServers from host on re-run" {
+@test "_cbox_generate_claude_json: ignores the host's ~/.claude.json mcpServers" {
   local f="$CBOX_DATA_DIR/.claude-myapp.json"
-  echo '{"oauthToken":"tok_abc"}' > "$f"
   echo '{"mcpServers":{"mytool":{"command":"npx","args":["mytool-mcp"]}}}' > "$HOME/.claude.json"
   _cbox_generate_claude_json "myapp"
-  run python3 -c "import json,sys; d=json.load(open('$f')); sys.exit(0 if 'mytool' in d.get('mcpServers',{}) else 1)"
+  run python3 -c "import json,sys; d=json.load(open('$f')); sys.exit(1 if 'mytool' in d.get('mcpServers',{}) else 0)"
   [ "$status" -eq 0 ]
+}
+
+# Prints the container's mcpServers entry for $2 as compact JSON ("null" if absent).
+_mcp_entry() {
+  python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d.get('mcpServers',{}).get(sys.argv[2]), sort_keys=True))" \
+    "$CBOX_DATA_DIR/.claude-$1.json" "$2"
+}
+
+@test "_cbox_generate_claude_json: host stdio server becomes a relay entry" {
+  echo '{"mcpServers":{"imcp":{"command":"/Applications/iMCP.app/Contents/MacOS/imcp-server"}}}' > "$CBOX_MCP_CONFIG"
+  _cbox_generate_claude_json "myapp"
+  run _mcp_entry myapp imcp
+  [ "$output" = "{\"args\": [\"connect\", \"imcp\"], \"command\": \"$_CBOX_MCP_RELAY\", \"type\": \"stdio\"}" ]
+}
+
+@test "_cbox_generate_claude_json: remote URL server is passed through unchanged" {
+  echo '{"mcpServers":{"lin":{"type":"sse","url":"https://mcp.example.com/sse"}}}' > "$CBOX_MCP_CONFIG"
+  _cbox_generate_claude_json "myapp"
+  run _mcp_entry myapp lin
+  [ "$output" = '{"type": "sse", "url": "https://mcp.example.com/sse"}' ]
+}
+
+@test "_cbox_generate_claude_json: localhost URL server is skipped with a warning" {
+  echo '{"mcpServers":{"loc":{"url":"http://127.0.0.1:9000/mcp"}}}' > "$CBOX_MCP_CONFIG"
+  run _cbox_generate_claude_json "myapp"
+  [[ "$output" == *"'loc'"*"not reachable from the container"* ]]
+  run _mcp_entry myapp loc
+  [ "$output" = "null" ]
+}
+
+@test "_cbox_generate_claude_json: invalid server name is skipped with a warning" {
+  echo '{"mcpServers":{"bad/name":{"command":"x"}}}' > "$CBOX_MCP_CONFIG"
+  run _cbox_generate_claude_json "myapp"
+  [[ "$output" == *"'bad/name'"*"skipped"* ]]
+  run _mcp_entry myapp "bad/name"
+  [ "$output" = "null" ]
+}
+
+@test "_cbox_generate_claude_json: invalid mcp.json warns and keeps the file usable" {
+  echo '{not json' > "$CBOX_MCP_CONFIG"
+  run _cbox_generate_claude_json "myapp"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not valid JSON"* ]]
+  grep -q '"hasTrustDialogAccepted": true' "$CBOX_DATA_DIR/.claude-myapp.json"
+}
+
+@test "_cbox_generate_claude_json: server removed from mcp.json is removed from the container" {
+  echo '{"mcpServers":{"a":{"command":"x"},"r":{"url":"https://r.example.com/mcp"}}}' > "$CBOX_MCP_CONFIG"
+  _cbox_generate_claude_json "myapp"
+  echo '{"mcpServers":{}}' > "$CBOX_MCP_CONFIG"
+  _cbox_generate_claude_json "myapp"
+  run _mcp_entry myapp a
+  [ "$output" = "null" ]
+  run _mcp_entry myapp r
+  [ "$output" = "null" ]
+}
+
+@test "_cbox_generate_claude_json: keeps servers added inside the container" {
+  local f="$CBOX_DATA_DIR/.claude-myapp.json"
+  echo '{"mcpServers":{"fs":{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/Workspace"]}}}' > "$f"
+  _cbox_generate_claude_json "myapp"
+  run _mcp_entry myapp fs
+  [[ "$output" == *"server-filesystem"* ]]
+}
+
+@test "_cbox_generate_claude_json: removes entries left by the old supergateway proxy" {
+  local f="$CBOX_DATA_DIR/.claude-myapp.json"
+  echo '{"mcpServers":{"p":{"type":"http","url":"http://192.168.64.1:39100/mcp"},"n":{"command":"/Applications/X.app/Contents/MacOS/x"}}}' > "$f"
+  _cbox_generate_claude_json "myapp"
+  run _mcp_entry myapp p
+  [ "$output" = "null" ]
+  run _mcp_entry myapp n
+  [ "$output" = "null" ]
+}
+
+@test "_cbox_generate_claude_json: safe mode gets no host servers" {
+  echo '{"mcpServers":{"imcp":{"command":"/Applications/iMCP.app/Contents/MacOS/imcp-server"}}}' > "$CBOX_MCP_CONFIG"
+  _cbox_generate_claude_json "myapp" "normal"
+  _cbox_generate_claude_json "myapp" "safe"
+  run _mcp_entry myapp imcp
+  [ "$output" = "null" ]
+}
+
+# ---------------------------------------------------------------------------
+# MCP relay (end to end, with a fake runtime whose `exec` runs locally)
+# ---------------------------------------------------------------------------
+
+_relay_setup() {
+  # Unix socket paths are length-limited, so keep them short.
+  RELAY_TMP=$(mktemp -d /tmp/cbr.XXXX)
+  export CBOX_MCP_SOCKET_DIR="$RELAY_TMP/s"
+  printf '#!/bin/bash\n[[ "$1" == exec ]] || exit 1\nshift; [[ "$1" == -i ]] && shift; shift\nexec "$@"\n' > "$RELAY_TMP/rt"
+  printf '#!/bin/bash\ncat > /dev/null; sleep 0.3; echo late-reply\n' > "$RELAY_TMP/late"
+  chmod +x "$RELAY_TMP/rt" "$RELAY_TMP/late"
+  _CBOX_CMD="$RELAY_TMP/rt"
+  _CBOX_MCP_RELAY="$RELAY_TMP/bin/cbox-mcp-relay"
+  cat > "$CBOX_MCP_CONFIG" <<JSON
+{"mcpServers":{"echo":{"command":"cat"},"late":{"command":"$RELAY_TMP/late"},"crash":{"command":"false"}}}
+JSON
+  _cbox_mcp_relay_start "rbox"
+}
+
+_relay_teardown() {
+  _cbox_mcp_relay_stop "rbox"
+  sleep 0.5
+  rm -rf "$RELAY_TMP"
+}
+
+@test "mcp relay: round-trips bytes between client and host server" {
+  _relay_setup
+  run bash -c "printf '{\"jsonrpc\":\"2.0\",\"id\":1}\n' | timeout 10 '$_CBOX_MCP_RELAY' connect echo"
+  _relay_teardown
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"jsonrpc":"2.0","id":1}' ]
+}
+
+@test "mcp relay: forwards server output sent after the client stopped sending" {
+  _relay_setup
+  run bash -c "echo x | timeout 10 '$_CBOX_MCP_RELAY' connect late"
+  _relay_teardown
+  [ "$output" = "late-reply" ]
+}
+
+@test "mcp relay: serves consecutive connections with fresh servers" {
+  _relay_setup
+  run bash -c "for i in 1 2 3 4; do echo \$i | timeout 10 '$_CBOX_MCP_RELAY' connect echo; done"
+  _relay_teardown
+  [ "$output" = "$(printf '1\n2\n3\n4')" ]
+}
+
+@test "mcp relay: client ends promptly when the host server exits" {
+  _relay_setup
+  # Timed inside: the client's stdin stays open (sleep), so only the server
+  # exiting can end it. `run` itself would wait for sleep's inherited fds.
+  run bash -c "s=\$SECONDS; timeout 10 '$_CBOX_MCP_RELAY' connect crash < <(sleep 8 2>/dev/null); echo \$? \$((SECONDS - s))"
+  _relay_teardown
+  local rc elapsed
+  read -r rc elapsed <<< "$output"
+  [ "$rc" -eq 0 ]
+  (( elapsed < 5 ))
+}
+
+@test "mcp relay: unknown server fails with a helpful message" {
+  run bash -c "_CBOX_DIR=\$(mktemp -d /tmp/cbr.XXXX); source '$CBOX_SH'; _cbox_mcp_relay_py > \$_CBOX_DIR/r; CBOX_MCP_SOCKET_DIR=\$_CBOX_DIR/s timeout 30 python3 \$_CBOX_DIR/r connect nope; rc=\$?; rm -rf \$_CBOX_DIR; exit \$rc"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"'nope' is not reachable"*"mcp.json"* ]]
+}
+
+@test "mcp relay: stop leaves no processes or sockets behind" {
+  _relay_setup
+  echo hi | timeout 10 "$_CBOX_MCP_RELAY" connect echo >/dev/null
+  _cbox_mcp_relay_stop "rbox"
+  sleep 1
+  run pgrep -f "$RELAY_TMP"
+  local procs="$output"
+  run find "$CBOX_MCP_SOCKET_DIR" -name '*.sock'
+  local socks="$output"
+  rm -rf "$RELAY_TMP"
+  [ -z "$procs" ]
+  [ -z "$socks" ]
+}
+
+@test "mcp relay: not started when no host stdio servers are configured" {
+  echo '{"mcpServers":{"r":{"url":"https://r.example.com/mcp"}}}' > "$CBOX_MCP_CONFIG"
+  _CBOX_CMD=false
+  run _cbox_mcp_relay_start "none"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ ! -f "$CBOX_DATA_DIR/.mcp-relay-none.pid" ]
+}
+
+@test "mcp relay: legacy supergateway files are cleaned up" {
+  echo '{}' > "$CBOX_DATA_DIR/.mcp-portmap-old.json"
+  echo '{}' > "$CBOX_DATA_DIR/.mcp-native-old.json"
+  _cbox_mcp_relay_stop "old"
+  [ ! -f "$CBOX_DATA_DIR/.mcp-portmap-old.json" ]
+  [ ! -f "$CBOX_DATA_DIR/.mcp-native-old.json" ]
+}
+
+# ---------------------------------------------------------------------------
+# cbox mcp
+# ---------------------------------------------------------------------------
+
+@test "cbox mcp: explains how to configure when nothing is set up" {
+  run _cbox_mcp_status "myapp"
+  [[ "$output" == *"No host MCP servers configured"*"cbox mcp import"* ]]
+}
+
+@test "cbox mcp: lists servers with their kind" {
+  echo '{"mcpServers":{"imcp":{"command":"/x/imcp"},"r":{"url":"https://r.example.com/mcp"},"l":{"url":"http://localhost:1/mcp"}}}' > "$CBOX_MCP_CONFIG"
+  run _cbox_mcp_status "myapp"
+  [[ "$output" == *"✔ imcp"*"host"*"/x/imcp"* ]]
+  [[ "$output" == *"✔ r"*"remote"* ]]
+  [[ "$output" == *"✘ l"*"not supported"* ]]
+  [[ "$output" == *"relay for 'myapp' not running"* ]]
+}
+
+@test "cbox mcp import: lists candidates from Claude Desktop and Claude Code when not interactive" {
+  mkdir -p "$HOME/Library/Application Support/Claude"
+  echo '{"mcpServers":{"imcp":{"command":"/Applications/iMCP.app/Contents/MacOS/imcp-server"}}}' \
+    > "$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+  echo '{"projects":{"/p":{"mcpServers":{"tool":{"command":"npx","args":["tool"]}}}}}' > "$HOME/.claude.json"
+  run python3 -c "$(_cbox_mcp_py)" import "$CBOX_MCP_CONFIG" < /dev/null
+  [[ "$output" == *"'imcp' from Claude Desktop"* ]]
+  [[ "$output" == *"'tool' from Claude Code"* ]]
+  [ ! -f "$CBOX_MCP_CONFIG" ]
+}
+
+@test "cbox mcp import: interactive import writes chosen servers with mode 600" {
+  mkdir -p "$HOME/Library/Application Support/Claude"
+  echo '{"mcpServers":{"imcp":{"command":"/Applications/iMCP.app/Contents/MacOS/imcp-server"},"tool":{"command":"npx"}}}' \
+    > "$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+  # Fake a terminal: accept the default for imcp (yes, macOS app), default for tool (no).
+  run python3 -c "
+import sys, io
+sys.stdin = io.TextIOWrapper(io.BytesIO(b'\n\n'))
+sys.stdin.isatty = lambda: True
+exec(sys.argv[1])
+" "$(_cbox_mcp_py | sed '/^if __name__/,$d')
+cmd_import(sys.argv[2])" "$CBOX_MCP_CONFIG"
+  [ "$status" -eq 0 ]
+  python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if list(d['mcpServers'])==['imcp'] else 1)" "$CBOX_MCP_CONFIG"
+  [ "$(stat -c %a "$CBOX_MCP_CONFIG" 2>/dev/null || stat -f %Lp "$CBOX_MCP_CONFIG")" = "600" ]
 }
 
 # ---------------------------------------------------------------------------

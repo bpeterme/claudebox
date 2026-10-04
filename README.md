@@ -74,6 +74,8 @@ cbox oc safe   # opencode in safe mode
 |---------|-------------|
 | `cbox update` | Force-update the active agent inside a running container |
 | `cbox doctor` | Run environment diagnostics (includes companion tool status) |
+| `cbox mcp` | Show host MCP servers and relay status |
+| `cbox mcp import` | Import MCP servers from Claude Desktop / Claude Code on the host |
 | `cbox version` | Show version |
 
 ## Container Modes
@@ -109,6 +111,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_BUILD_DIR` | cbox.sh directory | Build context for `cbox rebuild` |
 | `BUILD_PLAYWRIGHT` | `0` | Set to `1` to bake Playwright + Chromium into the image on the next `cbox rebuild` (or pass it inline). Decides whether the browser download happens at build time or on first use |
 | `CBOX_AUDIO` | *(unset)* | Set to `1` to enable Claude Code voice mode (requires PulseAudio on host) |
+| `CBOX_MCP_CONFIG` | `~/.config/claudebox/mcp.json` | MCP servers that run on the host and are relayed into the container (see [Host MCP Servers](#host-mcp-servers)) |
 
 > [!WARNING]
 > **Do not place `CBOX_CLAUDE_DIR` (default `~/.claude`) or your project directories on iCloud Drive, Dropbox Smart Sync, Google Drive Stream, or any on-demand cloud storage.** These services evict file contents to stubs when not recently accessed. A container mounting an evicted path will fail to read files that appear to exist on disk — a subtle failure that is hard to diagnose.
@@ -131,6 +134,39 @@ The image is based on Ubuntu 24.04 and includes:
   and survive `cbox reset`, `cbox prune` and image rebuilds
 
 The container user is `claude` (UID matches your host UID to avoid permission issues on mounted volumes).
+
+## Host MCP Servers
+
+Some MCP servers only work on the Mac itself — [iMCP](https://github.com/mattt/iMCP)
+(Reminders, Calendar, Contacts, Messages), anything that talks to a macOS app or the
+Keychain. List those in `~/.config/claudebox/mcp.json`, in the usual format:
+
+```json
+{
+  "mcpServers": {
+    "imcp": { "command": "/Applications/iMCP.app/Contents/MacOS/imcp-server" }
+  }
+}
+```
+
+Or import them from Claude Desktop / Claude Code on the host with `cbox mcp import`.
+Changes take effect with the next `cbox` session; `cbox mcp` shows what is configured.
+
+**How it works.** The server runs on the host; Claude in the container talks to it over
+the container runtime's own `exec` channel. Nothing listens on the network — neither
+on the host nor in the container — so the server is not reachable from your LAN.
+Each connection starts a fresh server process, just like a local stdio server.
+
+**What belongs where.**
+
+| Server | Where |
+|--------|-------|
+| Needs macOS (apps, Keychain, local hardware) | `~/.config/claudebox/mcp.json` (host) |
+| Works on files or repositories (filesystem, git, …) | Inside the container: the project's `.mcp.json` or `claude mcp add` — a host server would see host paths, not `/Workspace` |
+| Remote (`https://…`) | Either; entries with a `url` in `mcp.json` are passed through as-is |
+
+URLs on the host's `localhost` are not supported and are skipped with a warning.
+Host MCP servers are not available in safe mode.
 
 ## macOS: Screenshot Script
 

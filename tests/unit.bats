@@ -212,13 +212,22 @@ _relay_setup() {
   # Unix socket paths are length-limited, so keep them short.
   RELAY_TMP=$(mktemp -d /tmp/cbr.XXXX)
   export CBOX_MCP_SOCKET_DIR="$RELAY_TMP/s"
-  printf '#!/bin/bash\n[[ "$1" == exec ]] || exit 1\nshift; [[ "$1" == -i ]] && shift; shift\nexec "$@"\n' > "$RELAY_TMP/rt"
-  printf '#!/bin/bash\ncat > /dev/null; sleep 0.3; echo late-reply\n' > "$RELAY_TMP/late"
-  chmod +x "$RELAY_TMP/rt" "$RELAY_TMP/late"
+  # Like `container exec`: no `exec`, so the wrapper keeps stdout open until the
+  # in-container process exits — EOF alone does not reach the host earlier.
+  printf '#!/bin/bash\n[[ "$1" == exec ]] || exit 1\nshift; [[ "$1" == -i ]] && shift; shift\n"$@"\n' > "$RELAY_TMP/rt"
+  printf '#!/bin/bash\nwhile read -r l; do sleep 0.5; echo "late-$l"; done\n' > "$RELAY_TMP/late"
+  # Never answers and ignores EOF, like imcp-server without Local Network access.
+  printf '#!/bin/bash\nwhile :; do sleep 1; done\n' > "$RELAY_TMP/stuck"
+  # Stuck until the flag file exists, then echoes.
+  printf '#!/bin/bash\n[ -f "%s/fixed" ] && exec cat\nwhile :; do sleep 1; done\n' "$RELAY_TMP" > "$RELAY_TMP/flaky"
+  chmod +x "$RELAY_TMP/rt" "$RELAY_TMP/late" "$RELAY_TMP/stuck" "$RELAY_TMP/flaky"
   _CBOX_CMD="$RELAY_TMP/rt"
   _CBOX_MCP_RELAY="$RELAY_TMP/bin/cbox-mcp-relay"
+  _CBOX_MCP_HINT_SECONDS=1
+  RELAY_LOG="$CBOX_DATA_DIR/.mcp-relay-rbox.log"
   cat > "$CBOX_MCP_CONFIG" <<JSON
-{"mcpServers":{"echo":{"command":"cat"},"late":{"command":"$RELAY_TMP/late"},"crash":{"command":"false"}}}
+{"mcpServers":{"echo":{"command":"cat"},"late":{"command":"$RELAY_TMP/late"},"crash":{"command":"false"},
+ "stuck":{"command":"$RELAY_TMP/stuck"},"flaky":{"command":"$RELAY_TMP/flaky"}}}
 JSON
   _cbox_mcp_relay_start "rbox"
 }
@@ -237,11 +246,11 @@ _relay_teardown() {
   [ "$output" = '{"jsonrpc":"2.0","id":1}' ]
 }
 
-@test "mcp relay: forwards server output sent after the client stopped sending" {
+@test "mcp relay: answers a request written just before the client stopped sending" {
   _relay_setup
   run bash -c "echo x | timeout 10 '$_CBOX_MCP_RELAY' connect late"
   _relay_teardown
-  [ "$output" = "late-reply" ]
+  [ "$output" = "late-x" ]
 }
 
 @test "mcp relay: serves consecutive connections with fresh servers" {
@@ -261,6 +270,61 @@ _relay_teardown() {
   read -r rc elapsed <<< "$output"
   [ "$rc" -eq 0 ]
   (( elapsed < 5 ))
+}
+
+# Client that keeps its input open for $2 seconds, like Claude, but gives up
+# after $3 seconds, like Claude's connect timeout.
+_relay_client() {
+  timeout "$3" "$_CBOX_MCP_RELAY" connect "$1" < <(sleep "$2" 2>/dev/null)
+}
+
+# Waits up to $2 seconds for the number of processes matching $1 to reach $3.
+_wait_procs() {
+  local i
+  for i in $(seq 1 $(( $2 * 5 ))); do
+    [ "$(pgrep -fc "$1")" -eq "$3" ] && return 0
+    sleep 0.2
+  done
+  return 1
+}
+
+@test "mcp relay: client disconnecting mid-session stops the server and frees the slot" {
+  _relay_setup
+  _relay_client stuck 30 2 || true
+  _relay_client stuck 30 2 || true
+  # Both servers are stopped although they ignore EOF on stdin.
+  _wait_procs "$RELAY_TMP/stuck" 6 0
+  local stopped=$?
+  # Two slots were used; a third client must still be served.
+  run bash -c "echo hi | timeout 10 '$_CBOX_MCP_RELAY' connect echo"
+  _relay_teardown
+  [ "$stopped" -eq 0 ]
+  [ "$output" = "hi" ]
+}
+
+@test "mcp relay: server that never answers logs a hint and does not hold the slot" {
+  _relay_setup
+  _relay_client stuck 30 3 || true
+  _wait_procs "$RELAY_TMP/stuck" 6 0
+  local stopped=$?
+  local log; log=$(cat "$RELAY_LOG")
+  _relay_teardown
+  [ "$stopped" -eq 0 ]
+  [[ "$log" == *"WARN stuck: no response from the server 1s after a client connected"*"Local Network"* ]]
+  [[ "$log" == *"WARN stuck: client gave up before the server answered"* ]]
+}
+
+@test "mcp relay: repeated failed connects do not exhaust the slots" {
+  _relay_setup
+  local i
+  for i in 1 2 3 4 5; do _relay_client flaky 30 1 || true; done
+  touch "$RELAY_TMP/fixed"
+  run bash -c "{ echo works; sleep 0.5; } | timeout 10 '$_CBOX_MCP_RELAY' connect flaky"
+  _wait_procs "$RELAY_TMP/flaky" 10 0
+  local stopped=$?
+  _relay_teardown
+  [ "$output" = "works" ]
+  [ "$stopped" -eq 0 ]
 }
 
 @test "mcp relay: unknown server fails with a helpful message" {
@@ -316,6 +380,29 @@ _relay_teardown() {
   [[ "$output" == *"✔ r"*"remote"* ]]
   [[ "$output" == *"✘ l"*"not supported"* ]]
   [[ "$output" == *"relay for 'myapp' not running"* ]]
+}
+
+@test "cbox mcp: shows the latest relay problem under its server" {
+  echo '{"mcpServers":{"iMCP":{"command":"/x/imcp-server"},"other":{"command":"/x/o"}}}' > "$CBOX_MCP_CONFIG"
+  cat > "$CBOX_DATA_DIR/.mcp-relay-myapp.log" <<'LOG'
+2026-10-04 09:00:00 INFO iMCP: client connected — server started (pid 1)
+2026-10-04 09:00:25 WARN iMCP: no response from the server 25s after a client connected. Local Network ...
+2026-10-04 09:00:30 WARN iMCP: client gave up before the server answered — server stopped
+2026-10-04 09:01:00 INFO other: client connected — server started (pid 2)
+LOG
+  run _cbox_mcp_status "myapp"
+  [[ "$output" == *"iMCP"*"⚠ 09:00 no response"*"Local Network"*"⚠ 09:00 client gave up"* ]]
+  [[ "$output" != *"other"*"⚠"* ]]
+}
+
+@test "cbox mcp: a later successful connection clears the problem" {
+  echo '{"mcpServers":{"iMCP":{"command":"/x/imcp-server"}}}' > "$CBOX_MCP_CONFIG"
+  cat > "$CBOX_DATA_DIR/.mcp-relay-myapp.log" <<'LOG'
+2026-10-04 09:00:30 WARN iMCP: client gave up before the server answered — server stopped
+2026-10-04 09:05:00 INFO iMCP: client connected — server started (pid 3)
+LOG
+  run _cbox_mcp_status "myapp"
+  [[ "$output" != *"⚠"* ]]
 }
 
 @test "cbox mcp import: lists candidates from Claude Desktop and Claude Code when not interactive" {

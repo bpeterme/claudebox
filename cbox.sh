@@ -95,6 +95,8 @@ CBOX_PLAYWRIGHT_DIR="${CBOX_PLAYWRIGHT_DIR:-$CBOX_DATA_DIR/ms-playwright}"
 CBOX_MCP_CONFIG="${CBOX_MCP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/mcp.json}"
 _CBOX_MCP_RELAY="/home/claude/.local/bin/cbox-mcp-relay"
 _CBOX_MCP_SLOTS=2
+# Below Claude Code's 30s MCP connect timeout, so the hint lands before it gives up
+_CBOX_MCP_HINT_SECONDS=25
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
@@ -577,20 +579,30 @@ def cmd_claude_json(project_file, name, config, managed_file, relay, mode):
 
 # --- supervise --------------------------------------------------------------
 
-def log(msg):
-    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+NO_ANSWER_HINT = (
+    "{name}: no response from the server {secs}s after a client connected. "
+    "Servers that find their app via Bonjour, like iMCP, need Local Network access "
+    "(System Settings → Privacy & Security → Local Network → enable the server, "
+    "e.g. imcp-server, and its app), and only one Mac on the network may run iMCP."
+)
 
 
-def pump(src, dst):
+def log(msg, warn=False):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), "WARN" if warn else "INFO", msg, flush=True)
+
+
+def pump(src, dst, first_data=None):
     """Copy bytes until EOF or error, then close dst so the peer sees EOF."""
     try:
         while True:
             data = os.read(src.fileno(), 65536)
             if not data:
                 break
+            if first_data is not None:
+                first_data.set()
             while data:
                 data = data[os.write(dst.fileno(), data):]
-    except OSError:
+    except (OSError, ValueError):
         pass
     finally:
         try:
@@ -611,7 +623,16 @@ def finish(proc, grace=5.0):
             proc.wait()
 
 
-def serve(sname, cfg, ex):
+def close(f):
+    try:
+        f.close()
+    except OSError:
+        pass
+
+
+def serve(sname, cfg, ex, hint_after):
+    """One client connection. Ends — and takes the server with it — as soon as
+    either the exec process (the client's side) or the server exits."""
     env = dict(os.environ)
     env.update({str(k): str(v) for k, v in (cfg.get("env") or {}).items()})
     argv = [os.path.expanduser(str(cfg["command"]))] + [str(a) for a in (cfg.get("args") or [])]
@@ -620,26 +641,52 @@ def serve(sname, cfg, ex):
                                stderr=sys.stdout, env=env, bufsize=0,
                                cwd=os.path.expanduser("~"))
     except OSError as e:
-        log(f"{sname}: cannot start {argv[0]}: {e}")
-        ex.stdin.close()
-        finish(ex)
+        log(f"{sname}: cannot start {argv[0]}: {e}", warn=True)
+        close(ex.stdin)
+        finish(ex, grace=2)
         return
     log(f"{sname}: client connected — server started (pid {srv.pid})")
+    answered = threading.Event()
     up = threading.Thread(target=pump, args=(ex.stdout, srv.stdin), daemon=True)
-    down = threading.Thread(target=pump, args=(srv.stdout, ex.stdin), daemon=True)
+    down = threading.Thread(target=pump, args=(srv.stdout, ex.stdin, answered), daemon=True)
     up.start()
     down.start()
-    # Whichever side ends first, give the other a grace period, then end it.
-    while up.is_alive() and down.is_alive():
-        up.join(0.5)
-    finish(srv)
-    finish(ex)
+
+    # Watch the processes, not the pipes: EOF on the exec process's stdout does
+    # not reliably cross `container exec` while the in-container side is alive,
+    # but the in-container `accept` exits as soon as its client is gone.
+    connected = time.time()
+    hinted = False
+    while ex.poll() is None and srv.poll() is None:
+        if not hinted and not answered.is_set() and time.time() - connected >= hint_after:
+            log(NO_ANSWER_HINT.format(name=sname, secs=int(hint_after)), warn=True)
+            hinted = True
+        time.sleep(0.2)
+
+    if srv.poll() is not None:
+        # Server ended: deliver its last output, then let the client see EOF.
+        down.join(2)
+        close(ex.stdin)
+        finish(ex, grace=2)
+        if answered.is_set():
+            log(f"{sname}: server exited ({srv.returncode}) — client disconnected")
+        else:
+            log(f"{sname}: server exited ({srv.returncode}) without answering", warn=True)
+    else:
+        # Client gone: stop the server, however stuck it is.
+        close(srv.stdin)
+        finish(srv, grace=2)
+        if answered.is_set():
+            log(f"{sname}: client disconnected — server exited ({srv.returncode})")
+        else:
+            log(f"{sname}: client gave up before the server answered — server stopped", warn=True)
     up.join(1)
     down.join(1)
-    log(f"{sname}: client disconnected — server exited ({srv.returncode})")
 
 
-def slot(stop, runtime, box, config, relay, sname):
+def slot(stop, runtime, box, config, relay, sname, hint_after):
+    """Keeps one `accept` pending in the container. Each connection is handed
+    to its own thread, so the slot is ready again right away."""
     fails = 0
     while not stop.is_set():
         cfg = relay_servers(config).get(sname)
@@ -650,7 +697,7 @@ def slot(stop, runtime, box, config, relay, sname):
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=sys.stdout, bufsize=0)
         except OSError as e:
-            log(f"{sname}: cannot run {runtime}: {e}")
+            log(f"{sname}: cannot run {runtime}: {e}", warn=True)
             stop.wait(30)
             continue
         # Blocks until a client connects in the container.
@@ -660,18 +707,18 @@ def slot(stop, runtime, box, config, relay, sname):
             marker = b""
         if marker != MARKER:
             # Container stopped, relay missing, or exec failed: back off.
-            ex.stdin.close()
+            close(ex.stdin)
             finish(ex, grace=1)
             fails += 1
             if fails == 1:
-                log(f"{sname}: relay endpoint unavailable in '{box}' (exit {ex.returncode}) — retrying")
+                log(f"{sname}: relay endpoint unavailable in '{box}' (exit {ex.returncode}) — retrying", warn=True)
             stop.wait(min(30, 2 ** min(fails, 5)))
             continue
         fails = 0
-        serve(sname, cfg, ex)
+        threading.Thread(target=serve, args=(sname, cfg, ex, hint_after), daemon=True).start()
 
 
-def cmd_supervise(runtime, box, config, relay, slots, pidfile):
+def cmd_supervise(runtime, box, config, relay, slots, hint_after, pidfile):
     try:
         os.setsid()  # own process group, so stop can kill every child at once
     except OSError:
@@ -690,7 +737,8 @@ def cmd_supervise(runtime, box, config, relay, slots, pidfile):
                 alive = [t for t in workers.get(sname, []) if t.is_alive()]
                 while len(alive) < int(slots):
                     t = threading.Thread(target=slot, daemon=True,
-                                         args=(stop, runtime, box, config, relay, sname))
+                                         args=(stop, runtime, box, config, relay, sname,
+                                               float(hint_after)))
                     t.start()
                     alive.append(t)
                 workers[sname] = alive
@@ -726,8 +774,33 @@ def shown(path):
     return "~" + path[len(home):] if path.startswith(home + os.sep) else path
 
 
-def cmd_list(config):
+LOG_RE = re.compile(r"^(\S+ \S+) (INFO|WARN) ([A-Za-z0-9_.-]+): (.*)$")
+
+
+def recent_problems(logfile):
+    """Per server: the warnings logged since its last normal event, so a later
+    successful connection clears them."""
+    problems = {}
+    try:
+        with open(logfile, errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return problems
+    for line in lines:
+        m = LOG_RE.match(line)
+        if not m:
+            continue
+        stamp, level, sname, msg = m.groups()
+        if level == "WARN":
+            problems.setdefault(sname, []).append(f"{stamp[11:16]} {msg}")
+        else:
+            problems.pop(sname, None)
+    return problems
+
+
+def cmd_list(config, logfile=""):
     shown_config = shown(config)
+    problems = recent_problems(logfile) if logfile else {}
     servers = load_servers(config)
     if not servers:
         print(f"No host MCP servers configured ({shown_config}).")
@@ -750,6 +823,8 @@ def cmd_list(config):
         else:
             mark, label = "✘", "needs \"command\" or \"url\""
         print(f"  {mark} {sname.ljust(width)}  {label}  {describe(cfg)}")
+        for problem in problems.get(sname, [])[-2:]:
+            print(f"      ⚠ {problem}")
 
 
 # --- import -----------------------------------------------------------------
@@ -879,6 +954,7 @@ import glob, os, select, signal, socket, sys, time
 BASE = os.environ.get("CBOX_MCP_SOCKET_DIR", "/tmp/cbox-mcp")
 ACK = b"\x06"     # accept → client: this slot is yours
 MARKER = b"\x01"  # accept → host: a client connected, start the server
+DRAIN_SECONDS = 2  # accept: server output still forwarded after the client stops sending
 
 
 def write_all(fd, data):
@@ -886,30 +962,41 @@ def write_all(fd, data):
         data = data[os.write(fd, data):]
 
 
-def pump(in_fd, out_fd, sock, drain):
-    """in_fd → sock and sock → out_fd, passing each EOF on as a half-close.
-    connect ends once the server side closes; accept (drain) also forwards the
-    server's remaining output after the client has stopped sending."""
+def pump(in_fd, out_fd, sock, half_close):
+    """in_fd → sock and sock → out_fd.
+    connect (half_close) passes EOF on its input on and ends when the socket
+    does. accept ends on EOF from either side — its process exiting is what
+    tells the host the connection is over, since EOF alone does not cross
+    `container exec`. After the client stops sending, the server's output is
+    still forwarded for up to DRAIN_SECONDS, or until it fails because the
+    client is gone entirely."""
     readers = [in_fd, sock]
+    deadline = None
     try:
-        while readers:
-            ready, _, _ = select.select(readers, [], [])
+        while True:
+            timeout = None if deadline is None else max(0, deadline - time.time())
+            ready, _, _ = select.select(readers, [], [], timeout)
+            if not ready:
+                return  # drain time is up
             if in_fd in ready:
                 data = os.read(in_fd, 65536)
                 if data:
                     sock.sendall(data)
-                else:
+                elif half_close:
                     sock.shutdown(socket.SHUT_WR)
                     readers.remove(in_fd)
+                else:
+                    return
             if sock in ready:
                 data = sock.recv(65536)
                 if data:
                     write_all(out_fd, data)
+                elif half_close:
+                    return
                 else:
-                    os.close(out_fd)
+                    os.close(out_fd)  # reaches the server where the runtime passes EOF on
                     readers.remove(sock)
-                    if not drain:
-                        return
+                    deadline = time.time() + DRAIN_SECONDS
     except OSError:
         return
     finally:
@@ -943,7 +1030,7 @@ def accept(name):
     except OSError:
         return 0
     write_all(1, MARKER)
-    pump(0, 1, conn, drain=True)
+    pump(0, 1, conn, half_close=False)
     return 0
 
 
@@ -967,7 +1054,7 @@ def connect(name):
                 ok = False
             if ok:
                 s.settimeout(None)
-                pump(0, 1, s, drain=False)
+                pump(0, 1, s, half_close=True)
                 return 0
             s.close()
         if time.time() > deadline:
@@ -1039,7 +1126,8 @@ _cbox_mcp_relay_start() {
   # Subshell: no job-control noise in interactive shells, and the supervisor
   # detaches into its own session so it survives the terminal.
   ( python3 -c "$(_cbox_mcp_py)" supervise \
-      "$_CBOX_CMD" "$name" "$CBOX_MCP_CONFIG" "$_CBOX_MCP_RELAY" "$_CBOX_MCP_SLOTS" "$pidfile" \
+      "$_CBOX_CMD" "$name" "$CBOX_MCP_CONFIG" "$_CBOX_MCP_RELAY" "$_CBOX_MCP_SLOTS" \
+      "$_CBOX_MCP_HINT_SECONDS" "$pidfile" \
       </dev/null >"$logfile" 2>&1 & )
 
   local _i
@@ -1065,7 +1153,7 @@ _cbox_mcp_relay_stop() {
 
 _cbox_mcp_status() {
   local name="$1"
-  python3 -c "$(_cbox_mcp_py)" list "$CBOX_MCP_CONFIG"
+  python3 -c "$(_cbox_mcp_py)" list "$CBOX_MCP_CONFIG" "$CBOX_DATA_DIR/.mcp-relay-$name.log"
   python3 -c "$(_cbox_mcp_py)" has-relay-servers "$CBOX_MCP_CONFIG" || return 0
   local pid
   if pid=$(_cbox_mcp_relay_pid "$name"); then

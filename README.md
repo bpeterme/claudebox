@@ -168,6 +168,47 @@ Each connection starts a fresh server process, just like a local stdio server.
 URLs on the host's `localhost` are not supported and are skipped with a warning.
 Host MCP servers are not available in safe mode.
 
+### Troubleshooting host MCP servers
+
+If Claude reports that a host server failed to connect (for example after its 30 s
+connect timeout), start with `cbox mcp`: it shows the latest problem under each server.
+The full log is on the host:
+
+```bash
+tail ~/.local/share/claudebox/.mcp-relay-<project>.log
+```
+
+"no response from the server … after a client connected" means the server started
+but never answered. The relay is fine in that case; the server is stuck. Check
+whether it answers outside cbox (iMCP shown; use your server's command):
+
+```bash
+(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}'; sleep 10) \
+  | /Applications/iMCP.app/Contents/MacOS/imcp-server
+```
+
+A JSON response within a few seconds means the server works. If there is no output,
+the server is stuck. For iMCP, the two known causes are:
+
+- **Local Network access is off.** `imcp-server` finds iMCP.app via Bonjour and
+  needs its own permission, separate from iMCP and from your terminal app. Turn on
+  both `imcp-server` and iMCP in System Settings → Privacy & Security → Local Network.
+  Without it, discovery silently times out and retries forever.
+- **Another Mac on the network runs iMCP.** The other Mac's instance can claim the
+  Bonjour name "iMCP", and `imcp-server` then connects to the wrong one and retries
+  silently. This command should list exactly one service, named plain `iMCP`
+  (stop it with Ctrl-C):
+
+  ```bash
+  dns-sd -B _mcp._tcp local.
+  ```
+
+  If it shows `iMCP (2)` or more than one entry, quit iMCP on the other Mac.
+
+Server processes end together with their connection. Anything left over from an
+earlier failure is cleared by restarting the session: exit every `cbox` session for
+the project (or run `cbox stop`) and start `cbox` again.
+
 ## macOS: Screenshot Script
 
 [`macos/screenshot.sh`](macos/screenshot.sh) captures an interactive screenshot (drag to select a region, same as ⇧⌘4) and saves it directly to the container's `~/share/` folder. It reads `~/.config/claudebox/cbox.env` automatically so no path configuration is needed. See [`macos/README.md`](macos/README.md) for how to assign a keyboard shortcut via Automator, Hammerspoon, or Raycast.

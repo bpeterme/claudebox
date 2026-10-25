@@ -1045,6 +1045,35 @@ _prune_collect() {
   [ -d "$CBOX_PLAYWRIGHT_DIR" ]
 }
 
+@test "_cbox_create: skips symlink targets nested inside a mounted target directory" {
+  local capture="$BATS_TMPDIR/create-nested-args"
+  local dots="$BATS_TMPDIR/nested-dots"
+  rm -rf "$capture" "$dots" "$CBOX_CLAUDE_DIR/output-styles" "$CBOX_CLAUDE_DIR/output-styles.bak"
+  mkdir -p "$dots/output-styles" "$CBOX_CLAUDE_DIR/output-styles.bak"
+  echo "# ELI5" > "$dots/output-styles/ELI5.md"
+  echo "{}" > "$dots/settings.json"
+  ln -s "$dots/output-styles" "$CBOX_CLAUDE_DIR/output-styles"
+  ln -s "$dots/output-styles/ELI5.md" "$CBOX_CLAUDE_DIR/output-styles.bak/ELI5.md"
+  ln -s "$dots/settings.json" "$CBOX_CLAUDE_DIR/settings.json"
+  ln -s "$dots/settings.json" "$CBOX_CLAUDE_DIR/settings-copy.json"
+  # Work dir must not contain $dots, or the targets are skipped as workspace paths
+  mkdir -p "$BATS_TMPDIR/nested-project"
+  cd "$BATS_TMPDIR/nested-project"
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-nested"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+
+  _cbox_create "cbox-unit-nested" "normal"
+  rm -rf "$CBOX_CLAUDE_DIR/output-styles" "$CBOX_CLAUDE_DIR/output-styles.bak" \
+    "$CBOX_CLAUDE_DIR/settings.json" "$CBOX_CLAUDE_DIR/settings-copy.json"
+
+  run cat "$capture"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"$dots/output-styles:$dots/output-styles"* ]]
+  [[ "$output" != *"$dots/output-styles/ELI5.md:"* ]]
+  [ "$(grep -c "^$dots/settings.json:$dots/settings.json\$" "$capture")" -eq 1 ]
+}
+
 # ---------------------------------------------------------------------------
 # exit path under `set -e` (how the Homebrew install runs cbox)
 # ---------------------------------------------------------------------------

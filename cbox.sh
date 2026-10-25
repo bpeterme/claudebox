@@ -1336,16 +1336,32 @@ _cbox_create() {
   # mounting that path at the same path in the container lets the symlink resolve.
   # maxdepth 2 also covers symlinks one level down (e.g. output-styles/ELI5.md,
   # commands/foo.md) without recursing into large trees like projects/.
-  local _ro="" _link _target
+  # Targets inside an already-mounted target directory (or duplicates) are
+  # skipped: Apple Container shares a file mount's parent directory, so a
+  # directory mount plus file mounts inside it collapse into the file mounts
+  # alone and the rest of the directory disappears. Sorting puts a parent
+  # before its children.
+  local _ro="" _link _target _kept _nested
+  local _targets=() _mounted=()
   [[ "$mode" == "safe" ]] && _ro=":ro"
   while IFS= read -r _link; do
     _target=$(_cbox_resolve_path "$_link")
     [[ -e "$_target" ]] || continue
     [[ "$_target" == "$CBOX_CLAUDE_DIR"* ]] && continue
     [[ "$_target" == "$PWD" || "$_target" == "$PWD/"* ]] && continue
-    args+=(-v "$_target:$_target$_ro")
+    _targets+=("$_target")
   done < <(find "$CBOX_CLAUDE_DIR" -maxdepth 2 -type l 2>/dev/null)
-  unset _ro _link _target
+  while IFS= read -r _target; do
+    [[ -n "$_target" ]] || continue
+    _nested=0
+    for _kept in "${_mounted[@]}"; do
+      [[ "$_target" == "$_kept" || "$_target" == "$_kept/"* ]] && { _nested=1; break; }
+    done
+    (( _nested )) && continue
+    _mounted+=("$_target")
+    args+=(-v "$_target:$_target$_ro")
+  done < <(printf '%s\n' "${_targets[@]}" | LC_ALL=C sort)
+  unset _ro _link _target _kept _nested _targets _mounted
 
   args+=(
     "$CBOX_IMAGE"

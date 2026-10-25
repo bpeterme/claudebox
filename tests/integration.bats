@@ -123,6 +123,24 @@ _mounts_rw() {
   [[ "$output" == *"$target_dir/ELI5.md:$target_dir/ELI5.md"* ]]
 }
 
+@test "directory symlink (e.g. output-styles -> dotfiles dir) is mounted as a directory" {
+  local target_dir="$BATS_TMPDIR/dotfiles/output-styles"
+  mkdir -p "$target_dir"
+  echo "# ELI5" > "$target_dir/ELI5.md"
+  rm -rf "$CBOX_CLAUDE_DIR/output-styles"
+  ln -s "$target_dir" "$CBOX_CLAUDE_DIR/output-styles"
+
+  _cbox_create "$TEST_NAME" "normal"
+  run _mounts
+  [[ "$output" == *"$target_dir:$target_dir"* ]]
+
+  # Files added after container creation must be visible without a recreate
+  echo "# New" > "$target_dir/New.md"
+  run docker exec "$TEST_NAME" cat "$target_dir/New.md"
+  [ "$status" -eq 0 ]
+  [ "$output" = "# New" ]
+}
+
 @test "symlink target inside workspace is not double-mounted" {
   local inner="$TEST_WORKDIR/inner"
   mkdir -p "$inner"

@@ -102,6 +102,14 @@ RUN printf '[ -f /home/claude/.zshrc.global ] && . /home/claude/.zshrc.global\n[
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh -s -- --no-modify-path
 ENV PATH="/home/claude/.local/bin:$PATH"
 
+# Project venvs live in the bind-mounted workspace, which the host uses too.
+# A container-built .venv holds Linux binaries and a /usr/bin/python3 link that
+# break the host (and vice versa), so the container gets its own env per project.
+# Relative paths resolve against the project root (an absolute path would be
+# shared by every project), and uv writes a `*` .gitignore inside the env, so
+# neither repos nor the host's git config need an ignore entry.
+ENV UV_PROJECT_ENVIRONMENT=.venv-linux
+
 # dvc — required by flux for R2-routed files
 RUN uv tool install "dvc[s3]"
 

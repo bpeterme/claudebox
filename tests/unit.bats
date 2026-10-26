@@ -1118,3 +1118,17 @@ SH
   [ "$status" -eq 0 ]
   grep -qx "docker stop exitpath" "$BATS_TMPDIR/exitpath.log"
 }
+
+# ---------------------------------------------------------------------------
+# uv project environment
+# ---------------------------------------------------------------------------
+
+# The workspace is bind-mounted, so a container-built .venv replaces the host's
+# macOS venv with a Linux one. The container must use its own per-project env,
+# which only a relative path gives: an absolute one is shared by all projects.
+@test "dockerfile: uv uses a per-project .venv-linux, leaving .venv to the host" {
+  local dockerfile="$BATS_TEST_DIRNAME/../dockerfile"
+  run grep -nE '^ENV UV_PROJECT_ENVIRONMENT=' "$dockerfile"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ENV UV_PROJECT_ENVIRONMENT=.venv-linux" ]]
+}

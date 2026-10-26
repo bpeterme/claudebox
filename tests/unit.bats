@@ -1074,6 +1074,14 @@ _prune_collect() {
   [ "$(grep -c "^$dots/settings.json:$dots/settings.json\$" "$capture")" -eq 1 ]
 }
 
+@test "_cbox_create: possibly-empty arrays are expanded bash-3.2-safe under set -u" {
+  # macOS /bin/bash 3.2 treats "${arr[@]}" on an empty array as unbound under
+  # `set -u`; newer bash (and this test runner) does not, so check statically.
+  run grep -nE '"\$\{(_mounted|_targets)\[@\]\}"' "$CBOX_SH"
+  [ "$status" -eq 0 ]
+  ! grep -nE '(^|[^+])"\$\{(_mounted|_targets)\[@\]\}"' "$CBOX_SH"
+}
+
 # ---------------------------------------------------------------------------
 # exit path under `set -e` (how the Homebrew install runs cbox)
 # ---------------------------------------------------------------------------

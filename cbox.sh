@@ -1354,13 +1354,13 @@ _cbox_create() {
   while IFS= read -r _target; do
     [[ -n "$_target" ]] || continue
     _nested=0
-    for _kept in "${_mounted[@]}"; do
+    for _kept in ${_mounted[@]+"${_mounted[@]}"}; do
       [[ "$_target" == "$_kept" || "$_target" == "$_kept/"* ]] && { _nested=1; break; }
     done
     (( _nested )) && continue
     _mounted+=("$_target")
     args+=(-v "$_target:$_target$_ro")
-  done < <(printf '%s\n' "${_targets[@]}" | LC_ALL=C sort)
+  done < <(printf '%s\n' ${_targets[@]+"${_targets[@]}"} | LC_ALL=C sort)
   unset _ro _link _target _kept _nested _targets _mounted
 
   args+=(

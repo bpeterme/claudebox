@@ -1322,7 +1322,8 @@ _prune_collect() {
 @test "_cbox_create: skips symlink targets nested inside a mounted target directory" {
   local capture="$BATS_TMPDIR/create-nested-args"
   local dots="$BATS_TMPDIR/nested-dots"
-  rm -rf "$capture" "$dots" "$CBOX_CLAUDE_DIR/output-styles" "$CBOX_CLAUDE_DIR/output-styles.bak"
+  rm -rf "$capture" "$dots" "$CBOX_CLAUDE_DIR/output-styles" "$CBOX_CLAUDE_DIR/output-styles.bak" \
+    "$CBOX_CLAUDE_DIR/settings.json" "$CBOX_CLAUDE_DIR/settings-copy.json"
   mkdir -p "$dots/output-styles" "$CBOX_CLAUDE_DIR/output-styles.bak"
   echo "# ELI5" > "$dots/output-styles/ELI5.md"
   echo "{}" > "$dots/settings.json"

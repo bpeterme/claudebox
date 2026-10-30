@@ -111,6 +111,10 @@ _CBOX_MCP_HINT_SECONDS=25
 # resource definitions, approvals and session tokens — host only, never mounted.
 CBOX_WARDEN_DIR="${CBOX_WARDEN_DIR:-$CBOX_DATA_DIR/warden}"
 CBOX_WARDEN_PORT="${CBOX_WARDEN_PORT:-47100}"
+# Container memory. Without it Apple's container runtime gives a VM 1 GB, which
+# Claude Code (~400 MB) plus a test suite or a large file can exhaust; the VM
+# then dies with the session. Applies when a container is created (cbox reset).
+CBOX_MEMORY="${CBOX_MEMORY:-4g}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
@@ -2145,6 +2149,7 @@ _cbox_create() {
     -w "/Workspace/$name"
 
     -e ZDOTDIR=/home/claude
+    --memory="$CBOX_MEMORY"
   )
 
   if [[ "$agent_bin" == "claude" ]]; then
@@ -2208,7 +2213,6 @@ _cbox_create() {
     args+=(
       --network cbox-bridge
       --cap-drop=ALL
-      --memory=4g
       --cpus=2
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude:ro"
       # Read-only for the same reason .claude is: safe mode must not be able to

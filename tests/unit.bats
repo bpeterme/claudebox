@@ -1640,6 +1640,22 @@ _prune_collect() {
   [[ "$output" != *"$BATS_TMPDIR/pw-normal:/opt/ms-playwright:ro"* ]]
 }
 
+@test "_cbox_create: both modes get CBOX_MEMORY (default 4g), not the runtime's 1 GB" {
+  local capture="$BATS_TMPDIR/create-memory-args"
+  cd "$BATS_TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  rm -f "$capture"; _cbox_create "cbox-unit-mem" "normal"
+  normal=$(grep -c '^--memory=4g$' "$capture")
+  rm -f "$capture"; _cbox_create "cbox-unit-mem" "safe"
+  safe=$(grep -c '^--memory=4g$' "$capture")
+  rm -f "$capture"; CBOX_MEMORY=6g _cbox_create "cbox-unit-mem" "normal"
+  custom=$(grep -c '^--memory=6g$' "$capture")
+  [ "$normal" -eq 1 ]
+  [ "$safe" -eq 1 ]
+  [ "$custom" -eq 1 ]
+}
+
 @test "_cbox_create: mounts the playwright cache read-only in safe mode" {
   local capture="$BATS_TMPDIR/create-safe-args"
   rm -f "$capture"

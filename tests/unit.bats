@@ -4,6 +4,8 @@ CBOX_SH="$(cd "$BATS_TEST_DIRNAME/.." && pwd)/cbox.sh"
 
 setup() {
   export HOME="$BATS_TMPDIR/home"
+  # CI runners set these to the real home; cbox's defaults must follow $HOME here.
+  unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME
   mkdir -p "$HOME/.config/claudebox"
   export CBOX_DATA_DIR="$BATS_TMPDIR/cbox-data"
   export CBOX_CLAUDE_DIR="$BATS_TMPDIR/claude"

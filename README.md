@@ -76,6 +76,12 @@ cbox oc safe   # opencode in safe mode
 | `cbox doctor` | Run environment diagnostics (includes companion tool status) |
 | `cbox mcp` | Show host MCP servers and relay status |
 | `cbox mcp import` | Import MCP servers from Claude Desktop / Claude Code on the host |
+| `cbox warden` | List credential resources and what this project gets (see [Credentials (warden)](#credentials-warden)) |
+| `cbox warden edit` | Define resources the container may use |
+| `cbox warden secret set <resource>` | Store a resource's secret in the macOS Keychain |
+| `cbox warden approve` | Approve this project's `.warden` file |
+| `cbox warden test <resource>` | Check a resource from the host |
+| `cbox warden log` | Show recent broker requests |
 | `cbox version` | Show version |
 
 ## Container Modes
@@ -112,6 +118,10 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `BUILD_PLAYWRIGHT` | `0` | Set to `1` to bake Playwright + Chromium into the image on the next `cbox rebuild` (or pass it inline). Decides whether the browser download happens at build time or on first use |
 | `CBOX_AUDIO` | *(unset)* | Set to `1` to enable Claude Code voice mode (requires PulseAudio on host) |
 | `CBOX_MCP_CONFIG` | `~/.config/claudebox/mcp.json` | MCP servers that run on the host and are relayed into the container (see [Host MCP Servers](#host-mcp-servers)) |
+| `CBOX_WARDEN_DIR` | `$CBOX_DATA_DIR/warden` | warden resources, approvals and session tokens — host only, never mounted |
+| `CBOX_WARDEN_PORT` | `47100` | Port of the warden broker, bound only to the container-facing host address |
+| `CBOX_WARDEN_HOST` | `192.168.64.1` (Apple) / `docker0` IP | Host address containers reach the broker on |
+| `CBOX_WARDEN_SECRET_CMD` | *(unset)* | Hosts without the macOS Keychain: command that prints the secret for an item name |
 
 > [!WARNING]
 > **Do not place `CBOX_CLAUDE_DIR` (default `~/.claude`) or your project directories on iCloud Drive, Dropbox Smart Sync, Google Drive Stream, or any on-demand cloud storage.** These services evict file contents to stubs when not recently accessed. A container mounting an evicted path will fail to read files that appear to exist on disk — a subtle failure that is hard to diagnose.
@@ -208,6 +218,48 @@ the server is stuck. For iMCP, the two known causes are:
 Server processes end together with their connection. Anything left over from an
 earlier failure is cleared by restarting the session: exit every `cbox` session for
 the project (or run `cbox stop`) and start `cbox` again.
+
+## Credentials (warden)
+
+Code in the container can use API keys and other credentials **without the
+container ever holding them**. A broker on the host keeps the secret (macOS
+Keychain), checks each request against what you allowed, and adds the
+credential on the way out. Inside the container, requests go to
+`$WARDEN_URL/<resource>/...` — the key a client sends is always replaced.
+
+```sh
+cbox warden secret set openrouter   # paste the key; stored in the Keychain
+cbox warden edit                    # define the resource (template included)
+cbox warden test openrouter         # check it from the host
+```
+
+Resources live in `~/.local/share/claudebox/warden/resources` (`$CBOX_WARDEN_DIR`).
+The file holds no secrets — only Keychain item names and URLs — so it can be
+kept in a dotfiles repo and symlinked there. Keep it out of anything a container
+mounts: if a container could edit it, it could point a resource at its own
+server. warden checks this and stays off, with a message, when the file or its
+directory is visible inside a container.
+
+A resource is either available to every container (`availability = global`)
+or only to projects that list it in a tracked `.warden` file **and** whose
+`.warden` you approved on the host (`project`). Editing `.warden` — also from
+inside the container — needs a new approval at the next session start.
+
+**S3-compatible storage** (AWS S3, Cloudflare R2, MinIO, …) uses `auth = sigv4`:
+the container gets an AWS profile with dummy keys (`AWS_CONFIG_FILE`), and the
+broker re-signs every request with the real ones. `policy = dvc` limits a
+resource to DVC's data layout in one bucket and prefix, with no deletes. The
+prefix comes from the project's `.warden`, so one resource serves every
+project in a bucket:
+
+```ini
+# .warden (tracked in the project)
+[storage]
+prefix = my-project
+```
+
+Not available in safe mode. Full documentation follows with the remaining
+resource types (SSH, MCP, audio).
 
 ## macOS: Screenshot Script
 

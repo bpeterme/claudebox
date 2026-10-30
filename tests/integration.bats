@@ -23,6 +23,9 @@ setup() {
 
 teardown() {
   docker rm -f "$TEST_NAME" 2>/dev/null || true
+  # $BATS_TMPDIR/claude is shared with unit.bats: drop the symlinks the
+  # tests above create there, or later runs trip over them.
+  find "$CBOX_CLAUDE_DIR" -maxdepth 2 -type l -delete 2>/dev/null || true
 }
 
 _mounts() {

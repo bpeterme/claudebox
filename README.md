@@ -97,6 +97,13 @@ cbox oc safe   # opencode in safe mode
 - Isolated network bridge (`cbox-bridge`)
 - Agent config mounted read-only
 
+### Git safety (both modes)
+
+git on your Mac runs commands that a repository names: hooks in `.git/hooks`, and settings in `.git/config` such as `core.fsmonitor`, filters or `core.sshCommand`. Such a command runs with your Keychain and SSH keys, so code in the container must not be able to plant one.
+
+- **Read-only:** the project's `.git/config` and `.git/hooks` are mounted read-only. Git commands that write the config fail inside the container (`git remote add`, `git config`, the upstream part of `git push -u`); run them on the Mac. A config change made on the Mac may only show up in the container after its next start. `CBOX_PROTECT_GIT=0` turns this off.
+- **Check at the end:** when the last session of a container ends, cbox looks for git settings that run commands and were not there at the start: in nested repositories, submodules, worktrees, or a replaced `.git`. It names each one with its location and offers to put `.git/config` and `.git/hooks` back as they were (the changed files are kept in `~/.local/share/claudebox/git-guard/`). Repositories cloned in the container without such settings are not reported.
+
 ## Configuration
 
 Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.example`](cbox.env.example) for all options. If `$XDG_CONFIG_HOME` is set, the file goes in `$XDG_CONFIG_HOME/claudebox/cbox.env` instead.
@@ -121,6 +128,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_WARDEN_DIR` | `$CBOX_DATA_DIR/warden` | warden resources, approvals and session tokens — host only, never mounted |
 | `CBOX_WARDEN_PORT` | `47100` | Port of the warden broker, bound only to the container-facing host address |
 | `CBOX_MEMORY` | `4g` | Memory of each container (both modes). Applies to newly created containers: `cbox reset` |
+| `CBOX_PROTECT_GIT` | `1` | Mount the project's `.git/config` and `.git/hooks` read-only (see [Git safety](#git-safety-both-modes)); `0` = writable. Applies to newly created containers: `cbox reset` |
 | `CBOX_WARDEN_HOST` | `192.168.64.1` (Apple) / `docker0` IP | Host address containers reach the broker on |
 | `CBOX_WARDEN_SECRET_CMD` | *(unset)* | Hosts without the macOS Keychain: command that prints the secret for an item name |
 

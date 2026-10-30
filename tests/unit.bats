@@ -1770,3 +1770,122 @@ SH
   [ "$status" -eq 0 ]
   [[ "$output" == *"ENV UV_PROJECT_ENVIRONMENT=.venv-linux" ]]
 }
+
+# ---------------------------------------------------------------------------
+# git guard: read-only .git/config and .git/hooks, session-end check
+# ---------------------------------------------------------------------------
+
+@test "_cbox_create: .git/config and .git/hooks are read-only in both modes" {
+  local capture="$BATS_TMPDIR/create-git-args" proj="$BATS_TMPDIR/gitproj"
+  rm -rf "$proj"; mkdir -p "$proj"; git -C "$proj" init -q; rm -rf "$proj/.git/hooks"
+  cd "$proj"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  for mode in normal safe; do
+    rm -f "$capture"; _cbox_create "gitproj" "$mode"
+    grep -qx "$proj/.git/config:/Workspace/gitproj/.git/config:ro" "$capture"
+    grep -qx "$proj/.git/hooks:/Workspace/gitproj/.git/hooks:ro" "$capture"
+  done
+  [ -d "$proj/.git/hooks" ]
+  rm -f "$capture"; CBOX_PROTECT_GIT=0 _cbox_create "gitproj" "normal"
+  run grep -c '/.git/' "$capture"
+  [ "$output" = "0" ]
+}
+
+@test "_cbox_create: no git mounts outside a git repository" {
+  local capture="$BATS_TMPDIR/create-nogit-args"
+  mkdir -p "$BATS_TMPDIR/nogit"; cd "$BATS_TMPDIR/nogit"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  rm -f "$capture"; _cbox_create "nogit" "normal"
+  run grep -c '/.git/' "$capture"
+  [ "$output" = "0" ]
+}
+
+_guard_repo() {
+  GUARD_PROJ="$BATS_TMPDIR/guardproj"
+  rm -rf "$GUARD_PROJ" "$CBOX_DATA_DIR/git-guard"
+  mkdir -p "$GUARD_PROJ"; cd "$GUARD_PROJ"
+  git init -q .
+  printf '#!/bin/sh\necho mine\n' > .git/hooks/pre-commit
+  # Present before the session: not reported.
+  mkdir lib && git -C lib init -q && git -C lib config core.pager less
+}
+
+@test "git guard: a session that changes nothing reports nothing and leaves no record" {
+  _guard_repo
+  _cbox_git_guard_start "gp"
+  git clone -q lib cloned 2>/dev/null
+  echo "work" > notes.txt
+  run _cbox_git_guard_check "gp"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ ! -e "$CBOX_DATA_DIR/git-guard" ] || [ -z "$(ls -A "$CBOX_DATA_DIR/git-guard")" ]
+}
+
+@test "git guard: names each new command-running setting with its location" {
+  _guard_repo
+  _cbox_git_guard_start "gp"
+  git config core.fsmonitor 'touch /tmp/x'
+  git config alias.st '!sh -c evil'
+  git config alias.co checkout
+  printf '#!/bin/sh\n' > .git/hooks/post-checkout
+  mkdir -p vendor/x && git -C vendor/x init -q && git -C vendor/x config filter.a.smudge evil
+  mkdir -p .git/modules/sub && printf '[core]\n\tsshCommand = evil\n' > .git/modules/sub/config
+  run _cbox_git_guard_check "gp"
+  [[ "$output" == *".git/config: core.fsmonitor=touch /tmp/x"* ]]
+  [[ "$output" == *".git/config: alias.st=!sh -c evil"* ]]
+  [[ "$output" != *"alias.co"* ]]
+  [[ "$output" == *".git/hooks/post-checkout"* ]]
+  [[ "$output" == *"vendor/x/.git/config: filter.a.smudge=evil"* ]]
+  [[ "$output" == *".git/modules/sub/config: core.sshcommand=evil"* ]]
+  [[ "$output" != *"lib/.git"* ]]
+  [[ "$output" == *"Not restored"* ]]
+  # Declined: nothing touched.
+  [ "$(git config --get core.fsmonitor)" = "touch /tmp/x" ]
+}
+
+@test "git guard: a .git replaced by a pointer elsewhere is reported" {
+  _guard_repo
+  _cbox_git_guard_start "gp"
+  mv lib/.git "$BATS_TMPDIR/elsewhere.git"
+  echo "gitdir: $BATS_TMPDIR/elsewhere.git" > lib/.git
+  run _cbox_git_guard_check "gp"
+  [[ "$output" == *"lib/.git → gitdir: $BATS_TMPDIR/elsewhere.git (points git elsewhere)"* ]]
+  rm -rf "$BATS_TMPDIR/elsewhere.git"
+}
+
+@test "git guard: restore puts .git/config and .git/hooks back and keeps the changed files" {
+  _guard_repo
+  _cbox_git_guard_start "gp"
+  git config core.fsmonitor 'touch /tmp/x'
+  printf '#!/bin/sh\n' > .git/hooks/post-checkout
+  echo evil >> .git/hooks/pre-commit
+  echo ../elsewhere > .git/commondir
+  _cbox_git_guard_ask() { return 0; }
+  run _cbox_git_guard_check "gp"
+  [[ "$output" == *"Restored"* ]]
+  run git config --get core.fsmonitor
+  [ "$status" -eq 1 ]
+  [ ! -e .git/hooks/post-checkout ]
+  [ ! -e .git/commondir ]
+  [ "$(cat .git/hooks/pre-commit)" = "$(printf '#!/bin/sh\necho mine')" ]
+  local kept
+  kept=$(find "$CBOX_DATA_DIR/git-guard" -mindepth 1 -maxdepth 1 -name 'gp-*')
+  grep -q fsmonitor "$kept/changed/config"
+  [ -f "$kept/changed/hooks/post-checkout" ]
+  [ -f "$kept/changed/commondir" ]
+}
+
+@test "git guard: a second concurrent session keeps the first session's record" {
+  _guard_repo
+  _cbox_git_guard_start "gp"
+  git config core.fsmonitor 'touch /tmp/x'
+  sleep 300 & local other=$!
+  touch "$_CBOX_SESSION_DIR/.cbox-active-gp-$other"
+  _cbox_git_guard_start "gp"
+  kill "$other"; wait "$other" 2>/dev/null || true
+  rm -f "$_CBOX_SESSION_DIR/.cbox-active-gp-$other"
+  run _cbox_git_guard_check "gp"
+  [[ "$output" == *"core.fsmonitor"* ]]
+}

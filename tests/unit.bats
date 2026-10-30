@@ -2245,3 +2245,55 @@ ssh keys 1 True" ] || { cat "$TT/tunnel.log"; false; }
   [[ "$after" == *"$CBOX_SSH_DIR/config:/home/claude/.ssh/config:ro"* ]]
   [[ "$after" == *"$CBOX_SSH_DIR/known_hosts:/home/claude/.ssh/known_hosts"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# warden mcp
+# ---------------------------------------------------------------------------
+
+_mcp_setup() {
+  _warden_setup
+  cat >> "$CBOX_WARDEN_DIR/resources" <<INI
+[tracker]
+type   = mcp
+url    = http://127.0.0.1:$UP_PORT/api/mcp?team=x
+auth   = bearer
+secret = cbox.warden.tracker
+[broken]
+type = mcp
+url  = http://127.0.0.1:$UP_PORT/mcp
+auth = bearer
+INI
+}
+
+@test "warden mcp: the session hands out a warden URL for the server; the token stays on the host" {
+  _mcp_setup
+  run _warden_env
+  env_out="$output"
+  base=$(sed -n 's/^WARDEN_URL=//p' <<<"$env_out")
+  mcp=$(sed -n 's/^WARDEN_MCP=//p' <<<"$env_out" | base64 -d)
+  url=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["tracker"])' "$mcp")
+  post=$(curl -s -H 'Authorization: Bearer fake' -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0"}' "$url")
+  other=$(curl -s -o /dev/null -w '%{http_code}' "$base/tracker/admin")
+  _warden_teardown
+  [ "$url" = "$base/tracker/api/mcp?team=x" ]
+  [[ "$post" == *'"path": "/api/mcp?team=x"'* ]]
+  [[ "$post" == *'"authorization": "Bearer sk-test-REDACTED-cbox.warden.tracker"'* ]]
+  [ "$other" = "403" ]
+  grep -q "'broken': secret (Keychain item name) is missing" "$WT/stderr"
+}
+
+@test "_cbox_generate_claude_json: warden MCP servers are added as http servers and managed" {
+  _cbox_generate_claude_json "mcpapp" "normal" '{"tracker": "http://192.168.64.1:47100/w/tok/tracker/mcp"}'
+  run python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mcpServers"]["tracker"])' "$CBOX_DATA_DIR/.claude-mcpapp.json"
+  [[ "$output" == *"'type': 'http'"*"'url': 'http://192.168.64.1:47100/w/tok/tracker/mcp'"* ]]
+  # Gone again once warden no longer grants it.
+  _cbox_generate_claude_json "mcpapp" "normal"
+  run python3 -c 'import json,sys; print(sorted(json.load(open(sys.argv[1])).get("mcpServers", {})))' "$CBOX_DATA_DIR/.claude-mcpapp.json"
+  [ "$output" = "[]" ]
+}
+
+@test "_cbox_generate_claude_json: warns that headers of a remote MCP server are readable in the container" {
+  echo '{"mcpServers": {"remote": {"type": "http", "url": "https://mcp.example.com/mcp", "headers": {"Authorization": "Bearer x"}}}}' > "$CBOX_MCP_CONFIG"
+  run _cbox_generate_claude_json "hdrapp" "normal"
+  [[ "$output" == *"'remote': its headers are readable inside the container"*"type = mcp"* ]]
+}

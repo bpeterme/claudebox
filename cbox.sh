@@ -245,7 +245,7 @@ _cbox_generate_claude_json() {
   local managed="$CBOX_DATA_DIR/.mcp-managed-$name.json"
 
   python3 -c "$(_cbox_mcp_py)" claude-json \
-    "$claude_json" "$name" "$CBOX_MCP_CONFIG" "$managed" "$_CBOX_MCP_RELAY" "$mode"
+    "$claude_json" "$name" "$CBOX_MCP_CONFIG" "$managed" "$_CBOX_MCP_RELAY" "$mode" "${3:-}"
 }
 
 _cbox_maybe_update() {
@@ -552,7 +552,7 @@ def is_legacy(cfg, relay):
 
 # --- claude-json ------------------------------------------------------------
 
-def cmd_claude_json(project_file, name, config, managed_file, relay, mode):
+def cmd_claude_json(project_file, name, config, managed_file, relay, mode, warden="{}"):
     try:
         with open(project_file) as f:
             project = json.load(f)
@@ -585,10 +585,21 @@ def cmd_claude_json(project_file, name, config, managed_file, relay, mode):
             elif k == "remote":
                 servers[sname] = cfg
                 managed_now.append(sname)
+                if cfg.get("headers"):
+                    print(f"⚠  MCP server '{sname}': its headers are readable inside the container. "
+                          "Keep a token on the host instead: a warden resource with type = mcp")
             elif k == "local-url":
                 print(f"⚠  MCP server '{sname}': URLs on the host's localhost are not reachable from the container — skipped")
             else:
                 print(f"⚠  MCP server '{sname}': needs a \"command\" or a \"url\" — skipped")
+
+        # Remote servers whose token warden keeps: the container gets a warden URL.
+        for sname, url in json.loads(warden or "{}").items():
+            if sname in managed_now:
+                print(f"ℹ  MCP server '{sname}' is both in {config} and a warden resource — using warden's")
+            else:
+                managed_now.append(sname)
+            servers[sname] = {"type": "http", "url": url}
 
     if servers or existing is not None:
         project["mcpServers"] = servers
@@ -1586,6 +1597,13 @@ TEMPLATE = """\
 # key          = ~/.ssh/id_ed25519       # private key on this Mac; needs id_ed25519.pub next to it
 # hosts        = github.com              # the key signs only for these hosts (space-separated)
 # availability = global                  # the container gets an ssh agent, never the key file
+#
+# [linear]
+# type         = mcp                     # a remote MCP server that takes an API key or token
+# url          = https://mcp.linear.app/mcp
+# auth         = bearer                  # bearer | basic | header:<Name> | query:<param>
+# secret       = cbox.warden.linear      # set with: cbox warden secret set linear
+# availability = global                  # added to the agent's MCP servers; the token stays here
 """
 
 
@@ -1674,7 +1692,7 @@ def load_resources(d, warn=None, extra=()):
         if problem:
             warn and warn(f"warden resource '{name}': {problem} — skipped")
             continue
-        out[name] = r
+        out[name] = as_route(r)
     return out
 
 
@@ -1686,8 +1704,10 @@ def validate(name, r):
     kind = r.get("type", "http")
     if kind == "ssh":
         return validate_ssh(r)
+    if kind == "mcp":
+        return validate_mcp(r)
     if kind != "http":
-        return f"type '{kind}' is unknown (known: http, ssh)"
+        return f"type '{kind}' is unknown (known: http, ssh, mcp)"
     up = urlsplit(r.get("upstream", ""))
     if up.scheme not in ("http", "https") or not up.netloc:
         return "upstream must be an http(s) URL"
@@ -1709,6 +1729,30 @@ def validate(name, r):
         if "=" not in pair or not ENV_KEY_RE.match(pair.split("=", 1)[0]):
             return f"env entry '{pair}' is not KEY=VALUE"
     return None
+
+
+def validate_mcp(r):
+    extra = set(r) - {"type", "url", "auth", "secret", "secret-account", "availability"}
+    if extra:
+        return f"{', '.join(sorted(extra))} is not used by type = mcp (it takes url, auth, secret, availability)"
+    up = urlsplit(r.get("url", ""))
+    if up.scheme not in ("http", "https") or not up.netloc:
+        return "url must be the MCP server's http(s) URL"
+    if not r.get("auth", "").startswith(("bearer", "basic", "header:", "query:")):
+        return "auth must be bearer, basic, header:<Name> or query:<param>"
+    if not r.get("secret"):
+        return "secret (Keychain item name) is missing"
+    return None
+
+
+def as_route(r):
+    """An mcp resource as the broker's http route: the host is the upstream,
+    and only the server's own endpoint is allowed."""
+    if r.get("type") != "mcp":
+        return r
+    up = urlsplit(r["url"])
+    path = up.path.rstrip("/") or ""
+    return dict(r, upstream=f"{up.scheme}://{up.netloc}", allow=f"* {path or '/'}, * {path}/*")
 
 
 def validate_ssh(r):
@@ -1790,6 +1834,8 @@ def describe(r):
     """One line for listings and the approval prompt."""
     if r.get("type") == "ssh":
         return f"ssh key {r['key']} for {', '.join(r['hosts'].split())} ({r.get('availability', 'global')})"
+    if r.get("type") == "mcp":
+        return f"MCP server {r['url']} ({r.get('availability', 'global')})"
     scope = f", bucket {r['bucket']}" if r.get("bucket") else ""
     scope += f", prefix {r['prefix']}" if r.get("prefix") else ""
     return f"{r['upstream']} ({r.get('availability', 'global')}{scope})"
@@ -1860,6 +1906,12 @@ def cmd_session(d, box, project, base_url, interactive):
                                          "resources": sorted(granted), "settings": granted}, indent=2) + "\n")
     url = f"{base_url}/w/{token}"
     print(f"WARDEN_URL={url}")
+    # The server's own path and query, behind the container's warden route.
+    mcp = {n: f"{url}/{n}" + resources[n]["url"].split(urlsplit(resources[n]["url"]).netloc, 1)[1]
+           for n in sorted(granted) if resources[n].get("type") == "mcp"}
+    if mcp:
+        # Not container env: cbox adds these to the agent's MCP servers.
+        print("WARDEN_MCP=" + base64.b64encode(json.dumps(mcp).encode()).decode())
     keys = [n for n in sorted(granted) if resources[n].get("type") == "ssh"]
     if keys and ssh_load(d, keys, resources, interactive == "1"):
         print(f"SSH_AUTH_SOCK={TUNNEL_DIR}/ssh-agent.sock")
@@ -2027,7 +2079,7 @@ class Broker(http.server.BaseHTTPRequestHandler):
         resources = load_resources(self.d)
         if name not in sess.get("resources", []) or name not in resources:
             return self.fail(403, f"resource '{name}' is not available to this container", who)
-        if resources[name].get("type", "http") != "http":
+        if resources[name].get("type", "http") not in ("http", "mcp"):
             return self.fail(404, f"'{name}' is not an http resource", who)
         r, problem = with_project(name, resources[name], sess.get("settings", {}).get(name, {}))
         if problem:
@@ -2447,6 +2499,9 @@ def cmd_list(d, project):
         if r.get("type") == "ssh":
             print(f"{'✔' if here else '·'} {n:<16} ssh {r['key']} → {', '.join(r['hosts'].split())}  [{note}]")
             continue
+        if r.get("type") == "mcp":
+            print(f"{'✔' if here else '·'} {n:<16} MCP {r['url']}  [{r['auth'].split(':')[0]}; {note}]")
+            continue
         scope = "".join(f", {k} {r[k]}" for k in ("bucket", "prefix") if r.get(k))
         print(f"{'✔' if here else '·'} {n:<16} {r['upstream']}  [{r['auth'].split(':')[0]}{scope}; {note}]")
     if names is None:
@@ -2474,6 +2529,13 @@ def cmd_test(d, name):
         sys.exit(1)
     if r.get("type") == "ssh":
         return ssh_test(d, name, r)
+    body = None
+    if r.get("type") == "mcp":
+        # An MCP initialize: answered by any working server that accepts the token.
+        r = dict(r, test="POST " + (urlsplit(r["url"]).path or "/"))
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "warden-test", "version": "1"}}}).encode()
     default = f"GET /{r['bucket']}?list-type=2&max-keys=1" if r.get("bucket") else "GET /"
     method, _, path = (r.get("test") or default).partition(" ")
     try:
@@ -2490,9 +2552,11 @@ def cmd_test(d, name):
     else:
         headers, query = apply_auth(r, {"User-Agent": "warden-test"}, [], secret)
         target = up.path.rstrip("/") + path.strip() + (("?" + urlencode(query)) if query else "")
+    if body:
+        headers.update({"Content-Type": "application/json", "Accept": "application/json, text/event-stream"})
     conn = (http.client.HTTPSConnection if up.scheme == "https" else http.client.HTTPConnection)(up.netloc, timeout=30)
     try:
-        conn.request(method.upper(), target, headers=headers)
+        conn.request(method.upper(), target, body=body, headers=headers)
         status = conn.getresponse().status
     except (OSError, http.client.HTTPException) as e:
         err(f"✖ {name}: {up.netloc} unreachable ({e.__class__.__name__})")
@@ -3384,13 +3448,8 @@ _cbox_enter() {
     _cbox_audio_start && _audio=1
   fi
 
-  if [[ "$agent_bin" == "claude" ]]; then
-    [[ "$mode" != "safe" ]] && _cbox_mcp_relay_start "$name"
-    _cbox_generate_claude_json "$name" "$mode"
-  fi
-
   local _exec_args=(-it -w "/Workspace/$name")
-  local _run="$command" _g _tunnel=$_audio
+  local _run="$command" _g _tunnel=$_audio _warden_mcp=""
   if (( _audio )); then
     # Through the tunnel, PulseAudio sees a local client and would offer shared
     # memory, which cannot cross it: the client has to turn it off.
@@ -3408,9 +3467,16 @@ _cbox_enter() {
         WARDEN_AWS_CONFIG=*)
           _run="mkdir -p ~/.aws && print -rn -- '${_w_env#*=}' | base64 -d >| ~/.aws/warden-config; $_run" ;;
         SSH_AUTH_SOCK=*) _tunnel=1; _exec_args+=(-e "$_w_env") ;;
+        # Remote MCP servers behind warden: for the agent's config, not the env.
+        WARDEN_MCP=*) _warden_mcp=$(printf '%s' "${_w_env#*=}" | base64 -d 2>/dev/null) || _warden_mcp="" ;;
         ?*) _exec_args+=(-e "$_w_env") ;;
       esac
     done < <(_cbox_warden_start "$name")
+  fi
+
+  if [[ "$agent_bin" == "claude" ]]; then
+    [[ "$mode" != "safe" ]] && _cbox_mcp_relay_start "$name"
+    _cbox_generate_claude_json "$name" "$mode" "$_warden_mcp"
   fi
 
   (( _tunnel )) && _cbox_tunnel_start "$name"

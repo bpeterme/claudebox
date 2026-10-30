@@ -184,8 +184,11 @@ Each connection starts a fresh server process, just like a local stdio server.
 |--------|-------|
 | Needs macOS (apps, Keychain, local hardware) | `~/.config/claudebox/mcp.json` (host) |
 | Works on files or repositories (filesystem, git, …) | Inside the container: the project's `.mcp.json` or `claude mcp add` — a host server would see host paths, not `/Workspace` |
-| Remote (`https://…`) | Either; entries with a `url` in `mcp.json` are passed through as-is |
+| Remote (`https://…`) without a token | `mcp.json` (passed through as-is) or inside the container |
+| Remote with an API key or token | A warden resource with `type = mcp` (see [Credentials](#credentials-warden)) — the token stays on the host |
 
+A remote entry in `mcp.json` is copied into the container as-is, `headers`
+included — anything in them is readable there, and cbox warns about it.
 URLs on the host's `localhost` are not supported and are skipped with a warning.
 Host MCP servers are not available in safe mode.
 
@@ -291,6 +294,21 @@ hosts = github.com            # the key signs only for these hosts
   (`cbox warden log`).
 - Once any ssh resource exists, `CBOX_SSH_DIR` mounts only `config`,
   `known_hosts` and `*.pub` files — no private keys (from the next `cbox reset`).
+
+**Remote MCP servers** that take an API key (`type = mcp`) are added to Claude's
+MCP servers in the container with a warden URL; the broker adds the key and
+passes only the server's own endpoint:
+
+```ini
+[linear]
+type   = mcp
+url    = https://mcp.linear.app/mcp
+auth   = bearer                  # bearer | basic | header:<Name> | query:<param>
+secret = cbox.warden.linear      # cbox warden secret set linear
+```
+
+`cbox warden test linear` sends an MCP `initialize` from the host. Servers that
+only offer an OAuth login (no API key) are not supported through warden.
 
 Not available in safe mode.
 

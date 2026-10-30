@@ -1211,6 +1211,7 @@ AUTH_SCHEMES = ("bearer", "basic", "header:", "query:", "sigv4")
 HOP = {"connection", "keep-alive", "proxy-connection", "proxy-authorization", "te", "trailer",
        "transfer-encoding", "upgrade", "host", "expect"}
 CHUNK = 1 << 16
+PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 PREFIX_RE = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$")
 PROJECT_KEYS = {"prefix"}  # settings a project's .warden may add to a resource; approval covers them
 AWS_CONFIG = "/home/claude/.aws/warden-config"  # container path; written by cbox at session start
@@ -1348,8 +1349,8 @@ def validate(name, r):
         return "policy = dvc needs auth = sigv4 and a bucket"
     if r.get("prefix") and not PREFIX_RE.match(r["prefix"]):
         return "prefix may only contain letters, digits, '_', '-', '.' and '/'"
-    if r.get("profile") and not NAME_RE.match(r["profile"]):
-        return "profile may only contain a-z, 0-9, '_' and '-'"
+    if r.get("profile") and not PROFILE_RE.match(r["profile"]):
+        return "profile may only contain letters, digits, '_', '-' and '.'"
     for pair in r.get("env", "").split():
         if "=" not in pair or not ENV_KEY_RE.match(pair.split("=", 1)[0]):
             return f"env entry '{pair}' is not KEY=VALUE"
@@ -1815,7 +1816,52 @@ def cmd_template(d):
     print(path)
 
 
+def cmd_ensure(d, name):
+    """Add resource `name` (settings as INI lines on stdin) unless it already
+    exists. For companion tools on the host (flux); never overwrites."""
+    hit = exposure(d)
+    if hit:
+        err("✖ " + exposure_message(hit))
+        sys.exit(1)
+    path = os.path.realpath(paths(d)["resources"])
+    cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#",))
+    try:
+        cp.read(path)
+    except configparser.Error as e:
+        err(f"✖ warden resources file is not valid: {e}")
+        sys.exit(1)
+    if cp.has_section(name):
+        print(f"✔ warden resource '{name}' is already configured")
+        return
+    body = sys.stdin.read().strip()
+    new = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#",))
+    try:
+        new.read_string(f"[{name}]\n{body}\n")
+    except configparser.Error as e:
+        err(f"✖ resource '{name}' is not valid INI: {e}")
+        sys.exit(1)
+    problem = validate(name, dict(new[name]))
+    if problem:
+        err(f"✖ resource '{name}': {problem}")
+        sys.exit(1)
+    current = open(path).read() if os.path.exists(path) else TEMPLATE
+    write_private(path, current.rstrip("\n") + f"\n\n[{name}]\n{body}\n")
+    print(f"✔ added warden resource '{name}' to {paths(d)['resources']}")
+
+
+def cmd_exposed(d, path):
+    """Exit 0 (printing the mount) when path is visible inside a container."""
+    real = os.path.realpath(os.path.expanduser(path))
+    for m in sorted(container_mounts(d)):
+        if real == m or real.startswith(m.rstrip("/") + "/"):
+            print(m)
+            sys.exit(0)
+    sys.exit(1)
+
+
 COMMANDS = {
+    "ensure": lambda a: cmd_ensure(*a),
+    "exposed": lambda a: cmd_exposed(*a),
     "session": lambda a: cmd_session(*a),
     "end": lambda a: cmd_end(*a),
     "serve": lambda a: cmd_serve(*a),
@@ -1972,6 +2018,13 @@ _cbox_warden_cmd() {
       _cbox_warden_python test "$CBOX_WARDEN_DIR" "$2"
       ;;
     log) tail -n "${2:-20}" "$CBOX_WARDEN_DIR/broker.log" 2>/dev/null || echo "No broker log yet." ;;
+    # Internal, for companion tools on the host (flux):
+    #   _ensure <name>  add a resource (INI lines on stdin) unless it exists
+    #   _exposed <path> exit 0 when the path is visible inside a container
+    _ensure|_exposed)
+      [[ -n "${2:-}" ]] || { echo "Usage: cbox warden $1 <name|path>"; return 1; }
+      _cbox_warden_python "${1#_}" "$CBOX_WARDEN_DIR" "$2"
+      ;;
     *)
       echo "Unknown warden command: $1"
       echo "Usage: cbox warden [list|edit|secret set <resource>|approve|test <resource>|log]"

@@ -937,6 +937,50 @@ print(h['authorization'].split('Signature=')[1])"
   [[ "$inside" == *AWS_CONFIG_FILE* ]]
 }
 
+@test "cbox warden _ensure: adds a resource once and never overwrites it" {
+  _warden_setup
+  rm -f "$CBOX_WARDEN_DIR/resources"
+  body='type = http
+upstream = https://storage.example
+auth = sigv4
+key-id = t.id
+secret = t.secret
+policy = dvc
+bucket = bkt
+availability = project
+profile = flux-dvc-bkt.v1'
+  first=$(_cbox_warden_cmd _ensure dvc-bkt <<<"$body")
+  again=$(_cbox_warden_cmd _ensure dvc-bkt <<<"${body/storage.example/other.example}")
+  list=$(_cbox_warden_python list "$CBOX_WARDEN_DIR" "$PWD")
+  _warden_teardown
+  [[ "$first" == *"added warden resource 'dvc-bkt'"* ]]
+  [[ "$again" == *"already configured"* ]]
+  [ "$(grep -c '^\[dvc-bkt\]' "$CBOX_WARDEN_DIR/resources")" -eq 1 ]
+  grep -q 'storage.example' "$CBOX_WARDEN_DIR/resources"
+  ! grep -q 'other.example' "$CBOX_WARDEN_DIR/resources" || false
+  grep -q '^# warden resources' "$CBOX_WARDEN_DIR/resources"
+  [[ "$list" == *"dvc-bkt"* ]]
+}
+
+@test "cbox warden _ensure: refuses an invalid resource" {
+  _warden_setup
+  run _cbox_warden_cmd _ensure broken <<<"upstream = https://x.example
+auth = sigv4"
+  _warden_teardown
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"resource 'broken'"* ]]
+  ! grep -q '^\[broken\]' "$CBOX_WARDEN_DIR/resources" || false
+}
+
+@test "cbox warden _exposed: knows which host paths a container can see" {
+  mkdir -p "$CBOX_HOST_CONFIG_DIR/.aws" "$BATS_TMPDIR/private-aws"
+  run _cbox_warden_cmd _exposed "$CBOX_HOST_CONFIG_DIR/.aws/config"
+  inside=$status
+  run _cbox_warden_cmd _exposed "$BATS_TMPDIR/private-aws/config"
+  [ "$inside" -eq 0 ]
+  [ "$status" -eq 1 ]
+}
+
 @test "warden sigv4: a resource without key-id is reported and skipped" {
   _warden_setup
   _warden_add_store

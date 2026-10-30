@@ -52,9 +52,11 @@ MCP servers on the host (~/.config/claudebox/mcp.json):
 Credentials without exposing them (warden):
   cbox warden           List resources and what this project gets
   cbox warden edit      Define resources (APIs the container may use)
-  cbox warden secret set <resource>   Store a secret in the Keychain
+  cbox warden secret set <resource>
+                        Store a secret in the Keychain
   cbox warden approve   Approve this project's .warden file
-  cbox warden test <resource>         Check a resource from the host
+  cbox warden test <resource>
+                        Check a resource from the host
   cbox warden log       Show recent broker requests
 
 Maintenance:

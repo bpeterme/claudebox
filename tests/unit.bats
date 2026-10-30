@@ -1018,64 +1018,32 @@ auth = sigv4"
 # _cbox_audio_ensure_config
 # ---------------------------------------------------------------------------
 
-@test "_cbox_audio_ensure_config: creates default.pa with TCP module when absent" {
+@test "_cbox_audio_ensure_config: leaves PulseAudio's own default.pa alone" {
   export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config"
+  rm -rf "$XDG_CONFIG_HOME"
   _cbox_audio_ensure_config
-  run grep "module-native-protocol-tcp" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$status" -eq 0 ]
-  run grep "module-coreaudio" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$status" -eq 0 ]
+  [ ! -e "$XDG_CONFIG_HOME/pulse/default.pa" ]
 }
 
-@test "_cbox_audio_ensure_config: uses HOMEBREW_PREFIX over global brew paths" {
-  export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config-hbp"
-  local fake_brew="$BATS_TMPDIR/fakebrew"
-  mkdir -p "$fake_brew/etc/pulse"
-  echo "# custom brew default.pa" > "$fake_brew/etc/pulse/default.pa"
-  # Also create a decoy at the standard path to confirm it is not used
-  mkdir -p "$BATS_TMPDIR/opt-homebrew/etc/pulse"
-  echo "# global brew default.pa" > "$BATS_TMPDIR/opt-homebrew/etc/pulse/default.pa"
-  HOMEBREW_PREFIX="$fake_brew" _cbox_audio_ensure_config
-  # Generated file must .include the custom brew path
-  run grep "$fake_brew" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$status" -eq 0 ]
-  # The global decoy path must not be referenced
-  run grep "opt-homebrew" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$status" -ne 0 ]
-}
-
-@test "_cbox_audio_ensure_config: appends TCP module to existing default.pa without overwriting" {
+@test "_cbox_audio_ensure_config: removes the network listener older cbox versions added" {
   export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config2"
   mkdir -p "$XDG_CONFIG_HOME/pulse"
-  echo "existing-content" > "$XDG_CONFIG_HOME/pulse/default.pa"
+  printf '%s\n' ".include /opt/homebrew/etc/pulse/default.pa" "$_CBOX_PULSE_TCP_LINE" "load-module module-coreaudio-detect" \
+    > "$XDG_CONFIG_HOME/pulse/default.pa"
   _cbox_audio_ensure_config
-  run grep "existing-content" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$status" -eq 0 ]
-  run grep "module-native-protocol-tcp" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$status" -eq 0 ]
-  run grep "module-coreaudio" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$status" -eq 0 ]
+  run cat "$XDG_CONFIG_HOME/pulse/default.pa"
+  [[ "$output" != *"module-native-protocol-tcp"* ]]
+  [[ "$output" == *".include /opt/homebrew/etc/pulse/default.pa"* ]]
+  [[ "$output" == *"module-coreaudio-detect"* ]]
 }
 
-@test "_cbox_audio_ensure_config: does not duplicate TCP module if already present" {
+@test "_cbox_audio_ensure_config: keeps a TCP listener the user configured" {
   export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config3"
   mkdir -p "$XDG_CONFIG_HOME/pulse"
-  echo "load-module module-native-protocol-tcp" > "$XDG_CONFIG_HOME/pulse/default.pa"
+  echo "load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1" > "$XDG_CONFIG_HOME/pulse/default.pa"
   _cbox_audio_ensure_config
   run grep -c "module-native-protocol-tcp" "$XDG_CONFIG_HOME/pulse/default.pa"
   [ "$output" -eq 1 ]
-  run grep "module-coreaudio" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$status" -eq 0 ]
-}
-
-@test "_cbox_audio_ensure_config: does not add coreaudio if .include already present" {
-  export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config5"
-  mkdir -p "$XDG_CONFIG_HOME/pulse"
-  printf ".include /opt/homebrew/etc/pulse/default.pa\nload-module module-native-protocol-tcp\n" \
-    > "$XDG_CONFIG_HOME/pulse/default.pa"
-  _cbox_audio_ensure_config
-  run grep -c "module-coreaudio" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$output" -eq 0 ]
 }
 
 @test "_cbox_audio_ensure_config: adds exit-idle-time to daemon.conf" {
@@ -1085,22 +1053,25 @@ auth = sigv4"
   [ "$status" -eq 0 ]
 }
 
-# ---------------------------------------------------------------------------
-# _cbox_audio_pulse_server
-# ---------------------------------------------------------------------------
-
-@test "_cbox_audio_pulse_server: returns apple gateway for apple runtime" {
-  _CBOX_RUNTIME="apple"
-  run _cbox_audio_pulse_server
-  [ "$status" -eq 0 ]
-  [ "$output" = "tcp:192.168.64.1:4713" ]
+@test "_cbox_audio_stop: keeps PulseAudio while any cbox session is open" {
+  local dir; dir=$(_cbox_audio_socket); dir="${dir%/*}"
+  mkdir -p "$dir"; : > "$dir/started-by-cbox"
+  _CBOX_SESSION_DIR="$BATS_TMPDIR/sessions-audio"; mkdir -p "$_CBOX_SESSION_DIR"
+  : > "$_CBOX_SESSION_DIR/.cbox-active-other-$$"
+  pulseaudio() { echo "killed"; }
+  run _cbox_audio_stop
+  [[ "$output" != *killed* ]]
+  rm -f "$_CBOX_SESSION_DIR/.cbox-active-other-$$"
+  run _cbox_audio_stop
+  [[ "$output" == *killed* ]]
+  [ ! -e "$dir/started-by-cbox" ]
 }
 
-@test "_cbox_audio_pulse_server: returns docker hostname for docker runtime" {
-  _CBOX_RUNTIME="docker"
-  run _cbox_audio_pulse_server
-  [ "$status" -eq 0 ]
-  [ "$output" = "tcp:host.docker.internal:4713" ]
+@test "_cbox_audio_stop: never stops a PulseAudio cbox did not start" {
+  local dir; dir=$(_cbox_audio_socket); rm -f "${dir%/*}/started-by-cbox"
+  pulseaudio() { echo "killed"; }
+  run _cbox_audio_stop
+  [ -z "$output" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -2028,4 +1999,249 @@ _guard_repo() {
   cdot() { echo "dir=$CDOT_CLAUDE_DIR args=$*"; }
   run _cbox_cdot _pull
   [ "$output" = "dir=$CBOX_CLAUDE_DIR args=_pull" ]
+}
+
+# ---------------------------------------------------------------------------
+# tunnel and warden ssh
+# ---------------------------------------------------------------------------
+
+# A public key file with a made-up key (byte $2 repeated); no private key exists.
+_fake_pub() {
+  python3 -c 'import base64, struct, sys
+s = lambda b: struct.pack(">I", len(b)) + b
+print("ssh-ed25519 " + base64.b64encode(s(b"ssh-ed25519") + s(bytes([int(sys.argv[1])]) * 32)).decode() + " me@mac")' "$2" > "$1"
+}
+
+# Stand-in agent on $1: lists keys 1 and 2, signs anything, accepts extensions,
+# and records every request type in $2.
+_fake_agent() {
+  python3 -c '
+import os, socket, struct, sys, threading
+s = lambda b: struct.pack(">I", len(b)) + b
+key = lambda n: s(b"ssh-ed25519") + s(bytes([n]) * 32)
+def serve(c):
+    while True:
+        h = c.recv(4)
+        if len(h) < 4: return
+        m = c.recv(struct.unpack(">I", h)[0])
+        open(sys.argv[2], "a").write(f"{m[0]}\n")
+        if m[0] == 11: r = bytes([12]) + struct.pack(">I", 2) + s(key(1)) + s(b"/Users/me/.ssh/one") + s(key(2)) + s(b"/Users/me/.ssh/two")
+        elif m[0] == 13: r = bytes([14]) + s(b"signature")
+        else: r = bytes([6])
+        c.sendall(struct.pack(">I", len(r)) + r)
+srv = socket.socket(socket.AF_UNIX); srv.bind(sys.argv[1]); srv.listen(8)
+while True: threading.Thread(target=serve, args=(srv.accept()[0],), daemon=True).start()
+' "$1" "$2" </dev/null >/dev/null 2>&1 &
+  echo $!
+}
+
+_ssh_setup() {
+  _warden_setup
+  TT="$BATS_TMPDIR/tun"; rm -rf "$TT"; mkdir -p "$TT/keys"
+  _fake_pub "$TT/keys/one.pub" 1
+  _fake_pub "$TT/keys/two.pub" 2
+  cat > "$CBOX_WARDEN_DIR/resources" <<EOF
+[gh]
+type = ssh
+key = $TT/keys/one
+hosts = github.com
+EOF
+}
+
+_ssh_py() {  # runs python with the warden functions loaded
+  python3 -c "$(_cbox_warden_py | sed '/^if __name__/,$d')
+$1" "${@:2}"
+}
+
+@test "warden ssh: a valid ssh resource is listed; broken ones are skipped with a reason" {
+  _ssh_setup
+  cat >> "$CBOX_WARDEN_DIR/resources" <<EOF
+[nopub]
+type = ssh
+key = $TT/keys/missing
+hosts = github.com
+[nohosts]
+type = ssh
+key = $TT/keys/two
+[twin]
+type = ssh
+key = $TT/keys/one
+hosts = gitlab.com
+[mixed]
+type = ssh
+key = $TT/keys/two
+hosts = github.com
+upstream = https://example.com
+EOF
+  run _cbox_warden_python list "$CBOX_WARDEN_DIR" "$PWD"
+  _warden_teardown
+  [[ "$output" == *"gh"*"ssh $TT/keys/one → github.com"* ]]
+  [[ "$output" == *"'nopub': $TT/keys/missing.pub is missing"* ]]
+  [[ "$output" == *"'nohosts': hosts is missing"* ]]
+  [[ "$output" == *"'twin': its key is already used by 'gh'"* ]]
+  [[ "$output" == *"'mixed': upstream is not used by type = ssh"* ]]
+}
+
+@test "warden ssh: the filter lists and signs only granted keys and refuses key management" {
+  _ssh_setup
+  agent_pid=$(_fake_agent "$TT/agent.sock" "$TT/agent.log")
+  for _ in $(seq 50); do [ -S "$TT/agent.sock" ] && break; sleep 0.1; done
+  run _ssh_py '
+s = lambda b: struct.pack(">I", len(b)) + b
+key = lambda n: s(b"ssh-ed25519") + s(bytes([n]) * 32)
+ours, theirs = socket.socketpair()
+agent = socket.socket(socket.AF_UNIX); agent.connect(sys.argv[2])
+threading.Thread(target=ssh_filter, args=(sys.argv[1], "box", theirs, agent, {key(1): "gh"}), daemon=True).start()
+def ask(m):
+    ours.sendall(struct.pack(">I", len(m)) + m)
+    return ssh_recv(ours)
+ids = ask(bytes([11]))
+print("list", struct.unpack(">I", ids[1:5])[0], key(1) in ids, key(2) in ids, b"warden:gh" in ids, b"/Users" in ids)
+print("sign-granted", ask(bytes([13]) + s(key(1)) + s(b"data") + struct.pack(">I", 0))[0])
+print("sign-other", ask(bytes([13]) + s(key(2)) + s(b"data") + struct.pack(">I", 0))[0])
+print("add", ask(bytes([17]) + s(b"ssh-ed25519"))[0])
+print("lock", ask(bytes([22]) + s(b"pw"))[0])
+print("bind", ask(bytes([27]) + s(b"session-bind@openssh.com"))[0])
+print("other-ext", ask(bytes([27]) + s(b"something@else"))[0])
+' "$CBOX_WARDEN_DIR" "$TT/agent.sock"
+  kill "$agent_pid" 2>/dev/null || true
+  reached=$(sort -u "$TT/agent.log" | tr '\n' ' ')
+  _warden_teardown
+  [[ "$output" == *"list 1 True False True False"* ]]
+  [[ "$output" == *"sign-granted 14"* ]]
+  [[ "$output" == *"sign-other 5"* ]]
+  [[ "$output" == *"add 5"* ]]
+  [[ "$output" == *"lock 5"* ]]
+  [[ "$output" == *"bind 6"* ]]
+  [[ "$output" == *"other-ext 5"* ]]
+  # Only list, sign (granted key) and session-bind ever reached the agent.
+  [ "$reached" = "11 13 27 " ]
+  grep -q "box ssh: refused agent request type 17" "$CBOX_WARDEN_DIR/broker.log"
+}
+
+# Stub OpenSSH: ssh-add -L prints $TT/loaded; ssh-add <args> appends the key's
+# .pub to it and records the args; ssh-agent pretends to start.
+_ssh_stubs() {
+  mkdir -p "$TT/bin"
+  cat > "$TT/bin/ssh-add" <<EOF
+#!/bin/sh
+if [ "\$1" = "-L" ]; then [ -s "$TT/loaded" ] || exit 1; cat "$TT/loaded"; exit 0; fi
+echo "\$*" >> "$TT/ssh-add.args"
+for last; do :; done
+cat "\$last.pub" >> "$TT/loaded"
+EOF
+  printf '#!/bin/sh\necho "SSH_AGENT_PID=999999; export SSH_AGENT_PID;"\n' > "$TT/bin/ssh-agent"
+  chmod +x "$TT/bin/ssh-add" "$TT/bin/ssh-agent"
+  export PATH="$TT/bin:$PATH"
+}
+
+@test "warden ssh: session sets SSH_AUTH_SOCK only once the key is unlocked" {
+  _ssh_setup
+  _ssh_stubs
+  : > "$TT/loaded"
+  run _warden_env
+  first="$output"
+  # Unlocking happens with a terminal: ssh-add -h <host> <key>
+  _ssh_py 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1]), True)' "$CBOX_WARDEN_DIR" 2>/dev/null
+  run _warden_env
+  second="$output"
+  _warden_teardown
+  [[ "$first" != *SSH_AUTH_SOCK* ]]
+  grep -q "not unlocked yet" "$WT/stderr" || [[ "$first" != *SSH_AUTH_SOCK* ]]
+  [ "$(cat "$TT/ssh-add.args")" = "-h github.com $TT/keys/one" ]
+  [[ "$second" == *"SSH_AUTH_SOCK=/tmp/cbox-tunnel/ssh-agent.sock"* ]]
+}
+
+@test "warden ssh: the broker does not treat an ssh resource as an http route" {
+  _ssh_setup
+  _ssh_stubs
+  _fake_pub "$TT/loaded" 1
+  url=$(_warden_url)
+  run curl -s "$url/gh/anything"
+  _warden_teardown
+  [[ "$output" == *"'gh' is not an http resource"* ]]
+}
+
+@test "tunnel: carries many connections at once to the host, and grants decide per channel" {
+  _ssh_setup
+  _ssh_stubs
+  _fake_pub "$TT/loaded" 1
+  _warden_env >/dev/null   # session file for wbox: gh granted
+  mkdir -p "$CBOX_WARDEN_DIR/ssh"
+  agent_pid=$(_fake_agent "$CBOX_WARDEN_DIR/ssh/agent.sock" "$TT/agent.log")
+  # Echo server standing in for PulseAudio's socket.
+  python3 -c '
+import socket, sys, threading
+def echo(c):
+    while (b := c.recv(65536)): c.sendall(b)
+    c.close()
+srv = socket.socket(socket.AF_UNIX); srv.bind(sys.argv[1]); srv.listen(16)
+while True: threading.Thread(target=echo, args=(srv.accept()[0],), daemon=True).start()
+' "$TT/pulse" </dev/null >/dev/null 2>&1 &
+  echo_pid=$!
+  # Fake runtime: `rt exec -i box cmd...` runs cmd here.
+  printf '#!/bin/sh\nshift 3\nexec "$@"\n' > "$TT/rt"; chmod +x "$TT/rt"
+  _cbox_tunnel_py > "$TT/cbox-tunnel"; chmod +x "$TT/cbox-tunnel"
+  export CBOX_TUNNEL_DIR="$TT/sock"
+  _cbox_warden_env
+  env "${_CBOX_WARDEN_ENV[@]}" CBOX_TUNNEL_DIR="$TT/sock" python3 -c "$(_cbox_warden_py)" tunnel \
+    "$CBOX_WARDEN_DIR" "$TT/rt" wbox "$TT/cbox-tunnel" "$TT/tunnel.pid" "$TT/pulse" </dev/null >"$TT/tunnel.log" 2>&1 &
+  for _ in $(seq 100); do [ -S "$TT/sock/pulse.sock" ] && [ -S "$TT/sock/ssh-agent.sock" ] && break; sleep 0.1; done
+  run python3 -c '
+import os, socket, struct, sys, threading
+d = sys.argv[1]
+results = {}
+def one(i):
+    data = os.urandom(200000 + i)
+    c = socket.socket(socket.AF_UNIX); c.connect(d + "/pulse.sock")
+    threading.Thread(target=lambda: (c.sendall(data), c.shutdown(socket.SHUT_WR)), daemon=True).start()
+    got = b""
+    while (b := c.recv(65536)): got += b
+    results[i] = got == data
+ts = [threading.Thread(target=one, args=(i,)) for i in range(6)]
+[t.start() for t in ts]; [t.join(30) for t in ts]
+print("echo", sum(results.values()), "of 6")
+c = socket.socket(socket.AF_UNIX); c.connect(d + "/ssh-agent.sock")
+c.sendall(struct.pack(">I", 1) + bytes([11]))
+h = c.recv(4); ans = c.recv(struct.unpack(">I", h)[0])
+print("ssh keys", struct.unpack(">I", ans[1:5])[0], b"warden:gh" in ans)
+' "$TT/sock"
+  echo_out="$output"
+  # Without the grant, the ssh channel closes at once.
+  rm -f "$CBOX_WARDEN_DIR/sessions/wbox.json"
+  run python3 -c '
+import socket, struct, sys
+c = socket.socket(socket.AF_UNIX); c.settimeout(10); c.connect(sys.argv[1] + "/ssh-agent.sock")
+c.sendall(struct.pack(">I", 1) + bytes([11]))
+print("closed" if c.recv(4) == b"" else "answered")
+' "$TT/sock"
+  nogrant="$output"
+  kill -TERM -- "-$(cat "$TT/tunnel.pid")" 2>/dev/null || true
+  kill "$agent_pid" "$echo_pid" 2>/dev/null || true
+  _warden_teardown
+  [ "$echo_out" = "echo 6 of 6
+ssh keys 1 True" ] || { cat "$TT/tunnel.log"; false; }
+  [ "$nogrant" = "closed" ]
+}
+
+@test "_cbox_create: with a warden ssh resource only public SSH files are mounted" {
+  local capture="$BATS_TMPDIR/create-ssh-args"
+  cd "$BATS_TMPDIR"
+  export CBOX_SSH_DIR="$BATS_TMPDIR/dot-ssh"
+  mkdir -p "$CBOX_SSH_DIR"
+  : > "$CBOX_SSH_DIR/known_hosts"; : > "$CBOX_SSH_DIR/config"; : > "$CBOX_SSH_DIR/work"; : > "$CBOX_SSH_DIR/work.pub"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  mkdir -p "$CBOX_WARDEN_DIR"; rm -f "$CBOX_WARDEN_DIR/resources"
+  rm -f "$capture"; _cbox_create "cbox-unit-ssh" "normal"
+  before=$(cat "$capture")
+  printf '[gh]\ntype = ssh   # agent only\nkey = x\nhosts = github.com\n' > "$CBOX_WARDEN_DIR/resources"
+  rm -f "$capture"; _cbox_create "cbox-unit-ssh" "normal"
+  after=$(cat "$capture")
+  rm -f "$CBOX_WARDEN_DIR/resources"
+  [[ "$before" == *"$CBOX_SSH_DIR/work:/home/claude/.ssh/work:ro"* ]]
+  [[ "$after" != *"$CBOX_SSH_DIR/work:/home/claude/.ssh/work:ro"* ]]
+  [[ "$after" == *"$CBOX_SSH_DIR/work.pub:/home/claude/.ssh/work.pub:ro"* ]]
+  [[ "$after" == *"$CBOX_SSH_DIR/config:/home/claude/.ssh/config:ro"* ]]
+  [[ "$after" == *"$CBOX_SSH_DIR/known_hosts:/home/claude/.ssh/known_hosts"* ]]
 }

@@ -51,7 +51,7 @@ MCP servers on the host (~/.config/claudebox/mcp.json):
 
 Credentials without exposing them (warden):
   cbox warden           List resources and what this project gets
-  cbox warden edit      Define resources (APIs the container may use)
+  cbox warden edit      Define resources (APIs, storage, ssh keys the container may use)
   cbox warden secret set <resource>
                         Store a secret in the Keychain
   cbox warden approve   Approve this project's .warden file
@@ -112,6 +112,10 @@ _CBOX_MCP_RELAY="/home/claude/.local/bin/cbox-mcp-relay"
 _CBOX_MCP_SLOTS=2
 # Below Claude Code's 30s MCP connect timeout, so the hint lands before it gives up
 _CBOX_MCP_HINT_SECONDS=25
+# Container side of the tunnel (see "tunnel" below) and its socket folder;
+# the warden python has the same folder as TUNNEL_DIR.
+_CBOX_TUNNEL="/home/claude/.local/bin/cbox-tunnel"
+_CBOX_TUNNEL_DIR="/tmp/cbox-tunnel"
 # warden: host-side credential broker (see "warden" below). Its directory holds
 # resource definitions, approvals and session tokens — host only, never mounted.
 CBOX_WARDEN_DIR="${CBOX_WARDEN_DIR:-$CBOX_DATA_DIR/warden}"
@@ -366,7 +370,14 @@ _cbox_container_has_sessions() {
 # audio (voice mode)
 # ---------------------------------------------------------
 
-_CBOX_AUDIO_STARTED=0
+# Older cbox versions loaded this listener: anyone on the local network could
+# use the microphone. The container now reaches PulseAudio through the tunnel.
+_CBOX_PULSE_TCP_LINE="load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1;10.0.0.0/8;172.16.0.0/12;192.168.0.0/16"
+
+# PulseAudio's socket for containers, in a folder only this user can open.
+_cbox_audio_socket() {
+  echo "$CBOX_DATA_DIR/pulse/native"
+}
 
 _cbox_audio_ensure_config() {
   local pulse_conf_dir="${XDG_CONFIG_HOME:-$HOME/.config}/pulse"
@@ -375,34 +386,9 @@ _cbox_audio_ensure_config() {
 
   mkdir -p "$pulse_conf_dir"
 
-  if [[ ! -f "$default_pa" ]]; then
-    local _brew_pa="" _candidate _brew_prefix
-    if [[ -n "${HOMEBREW_PREFIX:-}" ]]; then
-      # Explicit custom Homebrew install — trust it and don't look elsewhere
-      [[ -f "$HOMEBREW_PREFIX/etc/pulse/default.pa" ]] && _brew_pa="$HOMEBREW_PREFIX/etc/pulse/default.pa"
-    else
-      _brew_prefix=$(brew --prefix 2>/dev/null) || _brew_prefix=""
-      for _candidate in \
-          "${_brew_prefix:+$_brew_prefix/etc/pulse/default.pa}" \
-          /opt/homebrew/etc/pulse/default.pa \
-          /usr/local/etc/pulse/default.pa; do
-        [[ -n "$_candidate" && -f "$_candidate" ]] && _brew_pa="$_candidate" && break
-      done
-    fi
-    { [[ -n "$_brew_pa" ]] && echo ".include $_brew_pa"; \
-      echo "load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1;10.0.0.0/8;172.16.0.0/12;192.168.0.0/16"; \
-    } > "$default_pa"
-    unset _brew_pa _candidate _brew_prefix
-  else
-    if ! grep -q "module-native-protocol-tcp" "$default_pa"; then
-      echo "load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1;10.0.0.0/8;172.16.0.0/12;192.168.0.0/16" >> "$default_pa"
-    fi
-  fi
-
-  # Ensure CoreAudio device detection is loaded — required on macOS.
-  # A .include of brew's default.pa already covers this; only add explicitly if absent.
-  if ! grep -qE "(\.include|module-coreaudio)" "$default_pa"; then
-    echo "load-module module-coreaudio-detect" >> "$default_pa"
+  if [[ -f "$default_pa" ]] && grep -qxF "$_CBOX_PULSE_TCP_LINE" "$default_pa"; then
+    grep -vxF "$_CBOX_PULSE_TCP_LINE" "$default_pa" > "$default_pa.cbox-tmp" || true
+    mv "$default_pa.cbox-tmp" "$default_pa"
   fi
 
   if ! grep -q "exit-idle-time" "$daemon_conf" 2>/dev/null; then
@@ -410,52 +396,67 @@ _cbox_audio_ensure_config() {
   fi
 }
 
-_cbox_audio_pulse_server() {
-  if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
-    echo "tcp:192.168.64.1:4713"
-  else
-    echo "tcp:host.docker.internal:4713"
-  fi
-}
-
 _cbox_audio_start() {
-  _CBOX_AUDIO_STARTED=0
-
   command -v pulseaudio >/dev/null 2>&1 || {
     echo "⚠  CBOX_AUDIO set but PulseAudio not found — install: brew install pulseaudio"
     return 1
   }
 
   _cbox_audio_ensure_config
+  local sock dir _i m
+  sock=$(_cbox_audio_socket)
+  dir="${sock%/*}"
 
-  if ! lsof -i :4713 >/dev/null 2>&1; then
+  # `pulseaudio --check`, not pactl: pactl would autospawn a daemon itself.
+  if ! pulseaudio --check 2>/dev/null; then
     echo "Starting PulseAudio for voice mode..."
+    mkdir -p "$dir"
     nohup pulseaudio --daemonize=no > "${TMPDIR:-/tmp}/cbox-pulse.log" 2>&1 &
-    disown
-    _CBOX_AUDIO_STARTED=1
-
-    local _i
+    disown 2>/dev/null || true
+    : > "$dir/started-by-cbox"
     for _i in $(seq 1 20); do
       sleep 0.3
-      lsof -i :4713 >/dev/null 2>&1 && break
+      pulseaudio --check 2>/dev/null && pactl info >/dev/null 2>&1 && break
     done
-
-    if ! lsof -i :4713 >/dev/null 2>&1; then
+    if ! pulseaudio --check 2>/dev/null; then
       echo "⚠  PulseAudio did not start — check ${TMPDIR:-/tmp}/cbox-pulse.log"
       return 1
     fi
   fi
 
+  # A TCP listener loaded by an older cbox is still open to the network: close it.
+  pactl list short modules 2>/dev/null \
+    | awk -v acl="${_CBOX_PULSE_TCP_LINE##* }" '$2 == "module-native-protocol-tcp" && index($0, acl) { print $1 }' \
+    | while IFS= read -r m; do pactl unload-module "$m" 2>/dev/null || true; done
+
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  if ! pactl list short modules 2>/dev/null | grep -qF "$sock"; then
+    rm -f "$sock"
+    pactl load-module module-native-protocol-unix "socket=\"$sock\"" auth-anonymous=1 >/dev/null 2>&1 || {
+      echo "⚠  PulseAudio did not open its socket for containers — voice mode unavailable"
+      return 1
+    }
+  fi
+
   # module-suspend-on-idle parks sources after a few seconds; voice mode needs
   # the mic source to stay active, so unload it whenever PulseAudio is running.
-  PULSE_SERVER=tcp:localhost:4713 pactl unload-module module-suspend-on-idle 2>/dev/null || true
+  pactl unload-module module-suspend-on-idle 2>/dev/null || true
 }
 
+# Stops PulseAudio if cbox started it and no cbox session is left anywhere.
 _cbox_audio_stop() {
-  [[ "${_CBOX_AUDIO_STARTED:-0}" == "1" ]] || return 0
+  local dir f pid
+  dir="$(_cbox_audio_socket)"
+  dir="${dir%/*}"
+  [[ -f "$dir/started-by-cbox" ]] || return 0
+  while IFS= read -r f; do
+    pid="${f##*-}"
+    [[ "$pid" =~ ^[0-9]+$ ]] && ps -p "$pid" >/dev/null 2>&1 && return 0
+  done < <(find "$_CBOX_SESSION_DIR" -maxdepth 1 -name '.cbox-active-*' 2>/dev/null)
   echo "Stopping PulseAudio..."
   pulseaudio --kill 2>/dev/null || true
-  _CBOX_AUDIO_STARTED=0
+  rm -f "$dir/started-by-cbox"
 }
 
 # ---------------------------------------------------------
@@ -1191,6 +1192,324 @@ _cbox_mcp_status() {
 }
 
 # ---------------------------------------------------------
+# tunnel
+# ---------------------------------------------------------
+#
+# Unix sockets in the container whose clients are served on the host — the
+# warden ssh agent and PulseAudio — with no network listener on either side:
+#
+#   ssh / paplay ─▶ /tmp/cbox-tunnel/<channel>.sock ─▶ cbox-tunnel serve
+#                   (in container)                      │ one `container exec -i`,
+#                                                       │ every connection multiplexed
+#   host: tunnel (warden python) ◀──────────────────────┘
+#         ├─ ssh:   filter ─▶ warden's own ssh-agent (list + sign granted keys only)
+#         └─ pulse: PulseAudio's private unix socket
+#
+# Starting an exec costs about a second, so one is kept open per container and
+# connections share it. The host decides per connection: a channel the
+# container has no grant for is closed right away.
+
+# Shared by both ends: the host side runs it as part of the warden python, the
+# container side as the head of cbox-tunnel.
+_cbox_tunnel_mux_py() {
+  cat <<'PYEOF'
+import os, queue, socket, struct, threading
+
+
+class Mux:
+    """Carries many stream connections over one byte pipe (the stdin/stdout of
+    a `container exec -i`). Frames are kind (1 byte), connection id, length, data:
+      R 0         container → host: listening, the tunnel is up
+      O id name   container → host: a client connected to channel `name`
+      D id data   either way: bytes for the connection
+      E id        either way: no more bytes this way (the other way stays open)
+      C id        either way: the connection is closed
+    Every connection writes through its own thread and queue, so a slow socket
+    never holds up the others."""
+    HDR = struct.Struct(">cII")
+    MAX_FRAME = 1 << 20
+    MAX_QUEUED = 256  # frames waiting for one socket; beyond that it is dropped
+    EOF = object()    # queued: shut down the socket's sending side
+
+    def __init__(self, rfd, wfd, opener=None):
+        self.rfd, self.wfd, self.opener = rfd, wfd, opener
+        self.wlock = threading.Lock()
+        self.lock = threading.Lock()
+        self.conns = {}
+        self.next_id = 0
+        self.ready = False
+
+    def send(self, kind, cid, data=b""):
+        frame = self.HDR.pack(kind, cid, len(data)) + data
+        with self.wlock:
+            while frame:
+                frame = frame[os.write(self.wfd, frame):]
+
+    def add(self, sock, cid=None, channel=None):
+        """Carries sock. Without cid (container side) a new id is taken and the
+        host is asked to open channel."""
+        q = queue.Queue(self.MAX_QUEUED)
+        with self.lock:
+            if cid is None:
+                self.next_id += 1
+                cid = self.next_id
+            self.conns[cid] = [sock, q, False, False]  # + EOF sent, EOF received
+        if channel is not None:
+            self.send(b"O", cid, channel.encode())
+        threading.Thread(target=self._read, args=(cid, sock), daemon=True).start()
+        threading.Thread(target=self._write, args=(cid, sock, q), daemon=True).start()
+        return cid
+
+    def drop(self, cid, tell):
+        with self.lock:
+            entry = self.conns.pop(cid, None)
+        if entry is None:
+            return
+        try:
+            entry[1].put_nowait(None)  # the writer sends what is queued, then closes
+        except queue.Full:
+            try:
+                entry[0].shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        if tell:
+            try:
+                self.send(b"C", cid)
+            except OSError:
+                pass
+
+    def _eof(self, cid, side):
+        """Marks EOF in one direction; the connection ends once both are done."""
+        with self.lock:
+            entry = self.conns.get(cid)
+            if entry is None:
+                return
+            entry[side] = True
+            done = entry[2] and entry[3]
+        if done:
+            self.drop(cid, tell=False)
+
+    def _read(self, cid, sock):
+        try:
+            while True:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                self.send(b"D", cid, data)
+        except OSError:
+            self.drop(cid, tell=True)
+            return
+        try:
+            self.send(b"E", cid)
+        except OSError:
+            self.drop(cid, tell=True)
+            return
+        self._eof(cid, 2)
+
+    def _write(self, cid, sock, q):
+        try:
+            while True:
+                data = q.get()
+                if data is None:
+                    break
+                if data is self.EOF:
+                    sock.shutdown(socket.SHUT_WR)
+                    continue
+                sock.sendall(data)
+        except OSError:
+            self.drop(cid, tell=True)
+        finally:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)  # wakes the reader thread
+            except OSError:
+                pass
+            sock.close()
+
+    def _read_exact(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = os.read(self.rfd, n - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
+    def _open(self, cid, name):
+        try:
+            sock = self.opener(name)
+        except OSError:
+            sock = None
+        if sock is None:
+            self.send(b"C", cid)
+        else:
+            self.add(sock, cid=cid)
+
+    def run(self):
+        """Handles frames until the pipe closes, then drops every connection."""
+        try:
+            while True:
+                hdr = self._read_exact(self.HDR.size)
+                if hdr is None:
+                    break
+                kind, cid, n = self.HDR.unpack(hdr)
+                if n > self.MAX_FRAME:
+                    break
+                data = self._read_exact(n) if n else b""
+                if data is None:
+                    break
+                if kind == b"R":
+                    self.ready = True
+                elif kind == b"O" and self.opener and cid not in self.conns:
+                    self._open(cid, data.decode(errors="replace"))
+                elif kind == b"D":
+                    entry = self.conns.get(cid)
+                    if entry:
+                        try:
+                            entry[1].put_nowait(data)
+                        except queue.Full:
+                            self.drop(cid, tell=True)  # its client stopped reading
+                elif kind == b"E":
+                    entry = self.conns.get(cid)
+                    if entry:
+                        try:
+                            entry[1].put_nowait(self.EOF)
+                        except queue.Full:
+                            self.drop(cid, tell=True)
+                            continue
+                        self._eof(cid, 3)
+                elif kind == b"C":
+                    self.drop(cid, tell=False)
+        except OSError:
+            pass
+        for cid in list(self.conns):
+            self.drop(cid, tell=False)
+PYEOF
+}
+
+# Container side, installed as $_CBOX_TUNNEL at every session start so it always
+# matches the host side. Only needs python3 from the image.
+_cbox_tunnel_py() {
+  echo '#!/usr/bin/env python3'
+  echo '# cbox-tunnel — installed by cbox at session start; local edits are overwritten.'
+  echo '#   serve NAME=SOCKET ...  run by the host over `container exec -i`: clients of'
+  echo '#                          SOCKET reach the host service NAME through this exec'
+  _cbox_tunnel_mux_py
+  cat <<'PYEOF'
+import sys
+
+
+def accept_loop(mux, srv, name):
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return
+        mux.add(conn, channel=name)
+
+
+def serve(specs):
+    mux = Mux(0, 1)
+    bound = []
+    for spec in specs:
+        name, path = spec.split("=", 1)
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        try:
+            os.unlink(path)  # left by an earlier tunnel
+        except FileNotFoundError:
+            pass
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(path)
+        os.chmod(path, 0o600)
+        srv.listen(16)
+        bound.append((path, os.stat(path).st_ino))
+        threading.Thread(target=accept_loop, args=(mux, srv, name), daemon=True).start()
+    mux.send(b"R", 0)
+    try:
+        mux.run()  # until the host goes away
+    finally:
+        for path, ino in bound:
+            try:
+                if os.stat(path).st_ino == ino:  # not yet taken over by a newer tunnel
+                    os.unlink(path)
+            except OSError:
+                pass
+    os._exit(0)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3 or sys.argv[1] != "serve" or not all("=" in a for a in sys.argv[2:]):
+        sys.stderr.write("usage: cbox-tunnel serve NAME=SOCKET ...\n")
+        sys.exit(2)
+    serve(sys.argv[2:])
+PYEOF
+}
+
+_cbox_tunnel_pid() {
+  local pid
+  pid=$(cat "$CBOX_DATA_DIR/.tunnel-$1.pid" 2>/dev/null) || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  # Guard against pid reuse: the process must still be our tunnel.
+  ps -p "$pid" -o command= 2>/dev/null | grep -q "tunnel" || return 1
+  echo "$pid"
+}
+
+# Identifies the code at both ends: a tunnel started by another cbox version is
+# replaced, so host and container always speak the same frames.
+_cbox_tunnel_id() {
+  { _cbox_warden_py; _cbox_tunnel_py; } | cksum | cut -d' ' -f1
+}
+
+# Installs the container side and starts the host side for the container,
+# unless it already runs. Failures are reported, never fatal.
+_cbox_tunnel_start() {
+  local name="$1"
+  local pidfile="$CBOX_DATA_DIR/.tunnel-$name.pid"
+  local idfile="$CBOX_DATA_DIR/.tunnel-$name.id"
+  local logfile="$CBOX_DATA_DIR/.tunnel-$name.log"
+  local id _i
+  id=$(_cbox_tunnel_id)
+  if _cbox_tunnel_pid "$name" >/dev/null; then
+    [[ "$(cat "$idfile" 2>/dev/null)" == "$id" ]] && return 0
+    _cbox_tunnel_stop "$name"
+  fi
+
+  # Atomic rename: a running tunnel may be reading the old file.
+  # shellcheck disable=SC2016
+  if ! _cbox_tunnel_py | $_CBOX_CMD exec -i "$name" sh -c \
+      'mkdir -p "${1%/*}" && cat > "$1.tmp" && chmod 755 "$1.tmp" && mv "$1.tmp" "$1"' \
+      sh "$_CBOX_TUNNEL" >/dev/null 2>&1; then
+    echo "⚠  Could not install the tunnel in '$name' — ssh agent and audio unavailable this session"
+    return 0
+  fi
+
+  mkdir -p "$CBOX_DATA_DIR"
+  rm -f "$pidfile"
+  _cbox_warden_env
+  # Subshell: no job-control noise; the tunnel detaches into its own session.
+  ( env "${_CBOX_WARDEN_ENV[@]}" python3 -c "$(_cbox_warden_py)" tunnel \
+      "$CBOX_WARDEN_DIR" "$_CBOX_CMD" "$name" "$_CBOX_TUNNEL" "$pidfile" "$(_cbox_audio_socket)" \
+      </dev/null >"$logfile" 2>&1 & )
+  for ((_i = 0; _i < 50; _i++)); do
+    [[ -f "$pidfile" ]] && break
+    sleep 0.2
+  done
+  if [[ -f "$pidfile" ]]; then
+    printf '%s\n' "$id" > "$idfile"
+    _cbox_log "✔ tunnel running (log: $logfile)"
+  else
+    echo "⚠  tunnel did not start — check $logfile"
+  fi
+}
+
+_cbox_tunnel_stop() {
+  local pid
+  pid=$(_cbox_tunnel_pid "$1") || return 0
+  # Negative pid: the whole process group — tunnel, exec client, filters.
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  rm -f "$CBOX_DATA_DIR/.tunnel-$1.pid" "$CBOX_DATA_DIR/.tunnel-$1.id"
+}
+
+# ---------------------------------------------------------
 # warden
 # ---------------------------------------------------------
 #
@@ -1215,8 +1534,9 @@ _cbox_mcp_status() {
 # Host-side logic: session grants, the broker, `cbox warden`.
 # Run as: _cbox_warden_python <command> ...
 _cbox_warden_py() {
+  _cbox_tunnel_mux_py
   cat <<'PYEOF'
-import base64, configparser, datetime, hashlib, hmac, http.client, http.server, json, os, re, secrets, socketserver, subprocess, sys, threading
+import base64, configparser, datetime, hashlib, hmac, http.client, http.server, json, os, re, secrets, shutil, signal, socket, socketserver, struct, subprocess, sys, threading, time
 from fnmatch import fnmatchcase
 from urllib.parse import urlsplit, unquote, parse_qsl, quote, urlencode
 
@@ -1230,6 +1550,11 @@ PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 PREFIX_RE = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$")
 PROJECT_KEYS = {"prefix"}  # settings a project's .warden may add to a resource; approval covers them
 AWS_CONFIG = "/home/claude/.aws/warden-config"  # container path; written by cbox at session start
+TUNNEL_DIR = os.environ.get("CBOX_TUNNEL_DIR", "/tmp/cbox-tunnel")  # container path; = _CBOX_TUNNEL_DIR
+HOST_RE = re.compile(r"^[A-Za-z0-9*?][A-Za-z0-9*?.-]{0,252}$")
+SSH_FAILURE, SSH_LIST, SSH_LIST_ANSWER, SSH_SIGN, SSH_EXTENSION = 5, 11, 12, 13, 27
+SSH_EXTENSIONS = {b"session-bind@openssh.com"}  # lets the agent enforce the hosts limit
+SSH_MAX = 256 * 1024
 TEMPLATE = """\
 # warden resources — host only, never mounted into a container.
 # One section per resource; the container never sees the secret itself.
@@ -1255,6 +1580,12 @@ TEMPLATE = """\
 # bucket       = my-bucket               # needed by policy = dvc
 # availability = project                 # the project's .warden sets the prefix:  [storage] prefix = my-project
 # profile      = storage                 # AWS profile created in the container (default: the resource name)
+#
+# [github]
+# type         = ssh
+# key          = ~/.ssh/id_ed25519       # private key on this Mac; needs id_ed25519.pub next to it
+# hosts        = github.com              # the key signs only for these hosts (space-separated)
+# availability = global                  # the container gets an ssh agent, never the key file
 """
 
 
@@ -1336,6 +1667,10 @@ def load_resources(d, warn=None, extra=()):
     for name in cp.sections():
         r = dict(cp[name])
         problem = validate(name, r)
+        if not problem and r.get("type") == "ssh":
+            twin = [n for n, o in out.items() if o.get("type") == "ssh" and ssh_blob(o) == ssh_blob(r)]
+            if twin:
+                problem = f"its key is already used by '{twin[0]}' (one resource per key)"
         if problem:
             warn and warn(f"warden resource '{name}': {problem} — skipped")
             continue
@@ -1346,8 +1681,13 @@ def load_resources(d, warn=None, extra=()):
 def validate(name, r):
     if not NAME_RE.match(name):
         return "name may only contain a-z, 0-9, '_' and '-'"
-    if r.get("type", "http") != "http":
-        return f"type '{r.get('type')}' is not supported yet"
+    if r.get("availability", "global") not in ("global", "project"):
+        return "availability must be global or project"
+    kind = r.get("type", "http")
+    if kind == "ssh":
+        return validate_ssh(r)
+    if kind != "http":
+        return f"type '{kind}' is unknown (known: http, ssh)"
     up = urlsplit(r.get("upstream", ""))
     if up.scheme not in ("http", "https") or not up.netloc:
         return "upstream must be an http(s) URL"
@@ -1355,8 +1695,6 @@ def validate(name, r):
         return "auth must be bearer, basic, header:<Name>, query:<param> or sigv4"
     if not r.get("secret"):
         return "secret (Keychain item name) is missing"
-    if r.get("availability", "global") not in ("global", "project"):
-        return "availability must be global or project"
     if r["auth"] == "sigv4" and not r.get("key-id"):
         return "sigv4 needs key-id (Keychain item with the access key ID)"
     if r.get("policy", "dvc") != "dvc":
@@ -1370,6 +1708,25 @@ def validate(name, r):
     for pair in r.get("env", "").split():
         if "=" not in pair or not ENV_KEY_RE.match(pair.split("=", 1)[0]):
             return f"env entry '{pair}' is not KEY=VALUE"
+    return None
+
+
+def validate_ssh(r):
+    extra = set(r) - {"type", "key", "hosts", "availability"}
+    if extra:
+        return f"{', '.join(sorted(extra))} is not used by type = ssh (it takes key, hosts, availability)"
+    if not r.get("key"):
+        return "key (path of the private key on this Mac) is missing"
+    try:
+        ssh_blob(r)
+    except (OSError, ValueError):
+        return f"{os.path.expanduser(r['key'])}.pub is missing or not a public key (create it: ssh-keygen -y -f {r['key']} > {r['key']}.pub)"
+    hosts = r.get("hosts", "").split()
+    if not hosts:
+        return "hosts is missing: the hosts this key may sign for, e.g. hosts = github.com"
+    for h in hosts:
+        if not HOST_RE.match(h):
+            return f"host '{h}' is not a host name"
     return None
 
 
@@ -1431,6 +1788,8 @@ def with_project(name, r, settings):
 
 def describe(r):
     """One line for listings and the approval prompt."""
+    if r.get("type") == "ssh":
+        return f"ssh key {r['key']} for {', '.join(r['hosts'].split())} ({r.get('availability', 'global')})"
     scope = f", bucket {r['bucket']}" if r.get("bucket") else ""
     scope += f", prefix {r['prefix']}" if r.get("prefix") else ""
     return f"{r['upstream']} ({r.get('availability', 'global')}{scope})"
@@ -1501,12 +1860,15 @@ def cmd_session(d, box, project, base_url, interactive):
                                          "resources": sorted(granted), "settings": granted}, indent=2) + "\n")
     url = f"{base_url}/w/{token}"
     print(f"WARDEN_URL={url}")
+    keys = [n for n in sorted(granted) if resources[n].get("type") == "ssh"]
+    if keys and ssh_load(d, keys, resources, interactive == "1"):
+        print(f"SSH_AUTH_SOCK={TUNNEL_DIR}/ssh-agent.sock")
     profiles = []
     for n in sorted(granted):
         r = resources[n]
         for pair in r.get("env", "").split():
             print(pair.replace("{url}", f"{url}/{n}"))
-        if r["auth"] == "sigv4":
+        if r.get("auth") == "sigv4":
             # Dummy keys: the broker drops their signature and signs with the real ones.
             profile = r.get("profile") or n
             profiles.append(("[default]" if profile == "default" else f"[profile {profile}]") +
@@ -1665,6 +2027,8 @@ class Broker(http.server.BaseHTTPRequestHandler):
         resources = load_resources(self.d)
         if name not in sess.get("resources", []) or name not in resources:
             return self.fail(403, f"resource '{name}' is not available to this container", who)
+        if resources[name].get("type", "http") != "http":
+            return self.fail(404, f"'{name}' is not an http resource", who)
         r, problem = with_project(name, resources[name], sess.get("settings", {}).get(name, {}))
         if problem:
             return self.fail(403, problem, who)
@@ -1751,6 +2115,316 @@ def cmd_serve(d, bind, port, pidfile):
         log_line(d, "broker stopped")
 
 
+# --- ssh: warden's own agent, and the filter in front of it ------------------
+#
+# The keys of ssh resources live in an agent of warden's own (not the user's),
+# each added with `ssh-add -h <host>` so the agent itself refuses to sign for
+# other hosts. A container reaches it only through the tunnel and ssh_filter:
+# listing and signing with the keys granted to that container; adding,
+# removing or locking keys is refused.
+
+def ssh_blob(r):
+    """Public key blob of an ssh resource, from <key>.pub."""
+    with open(os.path.expanduser(r["key"]) + ".pub") as f:
+        parts = f.read().split()
+    if len(parts) < 2:
+        raise ValueError("not a public key")
+    blob = base64.b64decode(parts[1], validate=True)
+    if ssh_string(blob, 0)[0] != parts[0].encode():
+        raise ValueError("not a public key")
+    return blob
+
+
+def ssh_string(buf, off):
+    if off + 4 > len(buf):
+        raise ValueError("short agent message")
+    n = struct.unpack(">I", buf[off:off + 4])[0]
+    if off + 4 + n > len(buf):
+        raise ValueError("short agent message")
+    return buf[off + 4:off + 4 + n], off + 4 + n
+
+
+def ssh_agent_sock(d):
+    return os.path.join(d, "ssh", "agent.sock")
+
+
+def ssh_agent_env(d):
+    return dict(os.environ, SSH_AUTH_SOCK=ssh_agent_sock(d))
+
+
+def ssh_agent_keys(d):
+    """Blobs held by warden's agent, or None when it does not run."""
+    p = subprocess.run(["ssh-add", "-L"], env=ssh_agent_env(d), stdin=subprocess.DEVNULL,
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if p.returncode not in (0, 1):
+        return None
+    keys = set()
+    for line in p.stdout.decode(errors="replace").splitlines():
+        parts = line.split()
+        try:
+            keys.add(base64.b64decode(parts[1], validate=True))
+        except (IndexError, ValueError):
+            pass
+    return keys
+
+
+def ssh_agent_start(d):
+    if ssh_agent_keys(d) is not None:
+        return True
+    sock = ssh_agent_sock(d)
+    os.makedirs(os.path.dirname(sock), mode=0o700, exist_ok=True)
+    try:
+        os.unlink(sock)  # left by an agent that died
+    except FileNotFoundError:
+        pass
+    p = subprocess.run(["ssh-agent", "-a", sock], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    m = re.search(rb"SSH_AGENT_PID=(\d+)", p.stdout)
+    if p.returncode != 0 or not m:
+        err(f"⚠  warden could not start its ssh agent: {p.stderr.decode(errors='replace').strip()}")
+        return False
+    write_private(os.path.join(os.path.dirname(sock), "agent.pid"), m.group(1).decode() + "\n")
+    return True
+
+
+def ssh_load(d, names, resources, interactive):
+    """Makes sure warden's agent holds the keys of names, each limited to its
+    hosts. True if at least one of them is loaded."""
+    if not shutil.which("ssh-agent") or not shutil.which("ssh-add"):
+        err("⚠  ssh resources need OpenSSH (ssh-agent, ssh-add) on this host — skipped")
+        return False
+    if not ssh_agent_start(d):
+        return False
+    have = ssh_agent_keys(d) or set()
+    loaded = False
+    for n in names:
+        r = resources[n]
+        if ssh_blob(r) in have:
+            loaded = True
+            continue
+        if not interactive:
+            err(f"ℹ  ssh key '{n}' is not unlocked yet — start cbox from a terminal once")
+            continue
+        hosts = r["hosts"].split()
+        argv = ["ssh-add"]
+        if sys.platform == "darwin" and shutil.which("ssh-add") == "/usr/bin/ssh-add":
+            argv.append("--apple-use-keychain")  # passphrase from / into the Keychain
+        for h in hosts:
+            argv += ["-h", h]
+        argv.append(os.path.expanduser(r["key"]))
+        err(f"warden: unlocking ssh key '{n}' — it will sign only for {', '.join(hosts)}")
+        if subprocess.run(argv, env=ssh_agent_env(d), stdout=sys.stderr).returncode == 0:
+            loaded = True
+        else:
+            err(f"⚠  ssh key '{n}' was not loaded. If ssh-add found no host keys, connect once\n"
+                f"   from this Mac first (e.g. ssh -T git@{hosts[0]}), then start cbox again.")
+    return loaded
+
+
+def ssh_granted(d, box):
+    """{public key blob: resource name} for the ssh keys box may use now."""
+    sess = load_json(os.path.join(paths(d)["sessions"], f"{box}.json"), {})
+    if not sess or exposure(d):
+        return {}
+    resources = load_resources(d)
+    out = {}
+    for n in sess.get("resources", []):
+        r = resources.get(n)
+        if r and r.get("type") == "ssh":
+            out[ssh_blob(r)] = n
+    return out
+
+
+def recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def ssh_recv(sock):
+    hdr = recv_exact(sock, 4)
+    if hdr is None:
+        return None
+    n = struct.unpack(">I", hdr)[0]
+    if not 0 < n <= SSH_MAX:
+        raise ValueError("bad agent message length")
+    return recv_exact(sock, n)
+
+
+def ssh_ask(agent, msg):
+    agent.sendall(struct.pack(">I", len(msg)) + msg)
+    reply = ssh_recv(agent)
+    if reply is None:
+        raise OSError("the agent closed the connection")
+    return reply
+
+
+def ssh_only(answer, keys):
+    """An identities answer cut down to the granted keys, each named after its
+    resource (the agent's comment is the key's path on the host)."""
+    if answer[:1] != bytes([SSH_LIST_ANSWER]) or len(answer) < 5:
+        return answer
+    off, kept = 5, []
+    for _ in range(struct.unpack(">I", answer[1:5])[0]):
+        blob, off = ssh_string(answer, off)
+        _, off = ssh_string(answer, off)
+        if blob in keys and blob not in kept:
+            kept.append(blob)
+    out = bytes([SSH_LIST_ANSWER]) + struct.pack(">I", len(kept))
+    for blob in kept:
+        comment = f"warden:{keys[blob]}".encode()
+        out += struct.pack(">I", len(blob)) + blob + struct.pack(">I", len(comment)) + comment
+    return out
+
+
+def ssh_filter(d, box, client, agent, keys):
+    """Serves one agent connection from the container."""
+    try:
+        while True:
+            msg = ssh_recv(client)
+            if msg is None:
+                break
+            reply = bytes([SSH_FAILURE])
+            if msg[0] == SSH_LIST:
+                reply = ssh_only(ssh_ask(agent, msg), keys)
+            elif msg[0] == SSH_SIGN:
+                blob, _ = ssh_string(msg, 1)
+                if blob in keys:
+                    reply = ssh_ask(agent, msg)
+                    log_line(d, f"{box} ssh: signed with '{keys[blob]}'"
+                                + ("" if reply[:1] != bytes([SSH_FAILURE]) else " — refused by the agent (host not allowed?)"))
+                else:
+                    log_line(d, f"{box} ssh: refused to sign with a key not granted to it")
+            elif msg[0] == SSH_EXTENSION and ssh_string(msg, 1)[0] in SSH_EXTENSIONS:
+                reply = ssh_ask(agent, msg)
+            else:
+                log_line(d, f"{box} ssh: refused agent request type {msg[0]}")
+            client.sendall(struct.pack(">I", len(reply)) + reply)
+    except (OSError, ValueError, struct.error):
+        pass
+    finally:
+        client.close()
+        agent.close()
+
+
+def cmd_ssh_stop(d):
+    """Stops warden's ssh agent; its unlocked keys go with it."""
+    pidfile = os.path.join(d, "ssh", "agent.pid")
+    try:
+        pid = int(open(pidfile).read())
+    except (OSError, ValueError):
+        pid = None
+    if pid:
+        p = subprocess.run(["ps", "-p", str(pid), "-o", "command="], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL)
+        if b"ssh-agent" in p.stdout:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+    for f in (pidfile, ssh_agent_sock(d)):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
+def ssh_test(d, name, r):
+    hosts = ", ".join(r["hosts"].split())
+    have = ssh_agent_keys(d)
+    if have is not None and ssh_blob(r) in have:
+        print(f"✔ {name}: unlocked in warden's agent, signs only for {hosts}")
+    else:
+        print(f"· {name}: key and {r['key']}.pub found; it is unlocked at the next cbox start (signs only for {hosts})")
+
+
+# --- tunnel: host end -------------------------------------------------------
+
+def say(text):
+    print(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} {text}", flush=True)
+
+
+def tunnel_opener(d, box, pulse):
+    def opener(name):
+        if name == "pulse" and pulse and os.path.exists(pulse):
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(pulse)
+            return s
+        if name == "ssh":
+            keys = ssh_granted(d, box)
+            if not keys:
+                return None
+            agent = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                agent.connect(ssh_agent_sock(d))
+            except OSError:
+                agent.close()
+                say("ssh: warden's agent is not running — start a new cbox session")
+                return None
+            ours, theirs = socket.socketpair()
+            threading.Thread(target=ssh_filter, args=(d, box, theirs, agent, keys), daemon=True).start()
+            return ours
+        return None
+    return opener
+
+
+def cmd_tunnel(d, runtime, box, script, pidfile, pulse=""):
+    try:
+        os.setsid()  # own process group, so stop can kill every child at once
+    except OSError:
+        pass
+    me = f"{os.getpid()}\n"
+
+    def bye(*_):
+        try:
+            if open(pidfile).read() == me:
+                os.remove(pidfile)
+        except OSError:
+            pass
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    with open(pidfile, "w") as f:
+        f.write(me)
+    say(f"tunnel for '{box}' started (pid {os.getpid()})")
+    specs = [f"ssh={TUNNEL_DIR}/ssh-agent.sock", f"pulse={TUNNEL_DIR}/pulse.sock"]
+    fails = 0
+    while True:
+        try:
+            ex = subprocess.Popen([runtime, "exec", "-i", box, script, "serve", *specs],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+        except OSError as e:
+            say(f"cannot run {runtime}: {e}")
+            time.sleep(30)
+            continue
+        mux = Mux(ex.stdout.fileno(), ex.stdin.fileno(), opener=tunnel_opener(d, box, pulse))
+        mux.run()
+        for f in (ex.stdin, ex.stdout):
+            try:
+                f.close()
+            except OSError:
+                pass
+        try:
+            ex.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            ex.kill()
+            ex.wait()
+        if mux.ready:
+            fails = 0
+            say("tunnel closed — reopening")
+            time.sleep(1)
+        else:
+            fails += 1
+            if fails == 1:
+                say(f"cannot open the tunnel in '{box}' (exit {ex.returncode}) — retrying")
+            time.sleep(min(30, 2 ** min(fails, 5)))
+
+
 # --- user-facing ----------------------------------------------------------------
 
 def cmd_list(d, project):
@@ -1770,6 +2444,9 @@ def cmd_list(d, project):
             else "projects whose .warden lists it")
         if names and n in names:
             r = with_project(n, r, names[n])[0] or r
+        if r.get("type") == "ssh":
+            print(f"{'✔' if here else '·'} {n:<16} ssh {r['key']} → {', '.join(r['hosts'].split())}  [{note}]")
+            continue
         scope = "".join(f", {k} {r[k]}" for k in ("bucket", "prefix") if r.get(k))
         print(f"{'✔' if here else '·'} {n:<16} {r['upstream']}  [{r['auth'].split(':')[0]}{scope}; {note}]")
     if names is None:
@@ -1795,6 +2472,8 @@ def cmd_test(d, name):
     if not r:
         err(f"No resource '{name}' in {paths(d)['resources']}")
         sys.exit(1)
+    if r.get("type") == "ssh":
+        return ssh_test(d, name, r)
     default = f"GET /{r['bucket']}?list-type=2&max-keys=1" if r.get("bucket") else "GET /"
     method, _, path = (r.get("test") or default).partition(" ")
     try:
@@ -1876,6 +2555,8 @@ def cmd_exposed(d, path):
 
 
 COMMANDS = {
+    "tunnel": lambda a: cmd_tunnel(*a),
+    "ssh-stop": lambda a: cmd_ssh_stop(*a),
     "ensure": lambda a: cmd_ensure(*a),
     "exposed": lambda a: cmd_exposed(*a),
     "session": lambda a: cmd_session(*a),
@@ -1910,6 +2591,13 @@ _cbox_warden_python() {
 
 _cbox_warden_enabled() {
   [[ -f "$CBOX_WARDEN_DIR/resources" ]]
+}
+
+# True when a resource of type ssh is configured (then no container gets
+# private keys mounted).
+_cbox_warden_has_ssh() {
+  _cbox_warden_enabled &&
+    grep -qE '^[[:space:]]*type[[:space:]]*=[[:space:]]*ssh([[:space:]#]|$)' "$CBOX_WARDEN_DIR/resources"
 }
 
 # Address on which the host is reachable from containers. The broker binds only
@@ -2010,6 +2698,7 @@ _cbox_warden_end() {
   [[ -d "$CBOX_WARDEN_DIR/sessions" ]] || return 0
   if _cbox_warden_python end "$CBOX_WARDEN_DIR" "$1"; then
     _cbox_warden_broker_stop
+    _cbox_warden_python ssh-stop "$CBOX_WARDEN_DIR"
   fi
 }
 
@@ -2268,6 +2957,13 @@ _cbox_create() {
 
   if [[ "$mode" == "normal" ]]; then
     if [[ -n "${CBOX_SSH_DIR:-}" ]]; then
+      # With warden ssh resources the keys stay on the host: the container
+      # signs through warden's agent and only needs the public halves.
+      local _keys_too=1
+      if _cbox_warden_has_ssh; then
+        _keys_too=0
+        _cbox_log "ℹ  private keys in $CBOX_SSH_DIR are not mounted: warden's ssh agent signs for the container"
+      fi
       # Mount each file individually so ~/.ssh/ itself is not a volume mount.
       # This allows known_hosts to be writable while keys remain read-only,
       # and lets us mount a generated config without EROFS conflicts.
@@ -2275,7 +2971,8 @@ _cbox_create() {
         local _fname; _fname=$(basename "$_f")
         case "$_fname" in
           known_hosts|known_hosts.old) args+=(-v "$_f:/home/claude/.ssh/$_fname") ;;
-          *)                           args+=(-v "$_f:/home/claude/.ssh/$_fname:ro") ;;
+          config|*.pub)                args+=(-v "$_f:/home/claude/.ssh/$_fname:ro") ;;
+          *) if (( _keys_too )); then args+=(-v "$_f:/home/claude/.ssh/$_fname:ro"); fi ;;
         esac
       done < <(find "$CBOX_SSH_DIR" -maxdepth 1 -type f 2>/dev/null)
 
@@ -2682,8 +3379,9 @@ _cbox_enter() {
     fi
   fi
 
+  local _audio=0
   if [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]] && [[ "$agent_bin" == "claude" ]]; then
-    _cbox_audio_start || true
+    _cbox_audio_start && _audio=1
   fi
 
   if [[ "$agent_bin" == "claude" ]]; then
@@ -2692,9 +3390,14 @@ _cbox_enter() {
   fi
 
   local _exec_args=(-it -w "/Workspace/$name")
-  [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]] && [[ "$agent_bin" == "claude" ]] && \
-    _exec_args+=(-e "PULSE_SERVER=$(_cbox_audio_pulse_server)")
-  local _run="$command" _g
+  local _run="$command" _g _tunnel=$_audio
+  if (( _audio )); then
+    # Through the tunnel, PulseAudio sees a local client and would offer shared
+    # memory, which cannot cross it: the client has to turn it off.
+    _exec_args+=(-e "PULSE_SERVER=unix:$_CBOX_TUNNEL_DIR/pulse.sock"
+                 -e "PULSE_CLIENTCONFIG=$_CBOX_TUNNEL_DIR/pulse-client.conf")
+    _run="mkdir -p -m 700 $_CBOX_TUNNEL_DIR && print -l 'enable-shm = no' 'enable-memfd = no' >| $_CBOX_TUNNEL_DIR/pulse-client.conf; $_run"
+  fi
   while IFS= read -r _g; do _exec_args+=(-e "$_g"); done < <(_cbox_git_identity)
   if [[ "$mode" != "safe" ]]; then
     local _w_env
@@ -2703,11 +3406,14 @@ _cbox_enter() {
         # S3-style resources: write their AWS profiles inside the container
         # (base64 only; the profiles hold dummy keys and the broker URL).
         WARDEN_AWS_CONFIG=*)
-          _run="mkdir -p ~/.aws && print -rn -- '${_w_env#*=}' | base64 -d >| ~/.aws/warden-config; $command" ;;
+          _run="mkdir -p ~/.aws && print -rn -- '${_w_env#*=}' | base64 -d >| ~/.aws/warden-config; $_run" ;;
+        SSH_AUTH_SOCK=*) _tunnel=1; _exec_args+=(-e "$_w_env") ;;
         ?*) _exec_args+=(-e "$_w_env") ;;
       esac
     done < <(_cbox_warden_start "$name")
   fi
+
+  (( _tunnel )) && _cbox_tunnel_start "$name"
 
   _cbox_flux_install "$name"
 
@@ -2720,10 +3426,6 @@ _cbox_enter() {
   # `set -e` a non-zero one would skip every teardown step below —
   # including stopping the container.
   $_CBOX_CMD exec "${_exec_args[@]}" "$name" zsh -ic "$_run" || true
-
-  if [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]] && [[ "$agent_bin" == "claude" ]]; then
-    _cbox_audio_stop
-  fi
 
   if [[ "$command" != "zsh" && "$mode" != "safe" ]]; then
     if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
@@ -2761,8 +3463,10 @@ _cbox_enter() {
 
   if (( _last_session )); then
     _cbox_mcp_relay_stop "$name"
+    _cbox_tunnel_stop "$name"
     _cbox_warden_end "$name"
     _cbox_git_guard_check "$name" || true
+    (( _audio )) && _cbox_audio_stop
     local _cache_base="${XDG_CACHE_HOME:-$HOME/.cache}"
     [[ -n "$CBOX_SHARE_DIR" && ( "$CBOX_SHARE_DIR" == /tmp/* || "$CBOX_SHARE_DIR" == "$_cache_base"/* ) ]] && \
       find "$CBOX_SHARE_DIR" -mindepth 1 -delete 2>/dev/null || true
@@ -2848,9 +3552,12 @@ _cbox_doctor_inline() {
     command -v pulseaudio >/dev/null 2>&1 \
       && echo "✔ PulseAudio installed" \
       || echo "✘ PulseAudio not found (CBOX_AUDIO set) — install: brew install pulseaudio"
-    lsof -i :4713 >/dev/null 2>&1 \
-      && echo "✔ PulseAudio listening on :4713" \
+    pulseaudio --check 2>/dev/null \
+      && echo "✔ PulseAudio running" \
       || echo "ℹ PulseAudio not running (will auto-start on next cbox session)"
+    [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/pulse/default.pa" ]] \
+      && grep -qxF "$_CBOX_PULSE_TCP_LINE" "${XDG_CONFIG_HOME:-$HOME/.config}/pulse/default.pa" \
+      && echo "⚠ PulseAudio still has the old network listener in default.pa — removed at the next cbox session"
   else
     echo "ℹ voice mode disabled (set CBOX_AUDIO=1 in cbox.env to enable)"
   fi

@@ -121,7 +121,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_SHARE_CONFIG` | *(unset)* | Folders of your real `~/.config` to share **read-only** into the container's `~/.config`, e.g. `"opencode nvim"`. Code in the container can read them, so leave out folders holding tokens (`gh`, `gcloud`). `claudebox` is never shared. Applies to newly created containers: `cbox reset` |
 | `CBOX_SHARE_DIR` | `~/.cache/claudebox/share` | Share folder, mounted as `~/share` in container; cleared on exit (read-write) |
 | `CBOX_PLAYWRIGHT_DIR` | `$CBOX_DATA_DIR/ms-playwright` | Playwright browser cache, mounted as `/opt/ms-playwright` (read-write; read-only in safe mode). Shared by all projects, kept across resets and rebuilds |
-| `CBOX_SSH_DIR` | *(unset)* | SSH dir to mount as `~/.ssh` in container (normal mode, **read-only**); unset = no SSH mount |
+| `CBOX_SSH_DIR` | *(unset)* | SSH dir to mount as `~/.ssh` in container (normal mode, **read-only**); unset = no SSH mount. With a warden ssh resource, only `config`, `known_hosts` and `*.pub` are mounted |
 | `CBOX_ZSHRC` | *(unset)* | `.zshrc` to source as `~/.zshrc.global` inside the container (**read-only**); unset = none |
 | `CBOX_BUILD_DIR` | cbox.sh directory | Build context for `cbox rebuild` |
 | `BUILD_PLAYWRIGHT` | `0` | Set to `1` to bake Playwright + Chromium into the image on the next `cbox rebuild` (or pass it inline). Decides whether the browser download happens at build time or on first use |
@@ -269,8 +269,30 @@ project in a bucket:
 prefix = my-project
 ```
 
-Not available in safe mode. Full documentation follows with the remaining
-resource types (SSH, MCP, audio).
+**SSH keys** (`type = ssh`) stay on the Mac. The container gets an ssh agent
+(`SSH_AUTH_SOCK`) instead of the key file, so `git push` and `ssh` work as
+usual, but nothing in the container can copy the key:
+
+```ini
+[github]
+type  = ssh
+key   = ~/.ssh/id_ed25519     # id_ed25519.pub must sit next to it
+hosts = github.com            # the key signs only for these hosts
+```
+
+- warden runs an agent of its own (not your usual one) and adds the key with
+  `ssh-add -h <host>`, so the agent itself refuses to sign for any other host.
+  The first `cbox` session after a Mac restart unlocks it; on macOS, ssh-add
+  takes the passphrase from the Keychain, and asks once otherwise.
+- `ssh-add -h` needs the host's key in `~/.ssh/known_hosts` on the Mac. If it
+  says none were found, connect once from the Mac (`ssh -T git@github.com`).
+- The container may only list the keys granted to it and sign with them;
+  adding, removing or locking keys is refused. Signatures are logged
+  (`cbox warden log`).
+- Once any ssh resource exists, `CBOX_SSH_DIR` mounts only `config`,
+  `known_hosts` and `*.pub` files — no private keys (from the next `cbox reset`).
+
+Not available in safe mode.
 
 ## macOS: Screenshot Script
 
@@ -281,7 +303,7 @@ resource types (SSH, MCP, audio).
 > [!NOTE]
 > Voice mode is Claude Code only. It has no equivalent in opencode and is not activated for `cbox oc` sessions.
 
-Claude Code's `/voice` command lets you dictate prompts using your microphone. Inside a container there is no direct audio device, so claudebox bridges your Mac's microphone via PulseAudio over TCP.
+Claude Code's `/voice` command lets you dictate prompts using your microphone. Inside a container there is no direct audio device, so claudebox bridges your Mac's microphone through PulseAudio. The container reaches it through a private socket that only cbox relays — PulseAudio opens no network port.
 
 ### Setup (one time)
 
@@ -304,12 +326,14 @@ CBOX_AUDIO=1
 cbox rebuild
 ```
 
-That's it. On every `cbox` session, claudebox automatically starts PulseAudio before entering the container and stops it on exit. Inside the container, run `/voice` to activate dictation.
+That's it. claudebox starts PulseAudio with the first `cbox` session and stops it when the last one closes (only if it started it). Inside the container, run `/voice` to activate dictation.
+
+Older claudebox versions opened PulseAudio on TCP port 4713 for every private network. claudebox now removes that line from `~/.config/pulse/default.pa` and closes a listener that is still open.
 
 ### Requirements
 
 - Claude.ai account (voice dictation is not available with a raw API key or third-party providers)
-- macOS with Apple Container or Docker Desktop; PulseAudio TCP is not supported in `cbox safe` mode
+- macOS with Apple Container or Docker Desktop; not available in `cbox safe` mode
 
 ### Troubleshooting
 
@@ -320,11 +344,7 @@ Run `cbox doctor` to check PulseAudio status. If voice fails inside the containe
 pactl info
 ```
 
-If `pactl` cannot connect, PulseAudio may not be running on the host. Start it manually:
-
-```bash
-nohup pulseaudio --daemonize=no > /tmp/cbox-pulse.log 2>&1 &
-```
+If `pactl` cannot connect, check on the host that PulseAudio runs (`pulseaudio --check`) and look at the tunnel's log: `~/.local/share/claudebox/.tunnel-<project>.log`.
 
 ## How It Works
 

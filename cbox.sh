@@ -94,7 +94,9 @@ unset _CBOX_CONFIG
 CBOX_VERBOSE="${CBOX_VERBOSE:-0}"
 CBOX_AGENT="${CBOX_AGENT:-claude}"
 CBOX_DATA_DIR="${CBOX_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/claudebox}"
-CBOX_CLAUDE_DIR="${CBOX_CLAUDE_DIR:-$HOME/.claude}"
+# The container's ~/.claude: a folder of its own, because Claude Code on the Mac
+# runs the hooks in ~/.claude/settings.json. Seeded from ~/.claude on first use.
+CBOX_CLAUDE_DIR="${CBOX_CLAUDE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/.claude}"
 # The container's ~/.config (normal mode): a folder of its own, because the real
 # ~/.config holds config that runs on this Mac (cbox.env, mcp.json, git) and
 # tokens. CBOX_SHARE_CONFIG shares chosen folders of it read-only.
@@ -2127,6 +2129,35 @@ _cbox_seed_playwright() {
 # container creation
 # ---------------------------------------------------------
 
+# True when a folder is, or contains, config that runs on this Mac: cbox's own
+# (cbox.env, mcp.json) or the Mac's Claude Code config (hooks in settings.json).
+_cbox_holds_host_config() {
+  local dir p
+  dir=$(_cbox_resolve_path "$1")
+  for p in "${XDG_CONFIG_HOME:-$HOME/.config}/claudebox" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"; do
+    p=$(_cbox_resolve_path "$p")
+    [[ "$p" == "$dir" || "$p" == "$dir"/* ]] && return 0
+  done
+  return 1
+}
+
+# First use of the container's Claude folder: copy your settings, instructions
+# and add-ons from the Mac's ~/.claude. Copies, never links: a link's target
+# would be mounted into the container writable. History and login stay out.
+_cbox_seed_claude_dir() {
+  local src="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" item copied=()
+  [[ -e "$CBOX_CLAUDE_DIR" || ! -d "$src" ]] && return 0
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  for item in CLAUDE.md settings.json keybindings.json agents commands skills output-styles; do
+    [[ -e "$src/$item" ]] || continue
+    command cp -RL "$src/$item" "$CBOX_CLAUDE_DIR/" 2>/dev/null && copied+=("$item")
+  done
+  echo "ℹ  Claude in containers has its own folder: $CBOX_CLAUDE_DIR"
+  (( ${#copied[@]} )) && echo "   Copied from $src: ${copied[*]}"
+  echo "   Log in once inside the container (/login)."
+  return 0
+}
+
 # Folder names listed in CBOX_SHARE_CONFIG, one per line (zsh does not split
 # an unquoted variable, so no word splitting here).
 _cbox_shared_config_names() {
@@ -2135,16 +2166,19 @@ _cbox_shared_config_names() {
 
 # The -v values for the container's ~/.config and the folders of the real
 # ~/.config shared into it read-only, one per line. Fails when the container
-# would get write access to cbox's own config: cbox.env and mcp.json run on
-# this Mac.
+# would get write access to config that runs on this Mac, through either its
+# ~/.config or its ~/.claude.
 _cbox_config_mounts() {
-  local real="${XDG_CONFIG_HOME:-$HOME/.config}" own dir n
-  own=$(_cbox_resolve_path "$real/claudebox")
-  dir=$(_cbox_resolve_path "$CBOX_HOST_CONFIG_DIR")
-  if [[ "$own" == "$dir" || "$own" == "$dir"/* ]]; then
+  local real="${XDG_CONFIG_HOME:-$HOME/.config}" n
+  if _cbox_holds_host_config "$CBOX_HOST_CONFIG_DIR"; then
     echo "✘ CBOX_HOST_CONFIG_DIR=$CBOX_HOST_CONFIG_DIR would let code in the container change config that runs on this Mac (cbox.env, mcp.json, git)." >&2
     echo "  Remove that line from $real/claudebox/cbox.env (the default is $real/claudebox/.config)," >&2
     echo "  and share the folders you need read-only instead, e.g.: CBOX_SHARE_CONFIG=\"opencode\"" >&2
+    return 1
+  fi
+  if _cbox_holds_host_config "$CBOX_CLAUDE_DIR"; then
+    echo "✘ CBOX_CLAUDE_DIR=$CBOX_CLAUDE_DIR would let code in the container change config that runs on this Mac (Claude Code's hooks in ~/.claude/settings.json)." >&2
+    echo "  Remove that line from $real/claudebox/cbox.env (the default is $real/claudebox/.claude, seeded from ~/.claude on first use)." >&2
     return 1
   fi
   mkdir -p "$CBOX_HOST_CONFIG_DIR"
@@ -2182,6 +2216,7 @@ _cbox_create() {
 
   if [[ "$agent_bin" == "claude" ]]; then
     _cbox_generate_claude_json "$name" "$mode"
+    _cbox_seed_claude_dir
     mkdir -p "$CBOX_CLAUDE_DIR/projects"
   fi
 
@@ -2271,6 +2306,14 @@ _cbox_create() {
     while IFS= read -r _cm; do
       [[ -n "$_cm" ]] && args+=(-v "$_cm")
     done <<<"$config_mounts"
+    # These folders are writable from the container, and claudedot (or you)
+    # runs git in them on the Mac: a planted .git/config or hook would run
+    # there. Their git dir is not needed inside, so all of it is read-only
+    # (a mount point also cannot be renamed or replaced).
+    [[ -d "$CBOX_CLAUDE_DIR/.git" && ! -L "$CBOX_CLAUDE_DIR/.git" ]] && \
+      args+=(-v "$CBOX_CLAUDE_DIR/.git:/home/claude/.claude/.git:ro")
+    [[ -d "$CBOX_HOST_CONFIG_DIR/.git" && ! -L "$CBOX_HOST_CONFIG_DIR/.git" ]] && \
+      args+=(-v "$CBOX_HOST_CONFIG_DIR/.git:/home/claude/.config/.git:ro")
   fi
 
   if [[ "$mode" == "safe" ]]; then
@@ -2582,16 +2625,21 @@ _cbox_git_guard_check() {
   return 0
 }
 
+# cdot syncs the Claude folder containers use, unless cdot.env names another.
+_cbox_cdot() {
+  CDOT_CLAUDE_DIR="$CBOX_CLAUDE_DIR" cdot "$@"
+}
+
 # Runs a cdot sync command. Failures must always be visible — CBOX_VERBOSE only
 # controls whether the routine success output is shown too, never whether
 # failures are silenced. A failed sync is reported, never fatal, so the
 # teardown after it (stopping the container) always runs.
 _cbox_cdot_push() {
   if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-    cdot "$@" || true
+    _cbox_cdot "$@" || true
   else
     local _out
-    if ! _out=$(cdot "$@" 2>&1); then
+    if ! _out=$(_cbox_cdot "$@" 2>&1); then
       echo "⚠  cdot $1 failed:"
       echo "$_out" | sed 's/^/    /'
     fi
@@ -2618,17 +2666,17 @@ _cbox_enter() {
     if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
       if [[ "$agent_bin" == "claude" ]]; then
         if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-          cdot _pull
-          [[ "$mode" != "safe" ]] && cdot _pull-history "$name"
+          _cbox_cdot _pull
+          [[ "$mode" != "safe" ]] && _cbox_cdot _pull-history "$name"
         else
-          cdot _pull >/dev/null 2>&1
-          [[ "$mode" != "safe" ]] && cdot _pull-history "$name" >/dev/null 2>&1
+          _cbox_cdot _pull >/dev/null 2>&1
+          [[ "$mode" != "safe" ]] && _cbox_cdot _pull-history "$name" >/dev/null 2>&1
         fi
       elif [[ "$agent_bin" == "opencode" ]]; then
         if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-          cdot _pull-opencode
+          _cbox_cdot _pull-opencode
         else
-          cdot _pull-opencode >/dev/null 2>&1
+          _cbox_cdot _pull-opencode >/dev/null 2>&1
         fi
       fi
     fi
@@ -2825,7 +2873,7 @@ _cbox_doctor() {
   echo "[cdot]"
   if command -v cdot >/dev/null 2>&1; then
     if _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
-      cdot _doctor
+      _cbox_cdot _doctor
     fi
   else
     echo "ℹ cdot not installed — sync unavailable"

@@ -1945,3 +1945,85 @@ _guard_repo() {
   run _cbox_warden_cmd _exposed "$HOME/.config/awsx/config"
   [ "$status" -ne 0 ]
 }
+
+@test "_cbox_create: the git dirs of the mounted Claude and config dirs are read-only" {
+  local capture="$BATS_TMPDIR/create-claude-git"
+  mkdir -p "$CBOX_CLAUDE_DIR/.git" "$CBOX_HOST_CONFIG_DIR/.git"
+  cd "$BATS_TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  rm -f "$capture"; _cbox_create "cgit" "normal"
+  grep -qx "$CBOX_CLAUDE_DIR/.git:/home/claude/.claude/.git:ro" "$capture"
+  grep -qx "$CBOX_HOST_CONFIG_DIR/.git:/home/claude/.config/.git:ro" "$capture"
+  rm -rf "$CBOX_CLAUDE_DIR/.git" "$CBOX_HOST_CONFIG_DIR/.git"
+  rm -f "$capture"; _cbox_create "cgit" "normal"
+  run grep -c '/.git:/home/claude' "$capture"
+  [ "$output" = "0" ]
+}
+
+# ---------------------------------------------------------------------------
+# Container ~/.claude: own folder by default, seeded from ~/.claude
+# ---------------------------------------------------------------------------
+
+@test "claude dir: defaults to claudebox/.claude, not the Mac's ~/.claude" {
+  run env -u CBOX_CLAUDE_DIR -u XDG_CONFIG_HOME HOME="$HOME" bash -c 'source "$1"; echo "$CBOX_CLAUDE_DIR"' _ "$CBOX_SH"
+  [ "$output" = "$HOME/.config/claudebox/.claude" ]
+}
+
+@test "_cbox_create: refuses the Mac's ~/.claude as the container's Claude folder (normal mode)" {
+  local capture="$BATS_TMPDIR/create-claude-refused"
+  mkdir -p "$HOME/.claude"
+  cd "$BATS_TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  for d in "$HOME/.claude" "$HOME"; do
+    rm -f "$capture"
+    CBOX_CLAUDE_DIR="$d" run _cbox_create "cbclaude" "normal"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"CBOX_CLAUDE_DIR=$d would let code in the container change config"* ]]
+    [ ! -e "$capture" ]
+  done
+  rm -f "$capture"
+  CBOX_CLAUDE_DIR="$HOME/.claude" run _cbox_create "cbclaude" "safe"
+  [ "$status" -eq 0 ]
+  rm -rf "$HOME/.claude"
+}
+
+@test "_cbox_create: a new Claude folder gets copies of settings and add-ons, not history or links" {
+  local capture="$BATS_TMPDIR/create-claude-seed"
+  mkdir -p "$HOME/.claude/agents" "$HOME/.claude/projects/p" "$BATS_TMPDIR/dotfiles"
+  echo '{"hooks":{}}' > "$HOME/.claude/settings.json"
+  echo "rules" > "$BATS_TMPDIR/dotfiles/CLAUDE.md"
+  ln -sf "$BATS_TMPDIR/dotfiles/CLAUDE.md" "$HOME/.claude/CLAUDE.md"
+  echo "a" > "$HOME/.claude/agents/a.md"
+  echo "{}" > "$HOME/.claude/history.jsonl"
+  echo "{}" > "$HOME/.claude/projects/p/s.jsonl"
+  CBOX_CLAUDE_DIR="$BATS_TMPDIR/new-claude"; rm -rf "$CBOX_CLAUDE_DIR"
+  cd "$BATS_TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  rm -f "$capture"
+  run _cbox_create "cbseed" "normal"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude in containers has its own folder: $CBOX_CLAUDE_DIR"* ]]
+  [[ "$output" == *"Copied from $HOME/.claude: CLAUDE.md settings.json agents"* ]]
+  [ -f "$CBOX_CLAUDE_DIR/settings.json" ]
+  [ -f "$CBOX_CLAUDE_DIR/CLAUDE.md" ]
+  [ ! -L "$CBOX_CLAUDE_DIR/CLAUDE.md" ]
+  [ -f "$CBOX_CLAUDE_DIR/agents/a.md" ]
+  [ ! -e "$CBOX_CLAUDE_DIR/history.jsonl" ]
+  [ ! -e "$CBOX_CLAUDE_DIR/projects/p" ]
+  # The copied file is not a link, so the dotfiles target is not mounted.
+  run grep -c "$BATS_TMPDIR/dotfiles" "$capture"
+  [ "$output" = "0" ]
+  # Only once.
+  run _cbox_create "cbseed" "normal"
+  [[ "$output" != *"has its own folder"* ]]
+  rm -rf "$HOME/.claude" "$CBOX_CLAUDE_DIR" "$BATS_TMPDIR/dotfiles"
+}
+
+@test "_cbox_cdot: cdot syncs the Claude folder containers use" {
+  cdot() { echo "dir=$CDOT_CLAUDE_DIR args=$*"; }
+  run _cbox_cdot _pull
+  [ "$output" = "dir=$CBOX_CLAUDE_DIR args=_pull" ]
+}

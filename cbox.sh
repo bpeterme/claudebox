@@ -115,6 +115,9 @@ CBOX_WARDEN_PORT="${CBOX_WARDEN_PORT:-47100}"
 # Claude Code (~400 MB) plus a test suite or a large file can exhaust; the VM
 # then dies with the session. Applies when a container is created (cbox reset).
 CBOX_MEMORY="${CBOX_MEMORY:-4g}"
+# Mount the project's .git/config and .git/hooks read-only (see _cbox_create).
+# 0 lets the container change them again. Applies when a container is created.
+CBOX_PROTECT_GIT="${CBOX_PROTECT_GIT:-1}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
@@ -2156,6 +2159,17 @@ _cbox_create() {
     args+=(-v "$claude_json:/home/claude/.claude.json")
   fi
 
+  # git on the Mac runs commands named in .git/config (core.fsmonitor, filters,
+  # core.sshCommand, …) and in .git/hooks — with your Keychain and SSH keys.
+  # Read-only here, so code in the container cannot plant them. Git writes the
+  # config by renaming a new file over it, so a config change made on the Mac
+  # may only show up in the container after its next start.
+  if [[ "$CBOX_PROTECT_GIT" == "1" && -d "$PWD/.git" && ! -L "$PWD/.git" ]]; then
+    mkdir -p "$PWD/.git/hooks"
+    [[ -f "$PWD/.git/config" ]] && args+=(-v "$PWD/.git/config:/Workspace/$name/.git/config:ro")
+    args+=(-v "$PWD/.git/hooks:/Workspace/$name/.git/hooks:ro")
+  fi
+
   if [[ -n "${CBOX_ZSHRC:-}" ]]; then
     local _zshrc_real
     _zshrc_real=$(_cbox_resolve_path "$CBOX_ZSHRC")
@@ -2363,6 +2377,160 @@ _cbox_git_identity() {
   return 0
 }
 
+# ---------------------------------------------------------
+# git guard: catch commands planted for git on the Mac
+# ---------------------------------------------------------
+# The read-only mounts cover the project's own .git/config and .git/hooks.
+# Everything else git would also obey stays writable from the container:
+# nested repositories, submodules (.git/modules), worktrees, .git/commondir,
+# or a replaced .git. So cbox lists every git setting in the project that runs
+# a command when a session starts, and warns about new ones when the last
+# session ends. Nothing here runs git hooks or reads includes.
+
+# Config keys whose value git runs as a command (or that redirect git to
+# other config, hooks or a work tree). Matched on git's lowercased key names.
+_CBOX_GIT_RISKY_KEYS='^(core\.(fsmonitor|sshcommand|pager|editor|askpass|hookspath|gitproxy|worktree)|sequence\.editor|diff\.external|diff\..+\.(textconv|command)|filter\..+\.(clean|smudge|process)|merge\..+\.driver|credential\.(.+\.)?helper|url\..+\.(insteadof|pushinsteadof)|include\.path|includeif\..+\.path|gpg\.(.+\.)?program|remote\..+\.(uploadpack|receivepack)|(difftool|mergetool|man|browser)\..+\.(cmd|path)|pager\..+|web\.browser|protocol\.(.+\.)?allow|uploadpack\.packobjectshook|ssh\.variant|submodule\..+\.update|extensions\.worktreeconfig)$'
+
+# Prints "<label>|<kind>|<detail>" for each risky setting of one git dir.
+_cbox_git_guard_gitdir() {
+  local gd="$1" label="$2" f entry key value h
+  for f in config config.worktree; do
+    [[ -f "$gd/$f" ]] || continue
+    while IFS= read -r -d '' entry; do
+      key="${entry%%$'\n'*}"
+      value=""
+      [[ "$entry" == *$'\n'* ]] && value="${entry#*$'\n'}"
+      if [[ "$key" =~ $_CBOX_GIT_RISKY_KEYS ]] || [[ "$key" == alias.* && "$value" == '!'* ]]; then
+        printf '%s|%s|%s=%s\n' "$label" "$f" "$key" "${value//$'\n'/\\n}"
+      fi
+    done < <(git config --file "$gd/$f" --no-includes --list -z 2>/dev/null)
+  done
+  [[ -f "$gd/commondir" ]] && printf '%s|commondir|%s\n' "$label" "$(head -n 1 "$gd/commondir")"
+  while IFS= read -r h; do
+    printf '%s|hook|%s %s\n' "$label" "${h##*/}" "$(cksum < "$h" 2>/dev/null | cut -d' ' -f1)"
+  done < <(find "$gd/hooks" -mindepth 1 -maxdepth 1 ! -type d ! -name '*.sample' 2>/dev/null | LC_ALL=C sort)
+  return 0
+}
+
+# Prints the risky settings of every git dir under the project root, sorted.
+_cbox_git_guard_scan() {
+  local root="$1" g rel sub
+  while IFS= read -r g; do
+    rel="${g#"$root"/}"
+    if [[ -L "$g" ]]; then
+      printf '%s|symlink|%s\n' "$rel" "$(/usr/bin/readlink "$g" 2>/dev/null || readlink "$g")"
+    elif [[ -f "$g" ]]; then
+      printf '%s|gitfile|%s\n' "$rel" "$(head -n 1 "$g")"
+    elif [[ -d "$g" ]]; then
+      _cbox_git_guard_gitdir "$g" "$rel"
+      # Submodule and worktree git dirs live inside .git.
+      while IFS= read -r sub; do
+        sub="${sub%/config}"
+        _cbox_git_guard_gitdir "$sub" "${sub#"$root"/}"
+      done < <(find "$g/modules" -type f -name config 2>/dev/null)
+      while IFS= read -r sub; do
+        _cbox_git_guard_gitdir "$sub" "${sub#"$root"/}"
+      done < <(find "$g/worktrees" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+    fi
+  done < <(find "$root" -name .git -prune -print 2>/dev/null)
+  return 0
+}
+
+# First session of a container: record the project's git settings, plus copies
+# of .git/config and .git/hooks to restore from. A later concurrent session
+# keeps the first one's record.
+_cbox_git_guard_start() {
+  local name="$1" f pid
+  local dir="$CBOX_DATA_DIR/git-guard/$name"
+  while IFS= read -r f; do
+    pid="${f##*-}"
+    [[ "$pid" != "$$" ]] && ps -p "$pid" >/dev/null 2>&1 && [[ -f "$dir/scan" ]] && return 0
+  done < <(_cbox_session_markers "$name")
+  rm -rf "$dir"
+  mkdir -p "$dir/hooks"
+  chmod 700 "$dir"
+  _cbox_git_guard_scan "$PWD" | LC_ALL=C sort > "$dir/scan.tmp"
+  if [[ -d "$PWD/.git" && ! -L "$PWD/.git" ]]; then
+    [[ -f "$PWD/.git/config" ]] && command cp -p "$PWD/.git/config" "$dir/config"
+    while IFS= read -r f; do
+      command cp -p "$f" "$dir/hooks/"
+    done < <(find "$PWD/.git/hooks" -mindepth 1 -maxdepth 1 ! -type d ! -name '*.sample' 2>/dev/null)
+  fi
+  # Written last: a snapshot without "scan" is incomplete and is not checked.
+  mv "$dir/scan.tmp" "$dir/scan"
+}
+
+# Asks on a terminal only; anything else means no.
+_cbox_git_guard_ask() {
+  [[ -t 0 ]] || return 1
+  local answer=""
+  printf '   Restore .git/config and .git/hooks as they were at the session start? [y/N] '
+  read -r answer || return 1
+  [[ "$answer" == [yY]* ]]
+}
+
+# Last session ended: warn about git settings that run commands and were not
+# there at the start, and offer to put .git/config and .git/hooks back.
+_cbox_git_guard_check() {
+  local name="$1"
+  local dir="$CBOX_DATA_DIR/git-guard/$name"
+  [[ -f "$dir/scan" ]] || return 0
+  local new line label kind detail restorable=0
+  new=$(_cbox_git_guard_scan "$PWD" | LC_ALL=C sort | LC_ALL=C comm -13 "$dir/scan" -)
+  if [[ -z "$new" ]]; then
+    rm -rf "$dir"
+    return 0
+  fi
+
+  echo ""
+  echo "⚠  New git settings in '$name' that would run commands on this Mac:"
+  while IFS= read -r line; do
+    label="${line%%|*}"; line="${line#*|}"
+    kind="${line%%|*}"; detail="${line#*|}"
+    case "$kind" in
+      hook)    echo "     $label/hooks/${detail%% *}" ;;
+      symlink) echo "     $label → $detail (replaced by a link)" ;;
+      gitfile) echo "     $label → $detail (points git elsewhere)" ;;
+      *)       echo "     $label/$kind: $detail" ;;
+    esac
+    [[ "$label" == ".git" && "$kind" != "symlink" && "$kind" != "gitfile" ]] && restorable=1
+  done <<<"$new"
+  echo "   Code in the container made them. Do not run git there on the Mac until you have checked them."
+
+  local keep
+  keep="$CBOX_DATA_DIR/git-guard/$name-$(date +%Y%m%d-%H%M%S)"
+  mv "$dir" "$keep"
+  if (( ! restorable )) || [[ ! -d "$PWD/.git" || -L "$PWD/.git" ]]; then
+    echo "   Session-start copies: $keep"
+    return 0
+  fi
+
+  if ! _cbox_git_guard_ask; then
+    echo "   Not restored. Session-start copies: $keep"
+    return 0
+  fi
+
+  # Changed files go to $keep/changed, never deleted.
+  local h base
+  mkdir -p "$keep/changed/hooks"
+  if [[ -f "$keep/config" ]] && ! cmp -s "$keep/config" "$PWD/.git/config"; then
+    [[ -f "$PWD/.git/config" ]] && mv "$PWD/.git/config" "$keep/changed/config"
+    command cp -p "$keep/config" "$PWD/.git/config"
+  fi
+  for base in commondir config.worktree; do
+    [[ -e "$PWD/.git/$base" ]] && ! grep -q "^\.git|$base|" "$keep/scan" && \
+      mv "$PWD/.git/$base" "$keep/changed/$base"
+  done
+  while IFS= read -r h; do
+    base="${h##*/}"
+    cmp -s "$h" "$keep/hooks/$base" 2>/dev/null && continue
+    mv "$h" "$keep/changed/hooks/$base"
+    [[ -f "$keep/hooks/$base" ]] && command cp -p "$keep/hooks/$base" "$h"
+  done < <(find "$PWD/.git/hooks" -mindepth 1 -maxdepth 1 ! -type d ! -name '*.sample' 2>/dev/null)
+  echo "   ✔ Restored. The changed files are kept in $keep/changed"
+  return 0
+}
+
 # Runs a cdot sync command. Failures must always be visible — CBOX_VERBOSE only
 # controls whether the routine success output is shown too, never whether
 # failures are silenced. A failed sync is reported, never fatal, so the
@@ -2446,6 +2614,7 @@ _cbox_enter() {
 
   echo "Entering container '$name'..."
 
+  _cbox_git_guard_start "$name" || true
   _cbox_session_start "$name"
 
   # The agent's exit status is irrelevant here, but under the script's
@@ -2494,6 +2663,7 @@ _cbox_enter() {
   if (( _last_session )); then
     _cbox_mcp_relay_stop "$name"
     _cbox_warden_end "$name"
+    _cbox_git_guard_check "$name" || true
     local _cache_base="${XDG_CACHE_HOME:-$HOME/.cache}"
     [[ -n "$CBOX_SHARE_DIR" && ( "$CBOX_SHARE_DIR" == /tmp/* || "$CBOX_SHARE_DIR" == "$_cache_base"/* ) ]] && \
       find "$CBOX_SHARE_DIR" -mindepth 1 -delete 2>/dev/null || true

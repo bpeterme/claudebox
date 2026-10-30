@@ -679,6 +679,128 @@ cmd_approve(sys.argv[2], sys.argv[3])" "$CBOX_WARDEN_DIR" "$PWD" 2>/dev/null
   [ "$status" -eq 0 ]
 }
 
+# Moves the resources file to $1 and leaves a symlink in its place, like a
+# dotfiles setup does.
+_warden_relocate() {
+  mkdir -p "$(dirname "$1")"
+  mv "$CBOX_WARDEN_DIR/resources" "$1"
+  ln -s "$1" "$CBOX_WARDEN_DIR/resources"
+}
+
+@test "cbox warden edit: creates the target of a symlinked resources file, keeping the link" {
+  rm -rf "$CBOX_WARDEN_DIR" "$BATS_TMPDIR/wdots"
+  mkdir -p "$CBOX_WARDEN_DIR"
+  ln -s "$BATS_TMPDIR/wdots/warden/resources" "$CBOX_WARDEN_DIR/resources"
+  EDITOR=true run _cbox_warden_cmd edit
+  [ "$status" -eq 0 ]
+  [ -L "$CBOX_WARDEN_DIR/resources" ]
+  grep -q "^# \[openrouter\]" "$BATS_TMPDIR/wdots/warden/resources"
+}
+
+@test "warden guard: off when the resources file lives in the mounted host config dir" {
+  _warden_setup
+  _warden_relocate "$CBOX_HOST_CONFIG_DIR/warden/resources"
+  run _warden_env
+  broker=$(_cbox_warden_broker_pid || true)
+  listing=$(_cbox_warden_cmd list)
+  _warden_teardown
+  [ -z "$output" ]
+  [ -z "$broker" ]
+  [[ "$(cat "$WT/stderr")" == *"warden is off"*"visible inside containers"*"$CBOX_HOST_CONFIG_DIR"* ]]
+  [[ "$listing" == *"warden is off"* ]]
+}
+
+@test "warden guard: off when the file sits in a dir mounted via a ~/.claude symlink" {
+  _warden_setup
+  local dots="$BATS_TMPDIR/wdots-mounted"
+  rm -rf "$dots"; mkdir -p "$dots/output-styles"
+  rm -rf "$CBOX_CLAUDE_DIR/output-styles"
+  ln -s "$dots/output-styles" "$CBOX_CLAUDE_DIR/output-styles"
+  _warden_relocate "$dots/output-styles/resources"
+  run _warden_env
+  rm -f "$CBOX_CLAUDE_DIR/output-styles"
+  _warden_teardown
+  [ -z "$output" ]
+  [[ "$(cat "$WT/stderr")" == *"warden is off"* ]]
+}
+
+@test "warden guard: a file next to mounted files (not in a mounted dir) is fine" {
+  _warden_setup
+  local dots="$BATS_TMPDIR/wdots-files"
+  rm -rf "$dots"; mkdir -p "$dots/claudebox"
+  echo "{}" > "$dots/claudebox/settings.json"
+  rm -f "$CBOX_CLAUDE_DIR/settings.json"
+  ln -s "$dots/claudebox/settings.json" "$CBOX_CLAUDE_DIR/settings.json"
+  _warden_relocate "$dots/claudebox/warden/resources"
+  run _warden_env
+  rm -f "$CBOX_CLAUDE_DIR/settings.json"
+  _warden_teardown
+  [[ "${lines[0]}" == WARDEN_URL=* ]]
+}
+
+@test "warden guard: off for a session whose workspace contains the file" {
+  _warden_setup
+  _warden_relocate "$WT/proj/config/resources"
+  run _warden_env
+  _warden_teardown
+  [ -z "$output" ]
+  [[ "$(cat "$WT/stderr")" == *"warden is off"*"$WT/proj"* ]]
+}
+
+@test "warden guard: broker refuses all requests once any session's workspace exposes the file" {
+  _warden_setup
+  url=$(_warden_url)
+  ok_before=$(curl -s -o /dev/null -w '%{http_code}' "$url/llm/models")
+  _warden_relocate "$BATS_TMPDIR/wdots-other/resources"
+  printf '{"token":"x","box":"other","project":"%s","resources":[]}\n' "$BATS_TMPDIR/wdots-other" \
+    > "$CBOX_WARDEN_DIR/sessions/other.json"
+  run curl -s -w ' %{http_code}' "$url/llm/models"
+  _warden_teardown
+  [ "$ok_before" = 200 ]
+  [[ "$output" == *"warden is off"*" 503" ]]
+}
+
+@test "warden guard: off when the warden dir itself is inside a mounted dir" {
+  _warden_setup
+  local res; res=$(cat "$CBOX_WARDEN_DIR/resources")
+  CBOX_WARDEN_DIR="$CBOX_SHARE_DIR/warden"
+  rm -rf "$CBOX_WARDEN_DIR"; mkdir -p "$CBOX_WARDEN_DIR"
+  printf '%s\n' "$res" > "$CBOX_WARDEN_DIR/resources"
+  run _warden_env
+  broker=$(_cbox_warden_broker_pid || true)
+  _warden_teardown
+  rm -rf "$CBOX_WARDEN_DIR"
+  [ -z "$output" ]
+  [ -z "$broker" ]
+  [[ "$(cat "$WT/stderr")" == *"warden is off"*"$CBOX_SHARE_DIR"* ]]
+}
+
+@test "warden: waits for a slow-starting broker (cold python3 on macOS)" {
+  _warden_setup
+  mkdir -p "$WT/slowbin"
+  printf '#!/bin/sh\nsleep 4\nexec %s "$@"\n' "$(command -v python3)" > "$WT/slowbin/python3"
+  chmod +x "$WT/slowbin/python3"
+  PATH="$WT/slowbin:$PATH" run _cbox_warden_broker_start
+  _warden_teardown
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"did not start"* ]]
+}
+
+@test "warden: gives up quickly when the broker dies at startup" {
+  _warden_setup
+  python3 -c 'import socket,time; s=socket.socket(); s.bind(("127.0.0.1",'"$CBOX_WARDEN_PORT"')); s.listen(); time.sleep(30)' &
+  local blocker=$!
+  sleep 0.5
+  local start=$SECONDS
+  run _cbox_warden_broker_start
+  local took=$((SECONDS - start))
+  kill "$blocker" 2>/dev/null || true
+  _warden_teardown
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"did not start"*"broker.log"* ]]
+  [ "$took" -lt 10 ]
+}
+
 @test "cbox warden: lists resources and what this project gets" {
   _warden_setup
   printf '[proj]\n' > .warden

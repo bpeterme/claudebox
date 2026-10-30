@@ -1198,7 +1198,7 @@ _cbox_mcp_status() {
 # container's last session.
 
 # Host-side logic: session grants, the broker, `cbox warden`.
-# Run as: python3 -c "$(_cbox_warden_py)" <command> ...
+# Run as: _cbox_warden_python <command> ...
 _cbox_warden_py() {
   cat <<'PYEOF'
 import base64, configparser, datetime, hashlib, http.client, http.server, json, os, re, secrets, socketserver, subprocess, sys, threading
@@ -1251,8 +1251,49 @@ def load_json(path, default):
         return default
 
 
-def load_resources(d, warn=None):
+def container_mounts(d, extra=()):
+    """Host paths that some container can see: the dirs and files cbox mounts
+    (passed in as CBOX_* environment), the targets of symlinks in the Claude
+    dir (mounted at their own path, up to two levels deep, like _cbox_create),
+    and the workspace of every active session."""
+    found = [os.environ.get(v) for v in ("CBOX_CLAUDE_DIR", "CBOX_HOST_CONFIG_DIR", "CBOX_SHARE_DIR",
+                                          "CBOX_PLAYWRIGHT_DIR", "CBOX_SSH_DIR", "CBOX_ZSHRC")]
+    claude = os.environ.get("CBOX_CLAUDE_DIR")
+    for level in ([claude] if claude and os.path.isdir(claude) else []):
+        for e in os.scandir(level):
+            if e.is_symlink():
+                found.append(e.path)
+            elif e.is_dir():
+                found += [s.path for s in os.scandir(e.path) if s.is_symlink()]
+    s = paths(d)["sessions"]
+    for f in os.listdir(s) if os.path.isdir(s) else []:
+        found.append(load_json(os.path.join(s, f), {}).get("project") if f.endswith(".json") else None)
+    return {os.path.realpath(m) for m in list(found) + list(extra) if m}
+
+
+def exposure(d, extra=()):
+    """(path, mount) when the warden dir or its resources file is visible inside
+    a container, else None. A container that can edit them could point a
+    resource at its own server and receive the secret, so warden then stays off."""
+    mounts = container_mounts(d, extra)
+    for target in (os.path.realpath(d), os.path.realpath(paths(d)["resources"])):
+        for m in mounts:
+            if target == m or target.startswith(m.rstrip("/") + "/"):
+                return target, m
+    return None
+
+
+def exposure_message(hit):
+    return (f"warden is off: {hit[0]} is visible inside containers (via {hit[1]}). "
+            "Move it to a path no container mounts.")
+
+
+def load_resources(d, warn=None, extra=()):
     """Valid resources from the host-only config; problems go to warn()."""
+    hit = exposure(d, extra)
+    if hit:
+        warn and warn(exposure_message(hit))
+        return {}
     cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#",))
     try:
         cp.read(paths(d)["resources"])
@@ -1366,6 +1407,10 @@ def approve(d, project, interactive):
 
 def cmd_session(d, box, project, base_url, interactive):
     p = paths(d)
+    hit = exposure(d, extra=[project])
+    if hit:
+        err("⚠  " + exposure_message(hit))
+        return
     resources = load_resources(d, warn=err)
     granted = [n for n, r in resources.items() if r.get("availability", "global") == "global"]
     names, _ = project_request(project)
@@ -1483,6 +1528,9 @@ class Broker(http.server.BaseHTTPRequestHandler):
         sess = find_session(self.d, parts[2])
         if not sess:
             return self.fail(403, "unknown or expired session token")
+        hit = exposure(self.d)
+        if hit:
+            return self.fail(503, exposure_message(hit), sess.get("box", "?"))
         who, name = sess.get("box", "?"), parts[3]
         rest = "/" + (parts[4] if len(parts) > 4 else "")
         resources = load_resources(self.d)
@@ -1625,9 +1673,12 @@ def cmd_test(d, name):
 
 
 def cmd_template(d):
+    """Create the resources file from the template if missing. A symlink is kept
+    and its target created, so the file can live in a dotfiles repo."""
     path = paths(d)["resources"]
-    if not os.path.exists(path):
-        write_private(path, TEMPLATE)
+    real = os.path.realpath(path)
+    if not os.path.exists(real):
+        write_private(real, TEMPLATE)
     print(path)
 
 
@@ -1644,6 +1695,21 @@ COMMANDS = {
 if __name__ == "__main__":
     COMMANDS[sys.argv[1]](sys.argv[2:])
 PYEOF
+}
+
+# Runs the warden logic with the paths cbox mounts into containers, so it can
+# refuse to work when its own files would be visible inside one.
+_cbox_warden_env() {
+  _CBOX_WARDEN_ENV=(
+    "CBOX_CLAUDE_DIR=$CBOX_CLAUDE_DIR" "CBOX_HOST_CONFIG_DIR=$CBOX_HOST_CONFIG_DIR"
+    "CBOX_SHARE_DIR=$CBOX_SHARE_DIR" "CBOX_PLAYWRIGHT_DIR=$CBOX_PLAYWRIGHT_DIR"
+    "CBOX_SSH_DIR=${CBOX_SSH_DIR:-}" "CBOX_ZSHRC=${CBOX_ZSHRC:-}"
+  )
+}
+
+_cbox_warden_python() {
+  _cbox_warden_env
+  env "${_CBOX_WARDEN_ENV[@]}" python3 -c "$(_cbox_warden_py)" "$@"
 }
 
 _cbox_warden_enabled() {
@@ -1673,12 +1739,18 @@ _cbox_warden_broker_start() {
   local ip pidfile="$CBOX_WARDEN_DIR/broker.pid" _i
   ip=$(_cbox_warden_host_ip)
   rm -f "$pidfile"
-  nohup python3 -c "$(_cbox_warden_py)" serve "$CBOX_WARDEN_DIR" "$ip" "$CBOX_WARDEN_PORT" "$pidfile" \
-    >>"$CBOX_WARDEN_DIR/broker.log" 2>&1 &
+  _cbox_warden_env
+  nohup env "${_CBOX_WARDEN_ENV[@]}" python3 -c "$(_cbox_warden_py)" serve \
+    "$CBOX_WARDEN_DIR" "$ip" "$CBOX_WARDEN_PORT" "$pidfile" >>"$CBOX_WARDEN_DIR/broker.log" 2>&1 &
+  local launcher=$!
   disown 2>/dev/null || true
-  for _i in 1 2 3 4 5 6 7 8 9 10; do
+  # The broker writes its pid file once it listens. A cold python3 on macOS can
+  # take seconds to get there, so wait while it is still alive (up to 15s) and
+  # give up early only when it has died (a zombie counts as dead).
+  for ((_i = 0; _i < 75; _i++)); do
     _cbox_warden_broker_pid >/dev/null && { _cbox_log "✔ warden broker running on $ip:$CBOX_WARDEN_PORT"; return 0; }
-    sleep 0.3
+    [[ "$(ps -o stat= -p "$launcher" 2>/dev/null)" =~ ^[^Z] ]] || break
+    sleep 0.2
   done
   echo "⚠  warden broker did not start — check $CBOX_WARDEN_DIR/broker.log" >&2
   return 1
@@ -1704,17 +1776,22 @@ _cbox_warden_start() {
     [[ "$box" == "$name" ]] && continue
     [[ -n "$(_cbox_session_markers "$box")" ]] || rm -f "$f"
   done < <(find "$CBOX_WARDEN_DIR/sessions" -maxdepth 1 -name '*.json' 2>/dev/null)
-  _cbox_warden_broker_start || return 0
   [[ -t 0 ]] && interactive=1
-  python3 -c "$(_cbox_warden_py)" session "$CBOX_WARDEN_DIR" "$name" "$PWD" \
-    "http://$(_cbox_warden_host_ip):$CBOX_WARDEN_PORT" "$interactive"
+  # Grants first: when warden is off (e.g. its files are visible in a
+  # container), nothing is printed and no broker is started.
+  local env_lines
+  env_lines=$(_cbox_warden_python session "$CBOX_WARDEN_DIR" "$name" "$PWD" \
+    "http://$(_cbox_warden_host_ip):$CBOX_WARDEN_PORT" "$interactive") || return 0
+  [[ -n "$env_lines" ]] || return 0
+  _cbox_warden_broker_start || return 0
+  printf '%s\n' "$env_lines"
 }
 
 # The container's last session ended: drop its token, and stop the broker once
 # no container has a session left.
 _cbox_warden_end() {
   [[ -d "$CBOX_WARDEN_DIR/sessions" ]] || return 0
-  if python3 -c "$(_cbox_warden_py)" end "$CBOX_WARDEN_DIR" "$1"; then
+  if _cbox_warden_python end "$CBOX_WARDEN_DIR" "$1"; then
     _cbox_warden_broker_stop
   fi
 }
@@ -1738,7 +1815,7 @@ _cbox_warden_secret_set() {
 _cbox_warden_cmd() {
   case "${1:-}" in
     ""|list)
-      python3 -c "$(_cbox_warden_py)" list "$CBOX_WARDEN_DIR" "$PWD"
+      _cbox_warden_python list "$CBOX_WARDEN_DIR" "$PWD"
       _cbox_warden_enabled || return 0
       local pid
       if pid=$(_cbox_warden_broker_pid); then
@@ -1749,17 +1826,17 @@ _cbox_warden_cmd() {
       ;;
     edit)
       local file
-      file=$(python3 -c "$(_cbox_warden_py)" template "$CBOX_WARDEN_DIR") || return 1
+      file=$(_cbox_warden_python template "$CBOX_WARDEN_DIR") || return 1
       "${EDITOR:-vi}" "$file"
       ;;
     secret)
       [[ "${2:-}" == "set" ]] || { echo "Usage: cbox warden secret set <resource>"; return 1; }
       _cbox_warden_secret_set "${3:-}"
       ;;
-    approve) python3 -c "$(_cbox_warden_py)" approve "$CBOX_WARDEN_DIR" "$PWD" ;;
+    approve) _cbox_warden_python approve "$CBOX_WARDEN_DIR" "$PWD" ;;
     test)
       [[ -n "${2:-}" ]] || { echo "Usage: cbox warden test <resource>"; return 1; }
-      python3 -c "$(_cbox_warden_py)" test "$CBOX_WARDEN_DIR" "$2"
+      _cbox_warden_python test "$CBOX_WARDEN_DIR" "$2"
       ;;
     log) tail -n "${2:-20}" "$CBOX_WARDEN_DIR/broker.log" 2>/dev/null || echo "No broker log yet." ;;
     *)

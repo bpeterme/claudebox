@@ -233,6 +233,13 @@ cbox warden edit                    # define the resource (template included)
 cbox warden test openrouter         # check it from the host
 ```
 
+Resources live in `~/.local/share/claudebox/warden/resources` (`$CBOX_WARDEN_DIR`).
+The file holds no secrets — only Keychain item names and URLs — so it can be
+kept in a dotfiles repo and symlinked there. Keep it out of anything a container
+mounts: if a container could edit it, it could point a resource at its own
+server. warden checks this and stays off, with a message, when the file or its
+directory is visible inside a container.
+
 A resource is either available to every container (`availability = global`)
 or only to projects that list it in a tracked `.warden` file **and** whose
 `.warden` you approved on the host (`project`). Editing `.warden` — also from

@@ -103,6 +103,7 @@ git on your Mac runs commands that a repository names: hooks in `.git/hooks`, an
 
 - **Read-only:** the project's `.git/config` and `.git/hooks` are mounted read-only. Git commands that write the config fail inside the container (`git remote add`, `git config`, the upstream part of `git push -u`); run them on the Mac. A config change made on the Mac may only show up in the container after its next start. `CBOX_PROTECT_GIT=0` turns this off.
 - **Check at the end:** when the last session of a container ends, cbox looks for git settings that run commands and were not there at the start: in nested repositories, submodules, worktrees, or a replaced `.git`. It names each one with its location and offers to put `.git/config` and `.git/hooks` back as they were (the changed files are kept in `~/.local/share/claudebox/git-guard/`). Repositories cloned in the container without such settings are not reported.
+- **Claude and config folders:** if the folder mounted as `~/.claude` or `~/.config` is a git repository (e.g. claudedot's sync repo), its whole `.git` is read-only in the container, because claudedot runs git there on the Mac.
 
 ## Configuration
 
@@ -115,8 +116,9 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_LABEL` | `cbox.project=true` | Label applied to all cbox containers |
 | `CBOX_KEEPALIVE_SECONDS` | `600` | Seconds container stays alive before auto-stop in keepalive mode |
 | `CBOX_DATA_DIR` | `~/.local/share/claudebox` | Per-project container config files (`.claude-<name>.json`), one per project |
-| `CBOX_CLAUDE_DIR` | `~/.claude` | Claude Code config, mounted as `~/.claude` (read-write; read-only in safe mode) |
-| `CBOX_HOST_CONFIG_DIR` | `~/.config` | Host config dir, mounted as `~/.config` in container (normal mode, read-write) |
+| `CBOX_CLAUDE_DIR` | `~/.config/claudebox/.claude` | The container's Claude Code folder, mounted as `~/.claude` (read-write; read-only in safe mode). Not your Mac's `~/.claude`: Claude Code on the Mac runs the hooks in its `settings.json`, so cbox refuses it. On first use cbox copies your settings, `CLAUDE.md`, keybindings, agents, commands, skills and output styles into it (copies, not links); log in once inside the container |
+| `CBOX_HOST_CONFIG_DIR` | `~/.config/claudebox/.config` | The container's own `~/.config` (normal mode, read-write). Not your real `~/.config`: that holds config that runs on your Mac and tokens, so cbox refuses it |
+| `CBOX_SHARE_CONFIG` | *(unset)* | Folders of your real `~/.config` to share **read-only** into the container's `~/.config`, e.g. `"opencode nvim"`. Code in the container can read them, so leave out folders holding tokens (`gh`, `gcloud`). `claudebox` is never shared. Applies to newly created containers: `cbox reset` |
 | `CBOX_SHARE_DIR` | `~/.cache/claudebox/share` | Share folder, mounted as `~/share` in container; cleared on exit (read-write) |
 | `CBOX_PLAYWRIGHT_DIR` | `$CBOX_DATA_DIR/ms-playwright` | Playwright browser cache, mounted as `/opt/ms-playwright` (read-write; read-only in safe mode). Shared by all projects, kept across resets and rebuilds |
 | `CBOX_SSH_DIR` | *(unset)* | SSH dir to mount as `~/.ssh` in container (normal mode, **read-only**); unset = no SSH mount |
@@ -133,9 +135,9 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_WARDEN_SECRET_CMD` | *(unset)* | Hosts without the macOS Keychain: command that prints the secret for an item name |
 
 > [!WARNING]
-> **Do not place `CBOX_CLAUDE_DIR` (default `~/.claude`) or your project directories on iCloud Drive, Dropbox Smart Sync, Google Drive Stream, or any on-demand cloud storage.** These services evict file contents to stubs when not recently accessed. A container mounting an evicted path will fail to read files that appear to exist on disk — a subtle failure that is hard to diagnose.
+> **Do not place `CBOX_CLAUDE_DIR` (default `~/.config/claudebox/.claude`) or your project directories on iCloud Drive, Dropbox Smart Sync, Google Drive Stream, or any on-demand cloud storage.** These services evict file contents to stubs when not recently accessed. A container mounting an evicted path will fail to read files that appear to exist on disk — a subtle failure that is hard to diagnose.
 >
-> **Do not use continuous sync tools (Syncthing, rsync daemons, etc.) on `CBOX_CLAUDE_DIR`.** They can write into the directory while Claude is actively appending to a conversation file, risking corruption or lost writes. If you need to sync `~/.claude` across machines, use [claudedot](https://github.com/bpeterme/claudedot) — it only touches the directory at explicit session boundaries.
+> **Do not use continuous sync tools (Syncthing, rsync daemons, etc.) on `CBOX_CLAUDE_DIR`.** They can write into the directory while Claude is actively appending to a conversation file, risking corruption or lost writes. If you need to sync it across machines, use [claudedot](https://github.com/bpeterme/claudedot) — it only touches the directory at explicit session boundaries.
 
 ## Container Image
 
@@ -329,10 +331,10 @@ nohup pulseaudio --daemonize=no > /tmp/cbox-pulse.log 2>&1 &
 - Container name is derived from the current directory name (e.g. `my-project`)
 - Project directory is mounted at `/Workspace/<name>` inside the container
 - The active agent (`claude` or `opencode`) is updated automatically once per day on first use; each agent has its own independent update stamp
-- `cbox oc` (or `CBOX_AGENT=opencode` in `cbox.env`) selects opencode for the session; opencode reads its config from `~/.config/opencode`, which is already available via the `CBOX_HOST_CONFIG_DIR` mount
+- `cbox oc` (or `CBOX_AGENT=opencode` in `cbox.env`) selects opencode for the session; opencode reads its config from `~/.config/opencode`; to use your Mac's, add `CBOX_SHARE_CONFIG="opencode"` to `cbox.env`
 - On exit, the container is stopped and the share folder is cleared
 - `cbox keepalive` leaves the container running for 10 minutes (useful for follow-up `exec` calls)
-- Authentication is automatic — credentials are mounted from the host, so no re-authentication is needed inside the container
+- Log in once inside a container (`/login`); the login is kept in `CBOX_CLAUDE_DIR` and shared by all containers
 - If [claudedot](https://github.com/bpeterme/claudedot) is installed, Claude config and history sync runs automatically at session start and exit (Claude sessions only)
 - If [flux](https://github.com/bpeterme/flux) is installed, the container runs the host's flux version, and flux projects reach their storage through warden: `dvc pull` and a plain `git push` (flux's pre-push hook uploads the data first) work inside the container
 
@@ -340,7 +342,7 @@ nohup pulseaudio --daemonize=no > /tmp/cbox-pulse.log 2>&1 &
 
 ### [claudedot](https://github.com/bpeterme/claudedot)
 
-[claudedot](https://github.com/bpeterme/claudedot) (`cdot`) syncs your Claude config and per-project conversation history across machines via a private git remote. Config (settings, keybindings, global instructions) syncs automatically on every session; project history is opt-in per project. claudebox calls `cdot` automatically at session boundaries if it is installed — no manual steps needed.
+[claudedot](https://github.com/bpeterme/claudedot) (`cdot`) syncs your Claude config and per-project conversation history across machines via a private git remote. Config (settings, keybindings, global instructions) syncs automatically on every session; project history is opt-in per project. claudebox calls `cdot` automatically at session boundaries if it is installed — no manual steps needed. It syncs the folder containers use (`CBOX_CLAUDE_DIR`), unless `CDOT_CLAUDE_DIR` in `cdot.env` names another.
 
 ```bash
 brew tap bpeterme/claudedot

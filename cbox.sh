@@ -2348,6 +2348,17 @@ _cbox_flux_install() {
   fi
 }
 
+# The container has no git identity of its own. Commits made in it use the one
+# git on the host would use for this project (global, includeIf and repo rules).
+_cbox_git_identity() {
+  local n e
+  n=$(git -C "$PWD" config user.name 2>/dev/null) || true
+  e=$(git -C "$PWD" config user.email 2>/dev/null) || true
+  if [[ -n "$n" ]]; then printf 'GIT_AUTHOR_NAME=%s\nGIT_COMMITTER_NAME=%s\n' "$n" "$n"; fi
+  if [[ -n "$e" ]]; then printf 'GIT_AUTHOR_EMAIL=%s\nGIT_COMMITTER_EMAIL=%s\n' "$e" "$e"; fi
+  return 0
+}
+
 # Runs a cdot sync command. Failures must always be visible — CBOX_VERBOSE only
 # controls whether the routine success output is shown too, never whether
 # failures are silenced. A failed sync is reported, never fatal, so the
@@ -2412,7 +2423,8 @@ _cbox_enter() {
   local _exec_args=(-it -w "/Workspace/$name")
   [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]] && [[ "$agent_bin" == "claude" ]] && \
     _exec_args+=(-e "PULSE_SERVER=$(_cbox_audio_pulse_server)")
-  local _run="$command"
+  local _run="$command" _g
+  while IFS= read -r _g; do _exec_args+=(-e "$_g"); done < <(_cbox_git_identity)
   if [[ "$mode" != "safe" ]]; then
     local _w_env
     while IFS= read -r _w_env; do

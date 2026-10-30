@@ -1205,6 +1205,32 @@ auth = sigv4"
 }
 
 # ---------------------------------------------------------------------------
+# _cbox_git_identity
+# ---------------------------------------------------------------------------
+
+@test "_cbox_git_identity: passes the host's identity for this project" {
+  local repo="$BATS_TMPDIR/ident-repo"
+  rm -rf "$repo"; git init -q "$repo"
+  git config --global user.name "Global Name"
+  git config --global user.email "global@example.com"
+  git -C "$repo" config user.email "work@example.com"
+  cd "$repo"
+  run _cbox_git_identity
+  git config --global --unset user.name; git config --global --unset user.email
+  [[ "$output" == *"GIT_AUTHOR_NAME=Global Name"* ]]
+  [[ "$output" == *"GIT_COMMITTER_NAME=Global Name"* ]]
+  [[ "$output" == *"GIT_AUTHOR_EMAIL=work@example.com"* ]]
+  [[ "$output" == *"GIT_COMMITTER_EMAIL=work@example.com"* ]]
+}
+
+@test "_cbox_git_identity: prints nothing when the host has no identity" {
+  cd "$BATS_TMPDIR"
+  run env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 bash -c "source '$CBOX_SH'; _cbox_git_identity"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+# ---------------------------------------------------------------------------
 # _cbox_flux_install
 # ---------------------------------------------------------------------------
 

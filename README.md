@@ -171,6 +171,8 @@ Keychain. List those in `~/.config/claudebox/mcp.json`, in the usual format:
 ```
 
 Or import them from Claude Desktop / Claude Code on the host with `cbox mcp import`.
+Both agents get them: Claude Code in its `~/.claude.json`, opencode through an extra
+config file cbox writes in the container (`OPENCODE_CONFIG`, merged over your own).
 Changes take effect with the next `cbox` session; `cbox mcp` shows what is configured.
 
 **How it works.** The server runs on the host; Claude in the container talks to it over
@@ -307,7 +309,20 @@ auth   = bearer                  # bearer | basic | header:<Name> | query:<param
 secret = cbox.warden.linear      # cbox warden secret set linear
 ```
 
-`cbox warden test linear` sends an MCP `initialize` from the host. Servers that
+`cbox warden test linear` sends an MCP `initialize` from the host. Claude Code
+and opencode both get these servers.
+
+**opencode providers.** `opencode = <provider id>` on an http resource points
+that opencode provider at warden (base URL and a dummy key), so the API key can
+leave `opencode.json` — which a container can read when it is shared:
+
+```ini
+[openrouter]
+upstream = https://openrouter.ai/api/v1
+auth     = bearer
+secret   = cbox.warden.openrouter
+opencode = openrouter
+``` Servers that
 only offer an OAuth login (no API key) are not supported through warden.
 
 Not available in safe mode.

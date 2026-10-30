@@ -116,6 +116,9 @@ _CBOX_MCP_HINT_SECONDS=25
 # the warden python has the same folder as TUNNEL_DIR.
 _CBOX_TUNNEL="/home/claude/.local/bin/cbox-tunnel"
 _CBOX_TUNNEL_DIR="/tmp/cbox-tunnel"
+# Extra opencode config cbox writes in the container (OPENCODE_CONFIG): host MCP
+# servers and warden routes, merged over the user's own opencode.json.
+_CBOX_OPENCODE_CONFIG="/home/claude/.cache/cbox/opencode.json"
 # warden: host-side credential broker (see "warden" below). Its directory holds
 # resource definitions, approvals and session tokens — host only, never mounted.
 CBOX_WARDEN_DIR="${CBOX_WARDEN_DIR:-$CBOX_DATA_DIR/warden}"
@@ -616,6 +619,34 @@ def cmd_claude_json(project_file, name, config, managed_file, relay, mode, warde
         json.dump(sorted(managed_now), f)
 
 
+# --- opencode-config ---------------------------------------------------------
+
+def cmd_opencode_config(config, relay, warden_mcp="", warden_providers=""):
+    """Prints opencode's view of the same servers (and warden's providers) as an
+    extra config file, or nothing when there is none."""
+    mcp = {}
+    for sname, cfg in load_servers(config).items():
+        k = kind(cfg)
+        if not NAME_RE.match(sname):
+            continue
+        if k == "stdio":
+            mcp[sname] = {"type": "local", "command": [relay, "connect", sname]}
+        elif k == "remote":
+            mcp[sname] = {"type": "remote", "url": cfg["url"]}
+            if isinstance(cfg.get("headers"), dict):
+                mcp[sname]["headers"] = cfg["headers"]
+                print(f"⚠  MCP server '{sname}': its headers are readable inside the container. "
+                      "Keep a token on the host instead: a warden resource with type = mcp", file=sys.stderr)
+    for sname, url in json.loads(warden_mcp or "{}").items():
+        mcp[sname] = {"type": "remote", "url": url}
+    out = {"mcp": mcp} if mcp else {}
+    providers = json.loads(warden_providers or "{}")
+    if providers:
+        out["provider"] = providers
+    if out:
+        print(json.dumps(dict({"$schema": "https://opencode.ai/config.json"}, **out)))
+
+
 # --- supervise --------------------------------------------------------------
 
 NO_ANSWER_HINT = (
@@ -968,6 +999,7 @@ def cmd_legacy_cleanup(portmap_file, native_index):
 
 COMMANDS = {
     "claude-json": cmd_claude_json,
+    "opencode-config": cmd_opencode_config,
     "supervise": cmd_supervise,
     "has-relay-servers": cmd_has_relay_servers,
     "list": cmd_list,
@@ -1578,6 +1610,7 @@ TEMPLATE = """\
 # availability = global                  # global: every container | project: only repos whose .warden lists it
 # allow        = POST /chat/completions, GET /models   # optional; default: everything under upstream
 # env          = OPENROUTER_BASE_URL={url} OPENROUTER_API_KEY=warden
+# opencode     = openrouter              # optional: opencode's provider of this id goes through warden
 # test         = GET /models             # used by: cbox warden test openrouter
 #
 # [storage]                              # any S3-compatible API (AWS S3, R2, MinIO, ...)
@@ -1728,6 +1761,8 @@ def validate(name, r):
     for pair in r.get("env", "").split():
         if "=" not in pair or not ENV_KEY_RE.match(pair.split("=", 1)[0]):
             return f"env entry '{pair}' is not KEY=VALUE"
+    if r.get("opencode") and (r["auth"] == "sigv4" or not PROFILE_RE.match(r["opencode"])):
+        return "opencode must be the id of an opencode provider (e.g. openrouter), on a non-sigv4 resource"
     return None
 
 
@@ -1912,6 +1947,11 @@ def cmd_session(d, box, project, base_url, interactive):
     if mcp:
         # Not container env: cbox adds these to the agent's MCP servers.
         print("WARDEN_MCP=" + base64.b64encode(json.dumps(mcp).encode()).decode())
+    # opencode providers routed through warden: base URL and a dummy key.
+    oc = {resources[n]["opencode"]: {"options": {"baseURL": f"{url}/{n}", "apiKey": "warden"}}
+          for n in sorted(granted) if resources[n].get("opencode")}
+    if oc:
+        print("WARDEN_OPENCODE=" + base64.b64encode(json.dumps(oc).encode()).decode())
     keys = [n for n in sorted(granted) if resources[n].get("type") == "ssh"]
     if keys and ssh_load(d, keys, resources, interactive == "1"):
         print(f"SSH_AUTH_SOCK={TUNNEL_DIR}/ssh-agent.sock")
@@ -3449,7 +3489,7 @@ _cbox_enter() {
   fi
 
   local _exec_args=(-it -w "/Workspace/$name")
-  local _run="$command" _g _tunnel=$_audio _warden_mcp=""
+  local _run="$command" _g _tunnel=$_audio _warden_mcp="" _warden_oc=""
   if (( _audio )); then
     # Through the tunnel, PulseAudio sees a local client and would offer shared
     # memory, which cannot cross it: the client has to turn it off.
@@ -3469,6 +3509,7 @@ _cbox_enter() {
         SSH_AUTH_SOCK=*) _tunnel=1; _exec_args+=(-e "$_w_env") ;;
         # Remote MCP servers behind warden: for the agent's config, not the env.
         WARDEN_MCP=*) _warden_mcp=$(printf '%s' "${_w_env#*=}" | base64 -d 2>/dev/null) || _warden_mcp="" ;;
+        WARDEN_OPENCODE=*) _warden_oc=$(printf '%s' "${_w_env#*=}" | base64 -d 2>/dev/null) || _warden_oc="" ;;
         ?*) _exec_args+=(-e "$_w_env") ;;
       esac
     done < <(_cbox_warden_start "$name")
@@ -3477,6 +3518,15 @@ _cbox_enter() {
   if [[ "$agent_bin" == "claude" ]]; then
     [[ "$mode" != "safe" ]] && _cbox_mcp_relay_start "$name"
     _cbox_generate_claude_json "$name" "$mode" "$_warden_mcp"
+  elif [[ "$agent_bin" == "opencode" && "$mode" != "safe" ]]; then
+    _cbox_mcp_relay_start "$name"
+    local _oc
+    _oc=$(python3 -c "$(_cbox_mcp_py)" opencode-config "$CBOX_MCP_CONFIG" "$_CBOX_MCP_RELAY" \
+      "$_warden_mcp" "$_warden_oc" | base64 | tr -d '\n')
+    if [[ -n "$_oc" ]]; then
+      _exec_args+=(-e "OPENCODE_CONFIG=$_CBOX_OPENCODE_CONFIG")
+      _run="mkdir -p ${_CBOX_OPENCODE_CONFIG%/*} && print -rn -- '$_oc' | base64 -d >| $_CBOX_OPENCODE_CONFIG; $_run"
+    fi
   fi
 
   (( _tunnel )) && _cbox_tunnel_start "$name"

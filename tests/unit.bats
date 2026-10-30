@@ -2297,3 +2297,31 @@ INI
   run _cbox_generate_claude_json "hdrapp" "normal"
   [[ "$output" == *"'remote': its headers are readable inside the container"*"type = mcp"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# opencode
+# ---------------------------------------------------------------------------
+
+@test "opencode config: host servers, warden MCP servers and warden providers, or nothing" {
+  rm -f "$CBOX_MCP_CONFIG"
+  run python3 -c "$(_cbox_mcp_py)" opencode-config "$CBOX_MCP_CONFIG" /relay "" ""
+  [ -z "$output" ]
+  echo '{"mcpServers": {"imcp": {"command": "/Applications/iMCP.app/x"}, "open": {"url": "https://mcp.example.com/mcp"}}}' > "$CBOX_MCP_CONFIG"
+  run python3 -c "$(_cbox_mcp_py)" opencode-config "$CBOX_MCP_CONFIG" /relay \
+    '{"tracker": "http://h/w/t/tracker/mcp"}' '{"openrouter": {"options": {"baseURL": "http://h/w/t/llm", "apiKey": "warden"}}}'
+  [ "$status" -eq 0 ]
+  run python3 -c 'import json,sys; c=json.loads(sys.argv[1]); print(c["mcp"]["imcp"], c["mcp"]["open"], c["mcp"]["tracker"], c["provider"]["openrouter"]["options"]["baseURL"])' "$output"
+  [ "$output" = "{'type': 'local', 'command': ['/relay', 'connect', 'imcp']} {'type': 'remote', 'url': 'https://mcp.example.com/mcp'} {'type': 'remote', 'url': 'http://h/w/t/tracker/mcp'} http://h/w/t/llm" ]
+}
+
+@test "warden opencode: a resource with opencode = <provider> routes that provider through warden" {
+  _warden_setup
+  sed -i 's|^env          = OPENAI_BASE_URL={url} OPENAI_API_KEY=warden|&\nopencode     = openrouter|' "$CBOX_WARDEN_DIR/resources"
+  printf '[s3x]\nupstream = http://127.0.0.1:1\nauth = sigv4\nkey-id = a\nsecret = b\nopencode = x\n' >> "$CBOX_WARDEN_DIR/resources"
+  run _warden_env
+  base=$(sed -n 's/^WARDEN_URL=//p' <<<"$output")
+  oc=$(sed -n 's/^WARDEN_OPENCODE=//p' <<<"$output" | base64 -d)
+  _warden_teardown
+  [ "$oc" = "{\"openrouter\": {\"options\": {\"baseURL\": \"$base/llm\", \"apiKey\": \"warden\"}}}" ]
+  grep -q "'s3x': opencode must be the id of an opencode provider" "$WT/stderr"
+}

@@ -60,13 +60,11 @@ RUN case $(uname -m) in \
     curl -fsSL "https://github.com/eza-community/eza/releases/latest/download/eza_${ARCH}-unknown-linux-gnu.tar.gz" \
     | tar xz -C /usr/local/bin
 
-# flux (Git + DVC auto-router). The pre-commit hook itself is self-contained
-# and doesn't call this binary — it's already present via the bind-mounted
-# .git/hooks, and only needs `dvc` (below) on PATH. This binary is here so
-# flux's own commands (list, doctor, dry-run, pin, ...) work if run manually
-# inside the container; DVC sync for flux-managed projects still runs
-# host-side around the container session (see _cbox_enter's flux _pull /
-# flux _push calls in cbox.sh).
+# flux (Git + DVC auto-router). Its hooks (pre-commit, pre-push) come with the
+# project's bind-mounted .git/hooks and only need `dvc` (below) on PATH. This
+# copy is a fallback: at each session start cbox replaces it with the host's
+# own flux when that differs (_cbox_flux_install), so both run the same version.
+# Storage access for DVC comes from warden on the host; no keys in here.
 RUN curl -fsSL -o /usr/local/bin/flux https://raw.githubusercontent.com/bpeterme/flux/main/flux && \
     chmod +x /usr/local/bin/flux
 

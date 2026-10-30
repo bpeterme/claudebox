@@ -2118,6 +2118,9 @@ _cbox_create() {
   local name="$1"
   local mode="$2"
 
+  # A new container still has the image's flux.
+  rm -f "$CBOX_DATA_DIR/.flux-installed-$name"
+
   local agent_bin
   agent_bin=$(_cbox_agent_bin)
 
@@ -2321,14 +2324,34 @@ _cbox_check_companion_api() {
 }
 
 # ---------------------------------------------------------
-# flux push — session-close sync for flux-managed repos
+# companion tools at session boundaries
 # ---------------------------------------------------------
 
-# Runs `flux _push` (auto-commits any dirty work, then pushes git + DVC).
-# Failures must always be visible — CBOX_VERBOSE only controls whether the
-# routine success output is shown too, never whether failures are silenced.
-# Same contract as _cbox_flux_push: a failed sync is reported, never fatal,
-# so the teardown after it (stopping the container) always runs.
+# The container runs the host's own flux: copied in whenever the host's flux
+# changed (e.g. after brew upgrade), so both sides agree on the repo layout.
+# No rebuild, no download. Storage access inside comes from warden, so cbox
+# no longer syncs flux projects on the host around the session.
+_cbox_flux_install() {
+  local name="$1" src sum stamp
+  src=$(command -v flux 2>/dev/null) || return 0
+  [[ -f "$src" ]] || return 0
+  sum=$(cksum < "$src" | cut -d' ' -f1)
+  stamp="$CBOX_DATA_DIR/.flux-installed-$name"
+  [[ "$(cat "$stamp" 2>/dev/null)" == "$sum" ]] && return 0
+  if $_CBOX_CMD exec -i --user root "$name" sh -c \
+      'cat > /usr/local/bin/flux.new && chmod 755 /usr/local/bin/flux.new && mv /usr/local/bin/flux.new /usr/local/bin/flux' \
+      < "$src" >/dev/null 2>&1; then
+    printf '%s\n' "$sum" > "$stamp"
+    _cbox_log "✔ flux in the container updated to the host's version"
+  else
+    echo "⚠  Could not install the host's flux in the container — it keeps its own version."
+  fi
+}
+
+# Runs a cdot sync command. Failures must always be visible — CBOX_VERBOSE only
+# controls whether the routine success output is shown too, never whether
+# failures are silenced. A failed sync is reported, never fatal, so the
+# teardown after it (stopping the container) always runs.
 _cbox_cdot_push() {
   if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
     cdot "$@" || true
@@ -2341,17 +2364,6 @@ _cbox_cdot_push() {
   fi
 }
 
-_cbox_flux_push() {
-  if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-    flux _push || true
-  else
-    local _out
-    if ! _out=$(flux _push 2>&1); then
-      echo "⚠  flux push failed:"
-      echo "$_out" | sed 's/^/    /'
-    fi
-  fi
-}
 
 # ---------------------------------------------------------
 # enter container
@@ -2386,13 +2398,6 @@ _cbox_enter() {
         fi
       fi
     fi
-    if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]] && _cbox_check_companion_api flux "$_CBOX_FLUX_API"; then
-      if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-        flux _pull || true
-      else
-        flux _pull >/dev/null 2>&1 || true
-      fi
-    fi
   fi
 
   if [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]] && [[ "$agent_bin" == "claude" ]]; then
@@ -2421,6 +2426,8 @@ _cbox_enter() {
     done < <(_cbox_warden_start "$name")
   fi
 
+  _cbox_flux_install "$name"
+
   echo "Entering container '$name'..."
 
   _cbox_session_start "$name"
@@ -2442,9 +2449,6 @@ _cbox_enter() {
       elif [[ "$agent_bin" == "opencode" ]]; then
         _cbox_cdot_push _push-opencode
       fi
-    fi
-    if command -v flux >/dev/null 2>&1 && [[ -d "$PWD/.dvc" ]] && _cbox_check_companion_api flux "$_CBOX_FLUX_API"; then
-      _cbox_flux_push
     fi
   fi
 

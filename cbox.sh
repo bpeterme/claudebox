@@ -1915,10 +1915,22 @@ _cbox_warden_broker_pid() {
   [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && echo "$pid"
 }
 
+# Identifies the broker's code and address. A running broker started by another
+# cbox version (e.g. before brew upgrade) would keep serving old rules, so it is
+# restarted; sessions live in files, so running containers keep their access.
+_cbox_warden_broker_id() {
+  { _cbox_warden_py; echo "$1:$CBOX_WARDEN_PORT"; } | cksum | cut -d' ' -f1
+}
+
 _cbox_warden_broker_start() {
-  _cbox_warden_broker_pid >/dev/null && return 0
-  local ip pidfile="$CBOX_WARDEN_DIR/broker.pid" _i
+  local ip pidfile="$CBOX_WARDEN_DIR/broker.pid" idfile="$CBOX_WARDEN_DIR/broker.id" _i id
   ip=$(_cbox_warden_host_ip)
+  id=$(_cbox_warden_broker_id "$ip")
+  if _cbox_warden_broker_pid >/dev/null; then
+    [[ "$(cat "$idfile" 2>/dev/null)" == "$id" ]] && return 0
+    _cbox_log "ℹ  restarting the warden broker (cbox was updated)"
+    _cbox_warden_broker_stop
+  fi
   rm -f "$pidfile"
   _cbox_warden_env
   nohup env "${_CBOX_WARDEN_ENV[@]}" python3 -c "$(_cbox_warden_py)" serve \
@@ -1929,7 +1941,11 @@ _cbox_warden_broker_start() {
   # take seconds to get there, so wait while it is still alive (up to 15s) and
   # give up early only when it has died (a zombie counts as dead).
   for ((_i = 0; _i < 75; _i++)); do
-    _cbox_warden_broker_pid >/dev/null && { _cbox_log "✔ warden broker running on $ip:$CBOX_WARDEN_PORT"; return 0; }
+    if _cbox_warden_broker_pid >/dev/null; then
+      printf '%s\n' "$id" > "$idfile"
+      _cbox_log "✔ warden broker running on $ip:$CBOX_WARDEN_PORT"
+      return 0
+    fi
     [[ "$(ps -o stat= -p "$launcher" 2>/dev/null)" =~ ^[^Z] ]] || break
     sleep 0.2
   done
@@ -1938,10 +1954,15 @@ _cbox_warden_broker_start() {
 }
 
 _cbox_warden_broker_stop() {
-  local pid
+  local pid _i
   pid=$(_cbox_warden_broker_pid) || return 0
   kill "$pid" 2>/dev/null || true
-  rm -f "$CBOX_WARDEN_DIR/broker.pid"
+  # Wait until the port is free, so a restart can bind it right away.
+  for ((_i = 0; _i < 25; _i++)); do
+    [[ "$(ps -o stat= -p "$pid" 2>/dev/null)" =~ ^[^Z] ]] || break
+    sleep 0.2
+  done
+  rm -f "$CBOX_WARDEN_DIR/broker.pid" "$CBOX_WARDEN_DIR/broker.id"
 }
 
 # Prints the container's environment (KEY=VALUE lines) for this session and

@@ -775,6 +775,28 @@ _warden_relocate() {
   [[ "$(cat "$WT/stderr")" == *"warden is off"*"$CBOX_SHARE_DIR"* ]]
 }
 
+@test "warden: a broker from another cbox version is restarted; tokens keep working" {
+  _warden_setup
+  url=$(_warden_url)
+  pid1=$(_cbox_warden_broker_pid)
+  _warden_env >/dev/null
+  pid2=$(_cbox_warden_broker_pid)
+  # As left by an older cbox: no (or another) code id.
+  rm -f "$CBOX_WARDEN_DIR/broker.id"
+  _warden_env >/dev/null
+  pid3=$(_cbox_warden_broker_pid)
+  echo other > "$CBOX_WARDEN_DIR/broker.id"
+  url_after=$(_warden_url)
+  pid4=$(_cbox_warden_broker_pid)
+  out=$(curl -s "$url/llm/models")
+  _warden_teardown
+  [ "$pid1" = "$pid2" ]
+  [ "$pid3" != "$pid2" ]
+  [ "$pid4" != "$pid3" ]
+  [ "$url_after" = "$url" ]
+  [[ "$out" == *'"path": "/api/v1/models"'* ]]
+}
+
 @test "warden: waits for a slow-starting broker (cold python3 on macOS)" {
   _warden_setup
   mkdir -p "$WT/slowbin"

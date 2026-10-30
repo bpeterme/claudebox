@@ -49,6 +49,14 @@ MCP servers on the host (~/.config/claudebox/mcp.json):
   cbox mcp              Show configured host MCP servers and relay status
   cbox mcp import       Import servers from Claude Desktop / Claude Code
 
+Credentials without exposing them (warden):
+  cbox warden           List resources and what this project gets
+  cbox warden edit      Define resources (APIs the container may use)
+  cbox warden secret set <resource>   Store a secret in the Keychain
+  cbox warden approve   Approve this project's .warden file
+  cbox warden test <resource>         Check a resource from the host
+  cbox warden log       Show recent broker requests
+
 Maintenance:
   cbox update           Force agent update (Claude Code or opencode)
   cbox doctor           Run environment diagnostics
@@ -97,6 +105,10 @@ _CBOX_MCP_RELAY="/home/claude/.local/bin/cbox-mcp-relay"
 _CBOX_MCP_SLOTS=2
 # Below Claude Code's 30s MCP connect timeout, so the hint lands before it gives up
 _CBOX_MCP_HINT_SECONDS=25
+# warden: host-side credential broker (see "warden" below). Its directory holds
+# resource definitions, approvals and session tokens — host only, never mounted.
+CBOX_WARDEN_DIR="${CBOX_WARDEN_DIR:-$CBOX_DATA_DIR/warden}"
+CBOX_WARDEN_PORT="${CBOX_WARDEN_PORT:-47100}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
@@ -1164,6 +1176,601 @@ _cbox_mcp_status() {
 }
 
 # ---------------------------------------------------------
+# warden
+# ---------------------------------------------------------
+#
+# Lets code in the container use host credentials without ever holding them:
+#
+#   container: $WARDEN_URL/<resource>/path ──http──▶ host: warden broker
+#                                                      ├─ token → container + granted resources
+#                                                      ├─ policy check (allow list, no dot segments)
+#                                                      ├─ secret from the Keychain, per request
+#                                                      └─ forwards to the upstream with auth applied
+#
+# Resources are defined on the host only ($CBOX_WARDEN_DIR/resources, never
+# mounted). `availability = global` gives a resource to every container;
+# `project` only to repos whose tracked .warden file lists it AND whose
+# current .warden the user approved on the host (approval is tied to the file's
+# hash, so an edit made inside the container needs a fresh approval).
+#
+# The per-container token in $WARDEN_URL is not a secret from Claude: it only
+# unlocks what the user already granted to this container, and it dies with the
+# container's last session.
+
+# Host-side logic: session grants, the broker, `cbox warden`.
+# Run as: python3 -c "$(_cbox_warden_py)" <command> ...
+_cbox_warden_py() {
+  cat <<'PYEOF'
+import base64, configparser, datetime, hashlib, http.client, http.server, json, os, re, secrets, socketserver, subprocess, sys, threading
+from fnmatch import fnmatchcase
+from urllib.parse import urlsplit, unquote, parse_qsl, urlencode
+
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+AUTH_SCHEMES = ("bearer", "basic", "header:", "query:")
+HOP = {"connection", "keep-alive", "proxy-connection", "proxy-authorization", "te", "trailer",
+       "transfer-encoding", "upgrade", "host"}
+CHUNK = 1 << 16
+TEMPLATE = """\
+# warden resources — host only, never mounted into a container.
+# One section per resource; the container never sees the secret itself.
+#
+# [openrouter]
+# type         = http
+# upstream     = https://openrouter.ai/api/v1
+# auth         = bearer                  # bearer | basic | header:<Name> | query:<param>
+# secret       = cbox.warden.openrouter  # Keychain item (service name); set with: cbox warden secret set openrouter
+# availability = global                  # global: every container | project: only repos whose .warden lists it
+# allow        = POST /chat/completions, GET /models   # optional; default: everything under upstream
+# env          = OPENROUTER_BASE_URL={url} OPENROUTER_API_KEY=warden
+# test         = GET /models             # used by: cbox warden test openrouter
+"""
+
+
+# --- helpers ----------------------------------------------------------------
+
+def paths(d):
+    return {"resources": os.path.join(d, "resources"), "approvals": os.path.join(d, "approvals.json"),
+            "sessions": os.path.join(d, "sessions"), "log": os.path.join(d, "broker.log")}
+
+
+def write_private(path, text):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return default
+
+
+def load_resources(d, warn=None):
+    """Valid resources from the host-only config; problems go to warn()."""
+    cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#",))
+    try:
+        cp.read(paths(d)["resources"])
+    except configparser.Error as e:
+        warn and warn(f"warden resources file is not valid: {e}")
+        return {}
+    out = {}
+    for name in cp.sections():
+        r = dict(cp[name])
+        problem = validate(name, r)
+        if problem:
+            warn and warn(f"warden resource '{name}': {problem} — skipped")
+            continue
+        out[name] = r
+    return out
+
+
+def validate(name, r):
+    if not NAME_RE.match(name):
+        return "name may only contain a-z, 0-9, '_' and '-'"
+    if r.get("type", "http") != "http":
+        return f"type '{r.get('type')}' is not supported yet"
+    up = urlsplit(r.get("upstream", ""))
+    if up.scheme not in ("http", "https") or not up.netloc:
+        return "upstream must be an http(s) URL"
+    if not r.get("auth", "").startswith(AUTH_SCHEMES):
+        return "auth must be bearer, basic, header:<Name> or query:<param>"
+    if not r.get("secret"):
+        return "secret (Keychain item name) is missing"
+    if r.get("availability", "global") not in ("global", "project"):
+        return "availability must be global or project"
+    for pair in r.get("env", "").split():
+        if "=" not in pair or not ENV_KEY_RE.match(pair.split("=", 1)[0]):
+            return f"env entry '{pair}' is not KEY=VALUE"
+    return None
+
+
+def read_secret(r):
+    """Secret for resource r: macOS Keychain, or CBOX_WARDEN_SECRET_CMD <item>."""
+    item = r["secret"]
+    cmd = os.environ.get("CBOX_WARDEN_SECRET_CMD")
+    if cmd:
+        argv = [cmd, item]
+    elif sys.platform == "darwin":
+        argv = ["security", "find-generic-password", "-s", item, "-a", r.get("secret-account") or os.environ.get("USER", ""), "-w"]
+    else:
+        raise LookupError("no secret store: set CBOX_WARDEN_SECRET_CMD (a command that prints the secret for an item name)")
+    p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+    value = p.stdout.decode().rstrip("\n")
+    if p.returncode != 0 or not value:
+        raise LookupError(f"secret '{item}' not found — set it with: cbox warden secret set <name>")
+    return value
+
+
+def project_file(project):
+    return os.path.join(project, ".warden")
+
+
+def project_request(project):
+    """(resource names, sha256) requested by the project's .warden, or ([], None)."""
+    try:
+        with open(project_file(project), "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return [], None
+    cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#",))
+    try:
+        cp.read_string(raw.decode())
+    except (configparser.Error, UnicodeDecodeError):
+        return None, hashlib.sha256(raw).hexdigest()
+    return cp.sections(), hashlib.sha256(raw).hexdigest()
+
+
+def err(msg):
+    sys.stderr.write(msg + "\n")
+
+
+# --- session: decide grants, issue token, print container env ---------------
+
+def ask(question):
+    if not sys.stdin.isatty():
+        return False
+    sys.stderr.write(question)
+    sys.stderr.flush()
+    return sys.stdin.readline().strip().lower() in ("y", "yes")
+
+
+def approve(d, project, interactive):
+    """True if the project's current .warden is approved (asking if allowed)."""
+    names, digest = project_request(project)
+    if digest is None:
+        return True
+    if names is None:
+        err(f"⚠  {project_file(project)} is not valid INI — project resources skipped")
+        return False
+    approvals = load_json(paths(d)["approvals"], {})
+    if approvals.get(project) == digest:
+        return True
+    resources = load_resources(d)
+    err(f"This project asks warden for: (from {project_file(project)})")
+    for n in names:
+        r = resources.get(n)
+        err(f"  • {n}: " + (f"{r['upstream']} ({r.get('availability', 'global')})" if r else "not configured on this machine"))
+    if not interactive or not ask("Allow these for this project? [y/N] "):
+        err("ℹ  Not approved — project resources stay off. Approve later with: cbox warden approve")
+        return False
+    approvals[project] = digest
+    write_private(paths(d)["approvals"], json.dumps(approvals, indent=2, sort_keys=True) + "\n")
+    return True
+
+
+def cmd_session(d, box, project, base_url, interactive):
+    p = paths(d)
+    resources = load_resources(d, warn=err)
+    granted = [n for n, r in resources.items() if r.get("availability", "global") == "global"]
+    names, _ = project_request(project)
+    if names and approve(d, project, interactive == "1"):
+        for n in names:
+            if n not in resources:
+                err(f"⚠  .warden asks for '{n}', which is not configured in {p['resources']}")
+            elif n not in granted:
+                granted.append(n)
+    sess_path = os.path.join(p["sessions"], f"{box}.json")
+    token = load_json(sess_path, {}).get("token") or secrets.token_urlsafe(24)
+    write_private(sess_path, json.dumps({"token": token, "box": box, "project": project,
+                                         "resources": sorted(granted)}, indent=2) + "\n")
+    url = f"{base_url}/w/{token}"
+    print(f"WARDEN_URL={url}")
+    for n in sorted(granted):
+        for pair in resources[n].get("env", "").split():
+            print(pair.replace("{url}", f"{url}/{n}"))
+
+
+def cmd_end(d, box):
+    """Forget the container's token. Exit 0 when no sessions remain."""
+    s = paths(d)["sessions"]
+    try:
+        os.remove(os.path.join(s, f"{box}.json"))
+    except FileNotFoundError:
+        pass
+    left = [f for f in os.listdir(s)] if os.path.isdir(s) else []
+    sys.exit(0 if not any(f.endswith(".json") for f in left) else 1)
+
+
+# --- broker -------------------------------------------------------------------
+
+def log_line(d, text):
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(paths(d)["log"], "a") as f:
+        f.write(f"{stamp} {text}\n")
+
+
+def find_session(d, token):
+    s = paths(d)["sessions"]
+    for f in os.listdir(s) if os.path.isdir(s) else []:
+        sess = load_json(os.path.join(s, f), {}) if f.endswith(".json") else {}
+        if sess.get("token") and secrets.compare_digest(sess["token"], token):
+            return sess
+    return None
+
+
+def allowed(r, method, rest):
+    rules = [x.strip() for x in r.get("allow", "").split(",") if x.strip()]
+    if not rules:
+        return True
+    for rule in rules:
+        m, _, pat = rule.partition(" ")
+        if fnmatchcase(method, m.strip().upper()) and fnmatchcase(rest, pat.strip()):
+            return True
+    return False
+
+
+def apply_auth(r, headers, query, secret):
+    scheme = r["auth"]
+    if scheme == "bearer":
+        headers["Authorization"] = f"Bearer {secret}"
+    elif scheme == "basic":
+        headers["Authorization"] = "Basic " + base64.b64encode(secret.encode()).decode()
+    elif scheme.startswith("header:"):
+        headers[scheme.split(":", 1)[1].strip()] = secret
+    elif scheme.startswith("query:"):
+        param = scheme.split(":", 1)[1].strip()
+        query = [(k, v) for k, v in query if k != param] + [(param, secret)]
+    return headers, query
+
+
+class Broker(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "warden"
+    sys_version = ""
+    d = None
+
+    def fail(self, code, msg, who="-"):
+        body = json.dumps({"error": {"message": f"warden: {msg}", "code": code}}).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        self.close_connection = True
+        log_line(self.d, f"{who} {self.command} {urlsplit(self.path).path.split('/', 3)[-1][:120]} -> {code} {msg}")
+
+    def body_iter(self):
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            while True:
+                size = int(self.rfile.readline().split(b";")[0].strip() or b"0", 16)
+                if size == 0:
+                    while self.rfile.readline() not in (b"\r\n", b"\n", b""):
+                        pass
+                    return
+                yield self.rfile.read(size)
+                self.rfile.readline()
+        left = int(self.headers.get("Content-Length") or 0)
+        while left > 0:
+            data = self.rfile.read(min(CHUNK, left))
+            if not data:
+                return
+            left -= len(data)
+            yield data
+
+    def handle_any(self):
+        split = urlsplit(self.path)
+        parts = split.path.split("/", 4)  # '', 'w', token, resource, rest
+        if len(parts) < 4 or parts[1] != "w":
+            return self.fail(404, "unknown path; use $WARDEN_URL/<resource>/...")
+        sess = find_session(self.d, parts[2])
+        if not sess:
+            return self.fail(403, "unknown or expired session token")
+        who, name = sess.get("box", "?"), parts[3]
+        rest = "/" + (parts[4] if len(parts) > 4 else "")
+        resources = load_resources(self.d)
+        if name not in sess.get("resources", []) or name not in resources:
+            return self.fail(403, f"resource '{name}' is not available to this container", who)
+        r = resources[name]
+        if ".." in unquote(unquote(rest)).split("/") or "." in unquote(unquote(rest)).split("/"):
+            return self.fail(403, "dot segments are not allowed", who)
+        if not allowed(r, self.command, rest):
+            return self.fail(403, f"{self.command} {rest} is not allowed for '{name}'", who)
+        try:
+            secret = read_secret(r)
+        except (LookupError, OSError, subprocess.SubprocessError) as e:
+            return self.fail(502, str(e), who)
+        up = urlsplit(r["upstream"])
+        scheme = r["auth"]
+        drop = {"authorization", "x-api-key", "api-key"}
+        if scheme.startswith("header:"):
+            drop.add(scheme.split(":", 1)[1].strip().lower())
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP | drop}
+        headers, query = apply_auth(r, headers, parse_qsl(split.query, keep_blank_values=True), secret)
+        target = up.path.rstrip("/") + rest + (("?" + urlencode(query)) if query else "")
+        headers["Host"] = up.netloc
+        conn_cls = http.client.HTTPSConnection if up.scheme == "https" else http.client.HTTPConnection
+        conn = conn_cls(up.netloc, timeout=600)
+        try:
+            # Bodies are streamed; without Content-Length, http.client sends them chunked.
+            has_body = "Content-Length" in self.headers or "chunked" in self.headers.get("Transfer-Encoding", "").lower()
+            conn.request(self.command, target, body=self.body_iter() if has_body else None, headers=headers)
+            resp = conn.getresponse()
+        except (OSError, http.client.HTTPException) as e:
+            conn.close()
+            return self.fail(502, f"upstream {up.netloc} unreachable: {e.__class__.__name__}", who)
+        log_line(self.d, f"{who} {self.command} {name}{rest[:120]} -> {resp.status}")
+        self.send_response(resp.status)
+        length = resp.getheader("Content-Length")
+        for k, v in resp.getheaders():
+            if k.lower() not in HOP and k.lower() != "content-length":
+                self.send_header(k, v)
+        chunked = length is None and self.command != "HEAD" and resp.status not in (204, 304)
+        if length is not None:
+            self.send_header("Content-Length", length)
+        if chunked:
+            self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        try:
+            while True:
+                data = resp.read1(CHUNK) if hasattr(resp, "read1") else resp.read(CHUNK)
+                if not data:
+                    break
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data) if chunked else data)
+                self.wfile.flush()
+            if chunked:
+                self.wfile.write(b"0\r\n\r\n")
+        except OSError:
+            self.close_connection = True
+        finally:
+            conn.close()
+
+    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = handle_any
+
+    def log_message(self, *a):
+        pass
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def cmd_serve(d, bind, port, pidfile):
+    Broker.d = d
+    srv = Server((bind, int(port)), Broker)
+    write_private(pidfile, f"{os.getpid()}\n")
+    log_line(d, f"broker started on {bind}:{port} (pid {os.getpid()})")
+    try:
+        srv.serve_forever()
+    finally:
+        log_line(d, "broker stopped")
+
+
+# --- user-facing ----------------------------------------------------------------
+
+def cmd_list(d, project):
+    p = paths(d)
+    if not os.path.exists(p["resources"]):
+        print("No warden resources configured.")
+        print("  Create them with: cbox warden edit")
+        return
+    resources = load_resources(d, warn=lambda m: print("⚠  " + m))
+    names, digest = project_request(project)
+    approved = digest is not None and load_json(p["approvals"], {}).get(project) == digest
+    for n, r in resources.items():
+        avail = r.get("availability", "global")
+        here = avail == "global" or (names and n in names and approved)
+        note = "every container" if avail == "global" else (
+            "this project (approved)" if here else "this project: listed in .warden, not approved" if names and n in names
+            else "projects whose .warden lists it")
+        print(f"{'✔' if here else '·'} {n:<16} {r['upstream']}  [{r['auth'].split(':')[0]}; {note}]")
+    if names is None:
+        print(f"⚠  {project_file(project)} is not valid INI")
+    elif names and not approved:
+        print("ℹ  This project's .warden is not approved yet: cbox warden approve")
+
+
+def cmd_approve(d, project):
+    names, digest = project_request(project)
+    if digest is None:
+        print(f"No .warden file in {project}")
+        return
+    approvals = load_json(paths(d)["approvals"], {})
+    if approvals.get(project) == digest:
+        print("✔ Already approved.")
+        return
+    approve(d, project, interactive=True)
+
+
+def cmd_test(d, name):
+    r = load_resources(d, warn=err).get(name)
+    if not r:
+        err(f"No resource '{name}' in {paths(d)['resources']}")
+        sys.exit(1)
+    method, _, path = (r.get("test") or "GET /").partition(" ")
+    try:
+        secret = read_secret(r)
+    except (LookupError, OSError, subprocess.SubprocessError) as e:
+        err(f"✖ {e}")
+        sys.exit(1)
+    up = urlsplit(r["upstream"])
+    headers, query = apply_auth(r, {"User-Agent": "warden-test"}, [], secret)
+    conn = (http.client.HTTPSConnection if up.scheme == "https" else http.client.HTTPConnection)(up.netloc, timeout=30)
+    try:
+        conn.request(method.upper(), up.path.rstrip("/") + path.strip() + (("?" + urlencode(query)) if query else ""), headers=headers)
+        status = conn.getresponse().status
+    except (OSError, http.client.HTTPException) as e:
+        err(f"✖ {name}: {up.netloc} unreachable ({e.__class__.__name__})")
+        sys.exit(1)
+    print(f"{'✔' if status < 400 else '✖'} {name}: {method.upper()} {path.strip()} → HTTP {status}")
+    sys.exit(0 if status < 400 else 1)
+
+
+def cmd_template(d):
+    path = paths(d)["resources"]
+    if not os.path.exists(path):
+        write_private(path, TEMPLATE)
+    print(path)
+
+
+COMMANDS = {
+    "session": lambda a: cmd_session(*a),
+    "end": lambda a: cmd_end(*a),
+    "serve": lambda a: cmd_serve(*a),
+    "list": lambda a: cmd_list(*a),
+    "approve": lambda a: cmd_approve(*a),
+    "test": lambda a: cmd_test(*a),
+    "template": lambda a: cmd_template(*a),
+}
+
+if __name__ == "__main__":
+    COMMANDS[sys.argv[1]](sys.argv[2:])
+PYEOF
+}
+
+_cbox_warden_enabled() {
+  [[ -f "$CBOX_WARDEN_DIR/resources" ]]
+}
+
+# Address on which the host is reachable from containers. The broker binds only
+# there — not on all interfaces — so it is not exposed to the local network.
+_cbox_warden_host_ip() {
+  if [[ -n "${CBOX_WARDEN_HOST:-}" ]]; then
+    echo "$CBOX_WARDEN_HOST"
+  elif [[ "$_CBOX_RUNTIME" == "apple" ]]; then
+    echo "192.168.64.1"
+  else
+    ip -4 -o addr show docker0 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}' | grep . || echo "172.17.0.1"
+  fi
+}
+
+_cbox_warden_broker_pid() {
+  local pid
+  pid=$(cat "$CBOX_WARDEN_DIR/broker.pid" 2>/dev/null) || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+}
+
+_cbox_warden_broker_start() {
+  _cbox_warden_broker_pid >/dev/null && return 0
+  local ip pidfile="$CBOX_WARDEN_DIR/broker.pid" _i
+  ip=$(_cbox_warden_host_ip)
+  rm -f "$pidfile"
+  nohup python3 -c "$(_cbox_warden_py)" serve "$CBOX_WARDEN_DIR" "$ip" "$CBOX_WARDEN_PORT" "$pidfile" \
+    >>"$CBOX_WARDEN_DIR/broker.log" 2>&1 &
+  disown 2>/dev/null || true
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    _cbox_warden_broker_pid >/dev/null && { _cbox_log "✔ warden broker running on $ip:$CBOX_WARDEN_PORT"; return 0; }
+    sleep 0.3
+  done
+  echo "⚠  warden broker did not start — check $CBOX_WARDEN_DIR/broker.log" >&2
+  return 1
+}
+
+_cbox_warden_broker_stop() {
+  local pid
+  pid=$(_cbox_warden_broker_pid) || return 0
+  kill "$pid" 2>/dev/null || true
+  rm -f "$CBOX_WARDEN_DIR/broker.pid"
+}
+
+# Prints the container's environment (KEY=VALUE lines) for this session and
+# makes sure the broker runs. Approval questions go to stderr / the terminal.
+_cbox_warden_start() {
+  local name="$1" f box interactive=0
+  _cbox_warden_enabled || return 0
+  mkdir -p "$CBOX_WARDEN_DIR/sessions"
+  chmod 700 "$CBOX_WARDEN_DIR" "$CBOX_WARDEN_DIR/sessions"
+  # Forget tokens of containers whose sessions ended without cleanup.
+  while IFS= read -r f; do
+    box=$(basename "$f" .json)
+    [[ "$box" == "$name" ]] && continue
+    [[ -n "$(_cbox_session_markers "$box")" ]] || rm -f "$f"
+  done < <(find "$CBOX_WARDEN_DIR/sessions" -maxdepth 1 -name '*.json' 2>/dev/null)
+  _cbox_warden_broker_start || return 0
+  [[ -t 0 ]] && interactive=1
+  python3 -c "$(_cbox_warden_py)" session "$CBOX_WARDEN_DIR" "$name" "$PWD" \
+    "http://$(_cbox_warden_host_ip):$CBOX_WARDEN_PORT" "$interactive"
+}
+
+# The container's last session ended: drop its token, and stop the broker once
+# no container has a session left.
+_cbox_warden_end() {
+  [[ -d "$CBOX_WARDEN_DIR/sessions" ]] || return 0
+  if python3 -c "$(_cbox_warden_py)" end "$CBOX_WARDEN_DIR" "$1"; then
+    _cbox_warden_broker_stop
+  fi
+}
+
+_cbox_warden_secret_set() {
+  local res="$1"
+  if [[ ! "$res" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]]; then
+    echo "Usage: cbox warden secret set <resource>   (a-z, 0-9, '_' and '-')"
+    return 1
+  fi
+  if [[ "$(/usr/bin/uname)" != "Darwin" ]]; then
+    echo "Storing secrets needs the macOS Keychain. On other hosts, set CBOX_WARDEN_SECRET_CMD"
+    echo "to a command that prints the secret for an item name (e.g. a 'pass' or 'secret-tool' wrapper)."
+    return 1
+  fi
+  echo "Paste the secret for '$res' (input is hidden). It is stored in the Keychain as cbox.warden.$res."
+  security add-generic-password -U -s "cbox.warden.$res" -a "$USER" -l "cbox warden: $res" -w || return 1
+  echo "✔ Stored. Reference it in $CBOX_WARDEN_DIR/resources with:  secret = cbox.warden.$res"
+}
+
+_cbox_warden_cmd() {
+  case "${1:-}" in
+    ""|list)
+      python3 -c "$(_cbox_warden_py)" list "$CBOX_WARDEN_DIR" "$PWD"
+      _cbox_warden_enabled || return 0
+      local pid
+      if pid=$(_cbox_warden_broker_pid); then
+        echo "✔ broker running (pid $pid, $(_cbox_warden_host_ip):$CBOX_WARDEN_PORT, log: $CBOX_WARDEN_DIR/broker.log)"
+      else
+        echo "ℹ broker not running — starts with the next cbox session"
+      fi
+      ;;
+    edit)
+      local file
+      file=$(python3 -c "$(_cbox_warden_py)" template "$CBOX_WARDEN_DIR") || return 1
+      "${EDITOR:-vi}" "$file"
+      ;;
+    secret)
+      [[ "${2:-}" == "set" ]] || { echo "Usage: cbox warden secret set <resource>"; return 1; }
+      _cbox_warden_secret_set "${3:-}"
+      ;;
+    approve) python3 -c "$(_cbox_warden_py)" approve "$CBOX_WARDEN_DIR" "$PWD" ;;
+    test)
+      [[ -n "${2:-}" ]] || { echo "Usage: cbox warden test <resource>"; return 1; }
+      python3 -c "$(_cbox_warden_py)" test "$CBOX_WARDEN_DIR" "$2"
+      ;;
+    log) tail -n "${2:-20}" "$CBOX_WARDEN_DIR/broker.log" 2>/dev/null || echo "No broker log yet." ;;
+    *)
+      echo "Unknown warden command: $1"
+      echo "Usage: cbox warden [list|edit|secret set <resource>|approve|test <resource>|log]"
+      return 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------
 # playwright browser cache
 # ---------------------------------------------------------
 
@@ -1511,11 +2118,17 @@ _cbox_enter() {
     _cbox_generate_claude_json "$name" "$mode"
   fi
 
-  echo "Entering container '$name'..."
-
   local _exec_args=(-it -w "/Workspace/$name")
   [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]] && [[ "$agent_bin" == "claude" ]] && \
     _exec_args+=(-e "PULSE_SERVER=$(_cbox_audio_pulse_server)")
+  if [[ "$mode" != "safe" ]]; then
+    local _w_env
+    while IFS= read -r _w_env; do
+      if [[ -n "$_w_env" ]]; then _exec_args+=(-e "$_w_env"); fi
+    done < <(_cbox_warden_start "$name")
+  fi
+
+  echo "Entering container '$name'..."
 
   _cbox_session_start "$name"
 
@@ -1567,6 +2180,7 @@ _cbox_enter() {
 
   if (( _last_session )); then
     _cbox_mcp_relay_stop "$name"
+    _cbox_warden_end "$name"
     local _cache_base="${XDG_CACHE_HOME:-$HOME/.cache}"
     [[ -n "$CBOX_SHARE_DIR" && ( "$CBOX_SHARE_DIR" == /tmp/* || "$CBOX_SHARE_DIR" == "$_cache_base"/* ) ]] && \
       find "$CBOX_SHARE_DIR" -mindepth 1 -delete 2>/dev/null || true
@@ -1719,6 +2333,10 @@ _cbox_doctor() {
   echo
   echo "[mcp]"
   _cbox_mcp_status "$name"
+
+  echo
+  echo "[warden]"
+  _cbox_warden_cmd list
 }
 
 # ---------------------------------------------------------
@@ -1771,6 +2389,7 @@ cbox() {
       fi
       echo "Stopping container '$stop_target'..."
       _cbox_mcp_relay_stop "$stop_target"
+      _cbox_warden_end "$stop_target"
       $_CBOX_CMD stop "$stop_target" >/dev/null
       ;;
 
@@ -1782,6 +2401,7 @@ cbox() {
       fi
       echo "Removing container '$reset_target'..."
       _cbox_mcp_relay_stop "$reset_target"
+      _cbox_warden_end "$reset_target"
       $_CBOX_CMD rm -f "$reset_target"
       ;;
 
@@ -1812,6 +2432,11 @@ cbox() {
           return 1
           ;;
       esac
+      ;;
+
+    warden)
+      shift
+      _cbox_warden_cmd "$@"
       ;;
 
     _doctor)
@@ -1921,7 +2546,7 @@ if [[ -n "${ZSH_VERSION:-}" ]]; then
   _cbox_zsh_complete() {
     case $CURRENT in
       2)
-        compadd -v --verbose list stop reset prune rebuild update doctor mcp safe shell keepalive oc opencode version help
+        compadd -v --verbose list stop reset prune rebuild update doctor mcp warden safe shell keepalive oc opencode version help
         ;;
       3)
         if [[ "${words[2]}" == "reset" || "${words[2]}" == "stop" ]]; then
@@ -1941,7 +2566,7 @@ elif [[ -n "${BASH_VERSION:-}" ]]; then
 
     if [[ $COMP_CWORD -eq 1 ]]; then
       COMPREPLY=( $(compgen -W \
-        "-v --verbose list stop reset prune rebuild update doctor mcp safe shell keepalive oc opencode version help" \
+        "-v --verbose list stop reset prune rebuild update doctor mcp warden safe shell keepalive oc opencode version help" \
         -- "$cur") )
     elif [[ $COMP_CWORD -eq 2 && ( "$prev" == "reset" || "$prev" == "stop" ) ]]; then
       COMPREPLY=( $(compgen -W "$(_cbox_list_names)" -- "$cur") )

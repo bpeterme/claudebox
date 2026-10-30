@@ -434,6 +434,280 @@ cmd_import(sys.argv[2])" "$CBOX_MCP_CONFIG"
 }
 
 # ---------------------------------------------------------------------------
+# warden (credential broker; end to end with a fake upstream on localhost)
+# ---------------------------------------------------------------------------
+
+_warden_setup() {
+  rm -rf "$CBOX_WARDEN_DIR"
+  mkdir -p "$CBOX_WARDEN_DIR"
+  export CBOX_WARDEN_HOST=127.0.0.1
+  CBOX_WARDEN_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+  UP_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+  WT="$BATS_TMPDIR/warden-t"
+  rm -rf "$WT"; mkdir -p "$WT/proj"
+  # Fake secret store: never a real secret.
+  printf '#!/bin/sh\necho "sk-test-REDACTED-$1"\n' > "$WT/secret"
+  chmod +x "$WT/secret"
+  export CBOX_WARDEN_SECRET_CMD="$WT/secret"
+  cat > "$WT/upstream.py" <<'PY'
+import http.server, json, sys, time
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def handle_any(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if self.path.endswith("/stream"):
+            self.send_response(200); self.send_header("Connection", "close"); self.end_headers()
+            for i in range(3):
+                self.wfile.write(f"data: {i}\n\n".encode()); self.wfile.flush(); time.sleep(0.1)
+            self.close_connection = True
+            return
+        out = json.dumps({"path": self.path, "body": body.decode(),
+                          "headers": {k.lower(): v for k, v in self.headers.items()}}).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers()
+        self.wfile.write(out)
+    do_GET = do_POST = do_DELETE = handle_any
+    def log_message(self, *a): pass
+http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+  python3 "$WT/upstream.py" "$UP_PORT" &
+  UP_PID=$!
+  cat > "$CBOX_WARDEN_DIR/resources" <<INI
+[llm]
+upstream     = http://127.0.0.1:$UP_PORT/api/v1
+auth         = bearer
+secret       = cbox.warden.llm
+allow        = POST /chat/*, GET /models, GET /stream
+env          = OPENAI_BASE_URL={url} OPENAI_API_KEY=warden
+[hdr]
+upstream = http://127.0.0.1:$UP_PORT/h
+auth     = header:X-Api-Key
+secret   = cbox.warden.hdr
+[bas]
+upstream = http://127.0.0.1:$UP_PORT/b
+auth     = basic
+secret   = cbox.warden.bas
+[qry]
+upstream = http://127.0.0.1:$UP_PORT/q
+auth     = query:key
+secret   = cbox.warden.qry
+[proj]
+upstream     = http://127.0.0.1:$UP_PORT/p
+auth         = bearer
+secret       = cbox.warden.proj
+availability = project
+INI
+  cd "$WT/proj"
+}
+
+_warden_teardown() {
+  _cbox_warden_broker_stop
+  kill "$UP_PID" 2>/dev/null || true
+  cd "$BATS_TMPDIR"
+}
+
+# Session env for container wbox (non-interactive), one KEY=VALUE per line.
+_warden_env() {
+  _cbox_warden_start wbox </dev/null 2>"$WT/stderr"
+}
+
+_warden_url() {
+  _warden_env | sed -n 's/^WARDEN_URL=//p'
+}
+
+# Approve the project's current .warden as if the user typed "y".
+_warden_approve_yes() {
+  python3 -c "
+import sys, io
+sys.stdin = io.TextIOWrapper(io.BytesIO(b'y\n'))
+sys.stdin.isatty = lambda: True
+exec(sys.argv[1])
+" "$(_cbox_warden_py | sed '/^if __name__/,$d')
+cmd_approve(sys.argv[2], sys.argv[3])" "$CBOX_WARDEN_DIR" "$PWD" 2>/dev/null
+}
+
+@test "warden: nothing happens without a resources file" {
+  rm -rf "$CBOX_WARDEN_DIR"
+  run _cbox_warden_start wbox
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ ! -d "$CBOX_WARDEN_DIR" ]
+}
+
+@test "warden: session env has WARDEN_URL and the global resources' env" {
+  _warden_setup
+  run _warden_env
+  _warden_teardown
+  [[ "${lines[0]}" =~ ^WARDEN_URL=http://127\.0\.0\.1:[0-9]+/w/[A-Za-z0-9_-]{20,}$ ]]
+  [[ "$output" == *"OPENAI_BASE_URL=${lines[0]#WARDEN_URL=}/llm"* ]]
+  [[ "$output" == *"OPENAI_API_KEY=warden"* ]]
+}
+
+@test "warden: bearer secret replaces whatever key the client sends" {
+  _warden_setup
+  url=$(_warden_url)
+  run curl -s -H 'Authorization: Bearer sk-or-REDACTED' -d '{"m":1}' "$url/llm/chat/completions"
+  _warden_teardown
+  [[ "$output" == *'"path": "/api/v1/chat/completions"'* ]]
+  [[ "$output" == *'"authorization": "Bearer sk-test-REDACTED-cbox.warden.llm"'* ]]
+  [[ "$output" == *'"body": "{\"m\":1}"'* ]]
+}
+
+@test "warden: header, basic and query schemes" {
+  _warden_setup
+  url=$(_warden_url)
+  hdr=$(curl -s -H 'X-Api-Key: fake' "$url/hdr/a")
+  bas=$(curl -s "$url/bas/a")
+  qry=$(curl -s "$url/qry/a?x=1&key=fake")
+  _warden_teardown
+  [[ "$hdr" == *'"x-api-key": "sk-test-REDACTED-cbox.warden.hdr"'* ]]
+  [[ "$hdr" != *'"authorization"'* ]]
+  [[ "$bas" == *"\"authorization\": \"Basic $(printf 'sk-test-REDACTED-cbox.warden.bas' | base64)\""* ]]
+  [[ "$qry" == *'"path": "/q/a?x=1&key=sk-test-REDACTED-cbox.warden.qry"'* ]]
+}
+
+@test "warden: streamed responses pass through" {
+  _warden_setup
+  url=$(_warden_url)
+  run curl -sN "$url/llm/stream"
+  _warden_teardown
+  [ "$output" = "$(printf 'data: 0\n\ndata: 1\n\ndata: 2\n')" ]
+}
+
+@test "warden: refuses what was not granted or allowed" {
+  _warden_setup
+  url=$(_warden_url)
+  host=${url%/w/*}
+  code() { curl -s -o /dev/null -w '%{http_code} ' --path-as-is "$@"; }
+  got=$(code "$url/llm/admin")                # outside the allow list
+  got+=$(code -X DELETE "$url/llm/models")    # method not allowed
+  got+=$(code "$url/proj/a")                  # project resource, not approved
+  got+=$(code "$url/nope/a")                  # unknown resource
+  got+=$(code "$url/llm/../hdr/a")            # dot segments
+  got+=$(code "$url/llm/%252e%252e/x")        # encoded dot segments
+  got+=$(code "$host/w/wrong-token/llm/models")
+  got+=$(code "$host/llm/models")
+  _warden_teardown
+  [ "$got" = "403 403 403 403 403 403 403 404 " ]
+}
+
+@test "warden: the secret never appears in the broker log" {
+  _warden_setup
+  url=$(_warden_url)
+  curl -s "$url/llm/models" >/dev/null
+  curl -s "$url/qry/a" >/dev/null
+  curl -s "$url/llm/admin" >/dev/null
+  _warden_teardown
+  grep -q "llm/models -> 200" "$CBOX_WARDEN_DIR/broker.log"
+  [ "$(grep -c "REDACTED" "$CBOX_WARDEN_DIR/broker.log")" = 0 ]
+}
+
+@test "warden: project resource needs an approved .warden" {
+  _warden_setup
+  printf '[proj]\n' > .warden
+  _warden_env >/dev/null
+  before=$(cat "$CBOX_WARDEN_DIR/sessions/wbox.json")
+  hint=$(cat "$WT/stderr")
+  _warden_approve_yes
+  url=$(_warden_url)
+  run curl -s "$url/proj/a"
+  _warden_teardown
+  [[ "$before" != *'"proj"'* ]]
+  [[ "$hint" == *"cbox warden approve"* ]]
+  [[ "$output" == *'"authorization": "Bearer sk-test-REDACTED-cbox.warden.proj"'* ]]
+}
+
+@test "warden: editing .warden after approval needs a new approval" {
+  _warden_setup
+  printf '[proj]\n' > .warden
+  _warden_approve_yes
+  printf '[proj]\n[hdr]\n' > .warden
+  _warden_env >/dev/null
+  run cat "$CBOX_WARDEN_DIR/sessions/wbox.json"
+  _warden_teardown
+  [[ "$output" != *'"proj"'* ]]
+}
+
+@test "warden: unknown and invalid resources are reported, not fatal" {
+  _warden_setup
+  printf '[bad name]\nupstream = ftp://x\n' >> "$CBOX_WARDEN_DIR/resources"
+  printf '[ghost]\n' > .warden
+  _warden_approve_yes
+  _warden_env >/dev/null
+  run cat "$WT/stderr"
+  _warden_teardown
+  [[ "$output" == *"'bad name'"*"skipped"* ]]
+  [[ "$output" == *"'ghost', which is not configured"* ]]
+}
+
+@test "warden: token is stable per container and private on disk" {
+  _warden_setup
+  a=$(_warden_url)
+  b=$(_warden_url)
+  dmode=$(stat -c %a "$CBOX_WARDEN_DIR/sessions" 2>/dev/null || stat -f %Lp "$CBOX_WARDEN_DIR/sessions")
+  fmode=$(stat -c %a "$CBOX_WARDEN_DIR/sessions/wbox.json" 2>/dev/null || stat -f %Lp "$CBOX_WARDEN_DIR/sessions/wbox.json")
+  _warden_teardown
+  [ "$a" = "$b" ]
+  [ "$dmode" = 700 ]
+  [ "$fmode" = 600 ]
+}
+
+@test "warden: last session end revokes the token and stops the broker" {
+  _warden_setup
+  url=$(_warden_url)
+  pid=$(_cbox_warden_broker_pid)
+  _cbox_warden_end wbox
+  sleep 0.3
+  # A zombie counts as stopped: in a container whose PID 1 never reaps
+  # orphans (tail -f /dev/null), the killed broker lingers as one.
+  alive=no; [[ "$(ps -o stat= -p "$pid" 2>/dev/null)" =~ ^[^Z] ]] && alive=yes
+  run _cbox_warden_broker_pid
+  _warden_teardown
+  [ "$status" -ne 0 ]
+  [ "$alive" = no ]
+  [ ! -f "$CBOX_WARDEN_DIR/sessions/wbox.json" ]
+}
+
+@test "warden: broker keeps running while another container has a session" {
+  _warden_setup
+  _warden_env >/dev/null
+  _cbox_warden_start obox </dev/null >/dev/null 2>&1
+  _cbox_session_start obox
+  _cbox_warden_end wbox
+  run _cbox_warden_broker_pid
+  rm -f "$_CBOX_SESSION_DIR/.cbox-active-obox-$$"
+  _warden_teardown
+  [ "$status" -eq 0 ]
+}
+
+@test "cbox warden: lists resources and what this project gets" {
+  _warden_setup
+  printf '[proj]\n' > .warden
+  run _cbox_warden_cmd list
+  _warden_teardown
+  [[ "$output" == *"✔ llm"*"every container"* ]]
+  [[ "$output" == *"· proj"*"listed in .warden, not approved"* ]]
+  [[ "$output" == *"cbox warden approve"* ]]
+}
+
+@test "cbox warden: explains how to start when nothing is configured" {
+  rm -rf "$CBOX_WARDEN_DIR"
+  run _cbox_warden_cmd
+  [[ "$output" == *"No warden resources configured"*"cbox warden edit"* ]]
+}
+
+@test "cbox warden secret set: rejects invalid resource names" {
+  run _cbox_warden_cmd secret set "Bad Name"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Usage: cbox warden secret set"* ]]
+}
+
+@test "cbox warden: unknown command shows usage" {
+  run _cbox_warden_cmd frobnicate
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Usage: cbox warden"* ]]
+}
+
+# ---------------------------------------------------------------------------
 # _cbox_audio_ensure_config
 # ---------------------------------------------------------------------------
 

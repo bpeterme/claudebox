@@ -465,7 +465,7 @@ class H(http.server.BaseHTTPRequestHandler):
                           "headers": {k.lower(): v for k, v in self.headers.items()}}).encode()
         self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers()
         self.wfile.write(out)
-    do_GET = do_POST = do_DELETE = handle_any
+    do_GET = do_POST = do_PUT = do_DELETE = handle_any
     def log_message(self, *a): pass
 http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
 PY
@@ -827,6 +827,123 @@ _warden_relocate() {
   run _cbox_warden_cmd frobnicate
   [ "$status" -eq 1 ]
   [[ "$output" == *"Usage: cbox warden"* ]]
+}
+
+# S3-style resource with the dvc policy (bucket bkt); the project's .warden sets the prefix.
+_warden_add_store() {
+  cat >> "$CBOX_WARDEN_DIR/resources" <<INI
+[store]
+upstream     = http://127.0.0.1:$UP_PORT
+auth         = sigv4
+key-id       = cbox.warden.store-id
+secret       = cbox.warden.store
+policy       = dvc
+bucket       = bkt
+availability = project
+${1:-}
+INI
+}
+
+_WARDEN_OBJ="bkt/proj1/files/md5/ab/cdef0123456789abcdef0123456789"
+
+@test "warden sigv4: signature matches the AWS documentation example" {
+  run python3 -c "$(_cbox_warden_py | sed '/^if __name__/,$d')
+h = sign_v4({'region': 'us-east-1'}, 'GET', '/', 'max-keys=2&prefix=J',
+            {'x-amz-content-sha256': 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'},
+            'examplebucket.s3.amazonaws.com', 'AKIAIOSFODNN7EXAMPLE',
+            'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', now='20130524T000000Z')
+print(h['authorization'].split('Signature=')[1])"
+  [ "$output" = "34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7" ]
+}
+
+@test "warden sigv4: container gets an AWS profile with dummy keys pointing at the broker" {
+  _warden_setup
+  _warden_add_store "profile = flux-dvc-bkt"
+  printf '[store]\nprefix = proj1\n' > .warden
+  _warden_approve_yes
+  env=$(_warden_env)
+  _warden_teardown
+  url=$(sed -n 's/^WARDEN_URL=//p' <<<"$env")
+  profile=$(sed -n 's/^WARDEN_AWS_CONFIG=//p' <<<"$env" | base64 -d)
+  [[ "$env" == *"AWS_CONFIG_FILE=/home/claude/.aws/warden-config"* ]]
+  [[ "$profile" == *"[profile flux-dvc-bkt]"* ]]
+  [[ "$profile" == *"endpoint_url = $url/store"* ]]
+  [[ "$profile" == *"aws_access_key_id = warden"* ]]
+  [[ "$profile" == *"addressing_style = path"* ]]
+  [[ "$profile$env" != *REDACTED* ]]
+}
+
+@test "warden sigv4: re-signs with the real keys and drops the client's signature" {
+  _warden_setup
+  _warden_add_store
+  printf '[store]\nprefix = proj1\n' > .warden
+  _warden_approve_yes
+  url=$(_warden_url)
+  out=$(curl -s -H 'Authorization: AWS4-HMAC-SHA256 Credential=warden/x' -H 'X-Amz-Security-Token: t' \
+    -H 'X-Amz-Content-Sha256: UNSIGNED-PAYLOAD' "$url/store/$_WARDEN_OBJ")
+  _warden_teardown
+  [[ "$out" == *'"authorization": "AWS4-HMAC-SHA256 Credential=sk-test-REDACTED-cbox.warden.store-id/'*'/auto/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature='* ]]
+  [[ "$out" == *"\"path\": \"/$_WARDEN_OBJ\""* ]]
+  [[ "$out" != *"Credential=warden"* ]]
+  [[ "$out" != *"x-amz-security-token"* ]]
+}
+
+@test "warden sigv4: the dvc policy allows only the project's DVC tree, never deletes" {
+  _warden_setup
+  _warden_add_store
+  printf '[store]\nprefix = proj1\n' > .warden
+  _warden_approve_yes
+  url=$(_warden_url)/store
+  code() { curl -s -o /dev/null -w '%{http_code}' -X "$1" "$url/$2"; }
+  got="$(code GET "$_WARDEN_OBJ") $(code PUT "$_WARDEN_OBJ") $(code POST "$_WARDEN_OBJ?uploads")"
+  got+=" $(code GET 'bkt?list-type=2&prefix=proj1/files/md5/ab/')"
+  got+=" | $(code DELETE "$_WARDEN_OBJ") $(code GET "${_WARDEN_OBJ/proj1/proj2}")"
+  got+=" $(code GET "${_WARDEN_OBJ/bkt/other}") $(code GET bkt/proj1/notes.txt)"
+  got+=" $(code GET 'bkt?list-type=2&prefix=proj2/') $(code GET 'bkt?list-type=2')"
+  got+=" $(code GET bkt/proj1/files/md5/%2e%2e/cdef0123456789abcdef0123456789)"
+  _warden_teardown
+  [ "$got" = "200 200 200 200 | 403 403 403 403 403 403 403" ]
+}
+
+@test "warden sigv4: no grant without a prefix, or when .warden sets anything else" {
+  _warden_setup
+  _warden_add_store
+  # Global availability alone does not do: the dvc policy needs a project prefix.
+  sed -i.bak 's/^availability = project$/availability = global/' "$CBOX_WARDEN_DIR/resources"
+  no_prefix=$(_warden_env)
+  printf '[store]\nprefix = proj1\nupstream = http://127.0.0.1:1\n' > .warden
+  _warden_approve_yes
+  extra_key=$(_warden_env)
+  extra_err=$(cat "$WT/stderr")
+  _warden_teardown
+  [[ "$no_prefix" != *AWS_CONFIG_FILE* ]]
+  [[ "$extra_key" != *AWS_CONFIG_FILE* ]]
+  [[ "$extra_err" == *"only prefix is allowed"* ]]
+}
+
+@test "warden sigv4: a .warden prefix must stay inside the resource's own prefix" {
+  _warden_setup
+  _warden_add_store "prefix = team"
+  printf '[store]\nprefix = other\n' > .warden
+  _warden_approve_yes
+  outside=$(_warden_env)
+  outside_err=$(cat "$WT/stderr")
+  printf '[store]\nprefix = team/proj1\n' > .warden
+  _warden_approve_yes
+  inside=$(_warden_env)
+  _warden_teardown
+  [[ "$outside" != *AWS_CONFIG_FILE* ]]
+  [[ "$outside_err" == *"outside the resource's prefix 'team'"* ]]
+  [[ "$inside" == *AWS_CONFIG_FILE* ]]
+}
+
+@test "warden sigv4: a resource without key-id is reported and skipped" {
+  _warden_setup
+  _warden_add_store
+  sed -i.bak '/^key-id/d' "$CBOX_WARDEN_DIR/resources"
+  run _cbox_warden_python list "$CBOX_WARDEN_DIR" "$PWD"
+  _warden_teardown
+  [[ "$output" == *"warden resource 'store': sigv4 needs key-id"* ]]
 }
 
 # ---------------------------------------------------------------------------

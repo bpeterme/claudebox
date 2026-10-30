@@ -245,8 +245,21 @@ or only to projects that list it in a tracked `.warden` file **and** whose
 `.warden` you approved on the host (`project`). Editing `.warden` — also from
 inside the container — needs a new approval at the next session start.
 
+**S3-compatible storage** (AWS S3, Cloudflare R2, MinIO, …) uses `auth = sigv4`:
+the container gets an AWS profile with dummy keys (`AWS_CONFIG_FILE`), and the
+broker re-signs every request with the real ones. `policy = dvc` limits a
+resource to DVC's data layout in one bucket and prefix, with no deletes. The
+prefix comes from the project's `.warden`, so one resource serves every
+project in a bucket:
+
+```ini
+# .warden (tracked in the project)
+[storage]
+prefix = my-project
+```
+
 Not available in safe mode. Full documentation follows with the remaining
-resource types (S3-compatible storage, SSH, MCP, audio).
+resource types (SSH, MCP, audio).
 
 ## macOS: Screenshot Script
 

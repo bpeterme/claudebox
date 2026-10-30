@@ -1201,16 +1201,19 @@ _cbox_mcp_status() {
 # Run as: _cbox_warden_python <command> ...
 _cbox_warden_py() {
   cat <<'PYEOF'
-import base64, configparser, datetime, hashlib, http.client, http.server, json, os, re, secrets, socketserver, subprocess, sys, threading
+import base64, configparser, datetime, hashlib, hmac, http.client, http.server, json, os, re, secrets, socketserver, subprocess, sys, threading
 from fnmatch import fnmatchcase
-from urllib.parse import urlsplit, unquote, parse_qsl, urlencode
+from urllib.parse import urlsplit, unquote, parse_qsl, quote, urlencode
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-AUTH_SCHEMES = ("bearer", "basic", "header:", "query:")
+AUTH_SCHEMES = ("bearer", "basic", "header:", "query:", "sigv4")
 HOP = {"connection", "keep-alive", "proxy-connection", "proxy-authorization", "te", "trailer",
-       "transfer-encoding", "upgrade", "host"}
+       "transfer-encoding", "upgrade", "host", "expect"}
 CHUNK = 1 << 16
+PREFIX_RE = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$")
+PROJECT_KEYS = {"prefix"}  # settings a project's .warden may add to a resource; approval covers them
+AWS_CONFIG = "/home/claude/.aws/warden-config"  # container path; written by cbox at session start
 TEMPLATE = """\
 # warden resources — host only, never mounted into a container.
 # One section per resource; the container never sees the secret itself.
@@ -1224,6 +1227,18 @@ TEMPLATE = """\
 # allow        = POST /chat/completions, GET /models   # optional; default: everything under upstream
 # env          = OPENROUTER_BASE_URL={url} OPENROUTER_API_KEY=warden
 # test         = GET /models             # used by: cbox warden test openrouter
+#
+# [storage]                              # any S3-compatible API (AWS S3, R2, MinIO, ...)
+# type         = http
+# upstream     = https://<account>.r2.cloudflarestorage.com
+# auth         = sigv4                   # requests are re-signed; the container gets dummy keys
+# key-id       = cbox.warden.storage-id  # Keychain item with the access key ID
+# secret       = cbox.warden.storage     # Keychain item with the secret access key
+# region       = auto                    # optional; default: auto
+# policy       = dvc                     # optional: only DVC's data layout in one bucket/prefix, no deletes
+# bucket       = my-bucket               # needed by policy = dvc
+# availability = project                 # the project's .warden sets the prefix:  [storage] prefix = my-project
+# profile      = storage                 # AWS profile created in the container (default: the resource name)
 """
 
 
@@ -1320,20 +1335,30 @@ def validate(name, r):
     if up.scheme not in ("http", "https") or not up.netloc:
         return "upstream must be an http(s) URL"
     if not r.get("auth", "").startswith(AUTH_SCHEMES):
-        return "auth must be bearer, basic, header:<Name> or query:<param>"
+        return "auth must be bearer, basic, header:<Name>, query:<param> or sigv4"
     if not r.get("secret"):
         return "secret (Keychain item name) is missing"
     if r.get("availability", "global") not in ("global", "project"):
         return "availability must be global or project"
+    if r["auth"] == "sigv4" and not r.get("key-id"):
+        return "sigv4 needs key-id (Keychain item with the access key ID)"
+    if r.get("policy", "dvc") != "dvc":
+        return f"policy '{r['policy']}' is unknown (known: dvc)"
+    if r.get("policy") == "dvc" and (r["auth"] != "sigv4" or not r.get("bucket")):
+        return "policy = dvc needs auth = sigv4 and a bucket"
+    if r.get("prefix") and not PREFIX_RE.match(r["prefix"]):
+        return "prefix may only contain letters, digits, '_', '-', '.' and '/'"
+    if r.get("profile") and not NAME_RE.match(r["profile"]):
+        return "profile may only contain a-z, 0-9, '_' and '-'"
     for pair in r.get("env", "").split():
         if "=" not in pair or not ENV_KEY_RE.match(pair.split("=", 1)[0]):
             return f"env entry '{pair}' is not KEY=VALUE"
     return None
 
 
-def read_secret(r):
+def read_secret(r, field="secret"):
     """Secret for resource r: macOS Keychain, or CBOX_WARDEN_SECRET_CMD <item>."""
-    item = r["secret"]
+    item = r[field]
     cmd = os.environ.get("CBOX_WARDEN_SECRET_CMD")
     if cmd:
         argv = [cmd, item]
@@ -1353,18 +1378,45 @@ def project_file(project):
 
 
 def project_request(project):
-    """(resource names, sha256) requested by the project's .warden, or ([], None)."""
+    """({resource name: project settings}, sha256) from the project's .warden, or ({}, None)."""
     try:
         with open(project_file(project), "rb") as f:
             raw = f.read()
     except FileNotFoundError:
-        return [], None
+        return {}, None
     cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#",))
     try:
         cp.read_string(raw.decode())
     except (configparser.Error, UnicodeDecodeError):
         return None, hashlib.sha256(raw).hexdigest()
-    return cp.sections(), hashlib.sha256(raw).hexdigest()
+    return {n: dict(cp[n]) for n in cp.sections()}, hashlib.sha256(raw).hexdigest()
+
+
+def with_project(name, r, settings):
+    """Resource r narrowed by the project's settings, or (None, problem). A project
+    may only add PROJECT_KEYS; a prefix must stay inside the resource's own prefix."""
+    extra = set(settings) - PROJECT_KEYS
+    if extra:
+        return None, f".warden sets {', '.join(sorted(extra))} for '{name}' — only {', '.join(sorted(PROJECT_KEYS))} is allowed"
+    out = dict(r)
+    want = settings.get("prefix", "").strip("/")
+    if want:
+        base = r.get("prefix", "").strip("/")
+        if not PREFIX_RE.match(want) or ".." in want.split("/") or "." in want.split("/"):
+            return None, f".warden prefix for '{name}' is not a plain path"
+        if base and want != base and not want.startswith(base + "/"):
+            return None, f".warden prefix for '{name}' is outside the resource's prefix '{base}'"
+        out["prefix"] = want
+    if out.get("policy") == "dvc" and not out.get("prefix", "").strip("/"):
+        return None, f"'{name}' needs a prefix (set it in .warden:  [{name}] prefix = <folder>)"
+    return out, None
+
+
+def describe(r):
+    """One line for listings and the approval prompt."""
+    scope = f", bucket {r['bucket']}" if r.get("bucket") else ""
+    scope += f", prefix {r['prefix']}" if r.get("prefix") else ""
+    return f"{r['upstream']} ({r.get('availability', 'global')}{scope})"
 
 
 def err(msg):
@@ -1394,9 +1446,9 @@ def approve(d, project, interactive):
         return True
     resources = load_resources(d)
     err(f"This project asks warden for: (from {project_file(project)})")
-    for n in names:
-        r = resources.get(n)
-        err(f"  • {n}: " + (f"{r['upstream']} ({r.get('availability', 'global')})" if r else "not configured on this machine"))
+    for n, settings in names.items():
+        r, problem = with_project(n, resources[n], settings) if n in resources else (None, "not configured on this machine")
+        err(f"  • {n}: " + (describe(r) if r else problem))
     if not interactive or not ask("Allow these for this project? [y/N] "):
         err("ℹ  Not approved — project resources stay off. Approve later with: cbox warden approve")
         return False
@@ -1412,23 +1464,41 @@ def cmd_session(d, box, project, base_url, interactive):
         err("⚠  " + exposure_message(hit))
         return
     resources = load_resources(d, warn=err)
-    granted = [n for n, r in resources.items() if r.get("availability", "global") == "global"]
+    # A global resource that still needs a project setting (a dvc prefix) waits for a .warden.
+    granted = {n: {} for n, r in resources.items()
+               if r.get("availability", "global") == "global" and not with_project(n, r, {})[1]}
     names, _ = project_request(project)
     if names and approve(d, project, interactive == "1"):
-        for n in names:
+        for n, settings in names.items():
             if n not in resources:
                 err(f"⚠  .warden asks for '{n}', which is not configured in {p['resources']}")
-            elif n not in granted:
-                granted.append(n)
+                continue
+            r, problem = with_project(n, resources[n], settings)
+            if problem:
+                err(f"⚠  {problem} — skipped")
+            else:
+                granted[n] = settings
     sess_path = os.path.join(p["sessions"], f"{box}.json")
     token = load_json(sess_path, {}).get("token") or secrets.token_urlsafe(24)
     write_private(sess_path, json.dumps({"token": token, "box": box, "project": project,
-                                         "resources": sorted(granted)}, indent=2) + "\n")
+                                         "resources": sorted(granted), "settings": granted}, indent=2) + "\n")
     url = f"{base_url}/w/{token}"
     print(f"WARDEN_URL={url}")
+    profiles = []
     for n in sorted(granted):
-        for pair in resources[n].get("env", "").split():
+        r = resources[n]
+        for pair in r.get("env", "").split():
             print(pair.replace("{url}", f"{url}/{n}"))
+        if r["auth"] == "sigv4":
+            # Dummy keys: the broker drops their signature and signs with the real ones.
+            profile = r.get("profile") or n
+            profiles.append(("[default]" if profile == "default" else f"[profile {profile}]") +
+                            f"\nendpoint_url = {url}/{n}\naws_access_key_id = warden\n"
+                            f"aws_secret_access_key = warden\nregion = {r.get('region', 'auto')}\n"
+                            "s3 =\n    addressing_style = path\n")
+    if profiles:
+        print(f"AWS_CONFIG_FILE={AWS_CONFIG}")
+        print("WARDEN_AWS_CONFIG=" + base64.b64encode("\n".join(profiles).encode()).decode())
 
 
 def cmd_end(d, box):
@@ -1484,6 +1554,48 @@ def apply_auth(r, headers, query, secret):
     return headers, query
 
 
+def sign_v4(r, method, path, query, headers, host, key_id, secret, now=None):
+    """Headers for an AWS SigV4-signed request (S3 rules: the path is signed as
+    sent, the payload hash comes from the client or is UNSIGNED-PAYLOAD)."""
+    region, service = r.get("region", "auto"), r.get("service", "s3")
+    h = {k.lower(): v for k, v in headers.items()
+         if k.lower() not in ("authorization", "x-amz-date", "x-amz-security-token")}
+    h["host"] = host
+    h["x-amz-date"] = now or datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    h.setdefault("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+    day = h["x-amz-date"][:8]
+    scope = f"{day}/{region}/{service}/aws4_request"
+    signed = sorted(k for k in h if k in ("host", "content-type", "content-md5") or k.startswith("x-amz-"))
+    canon_headers = "".join(f"{k}:{' '.join(h[k].split())}\n" for k in signed)
+    pairs = sorted((quote(k, safe="-_.~"), quote(v, safe="-_.~")) for k, v in parse_qsl(query, keep_blank_values=True))
+    canon = "\n".join([method, path or "/", "&".join(f"{k}={v}" for k, v in pairs), canon_headers,
+                       ";".join(signed), h["x-amz-content-sha256"]])
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", h["x-amz-date"], scope, hashlib.sha256(canon.encode()).hexdigest()])
+    key = ("AWS4" + secret).encode()
+    for part in (day, region, service, "aws4_request"):
+        key = hmac.new(key, part.encode(), hashlib.sha256).digest()
+    sig = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
+    h["authorization"] = (f"AWS4-HMAC-SHA256 Credential={key_id}/{scope}, "
+                          f"SignedHeaders={';'.join(signed)}, Signature={sig}")
+    return h
+
+
+def dvc_allowed(r, method, path, query):
+    """Only what DVC does with an S3 remote: content-addressed objects under
+    bucket/prefix/files/md5/, listings of that tree, multipart uploads — never
+    a delete. Exact shapes instead of blocklisting tricks (dot segments, encodings)."""
+    if method not in ("GET", "HEAD", "PUT", "POST"):
+        return False
+    bucket, prefix = re.escape(r["bucket"]), re.escape(r["prefix"].strip("/"))
+    if path in (f"/{r['bucket']}", f"/{r['bucket']}/"):
+        listing = dict(parse_qsl(query, keep_blank_values=True)).get("prefix", "")
+        return method == "GET" and re.fullmatch(
+            rf"{prefix}/files/(md5/([0-9a-f]{{2}}(/([0-9a-f]{{0,30}}(\.dir)?/?)?)?)?)?", listing) is not None
+    if method == "HEAD" and re.fullmatch(rf"/{bucket}/{prefix}(/files(/md5)?)?/?", path):
+        return True  # "does this directory exist"
+    return re.fullmatch(rf"/{bucket}/{prefix}/files/md5/[0-9a-f]{{2}}/[0-9a-f]{{30}}(\.dir)?", path) is not None
+
+
 class Broker(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "warden"
@@ -1536,13 +1648,17 @@ class Broker(http.server.BaseHTTPRequestHandler):
         resources = load_resources(self.d)
         if name not in sess.get("resources", []) or name not in resources:
             return self.fail(403, f"resource '{name}' is not available to this container", who)
-        r = resources[name]
+        r, problem = with_project(name, resources[name], sess.get("settings", {}).get(name, {}))
+        if problem:
+            return self.fail(403, problem, who)
         if ".." in unquote(unquote(rest)).split("/") or "." in unquote(unquote(rest)).split("/"):
             return self.fail(403, "dot segments are not allowed", who)
-        if not allowed(r, self.command, rest):
+        if not allowed(r, self.command, rest) or (
+                r.get("policy") == "dvc" and not dvc_allowed(r, self.command, rest, split.query)):
             return self.fail(403, f"{self.command} {rest} is not allowed for '{name}'", who)
         try:
             secret = read_secret(r)
+            key_id = read_secret(r, "key-id") if r["auth"] == "sigv4" else None
         except (LookupError, OSError, subprocess.SubprocessError) as e:
             return self.fail(502, str(e), who)
         up = urlsplit(r["upstream"])
@@ -1551,9 +1667,15 @@ class Broker(http.server.BaseHTTPRequestHandler):
         if scheme.startswith("header:"):
             drop.add(scheme.split(":", 1)[1].strip().lower())
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP | drop}
-        headers, query = apply_auth(r, headers, parse_qsl(split.query, keep_blank_values=True), secret)
-        target = up.path.rstrip("/") + rest + (("?" + urlencode(query)) if query else "")
-        headers["Host"] = up.netloc
+        if scheme == "sigv4":
+            # The query is signed exactly as sent, so it is passed on untouched.
+            target = up.path.rstrip("/") + rest
+            headers = sign_v4(r, self.command, target, split.query, headers, up.netloc, key_id, secret)
+            target += ("?" + split.query) if split.query else ""
+        else:
+            headers, query = apply_auth(r, headers, parse_qsl(split.query, keep_blank_values=True), secret)
+            target = up.path.rstrip("/") + rest + (("?" + urlencode(query)) if query else "")
+            headers["Host"] = up.netloc
         conn_cls = http.client.HTTPSConnection if up.scheme == "https" else http.client.HTTPConnection
         conn = conn_cls(up.netloc, timeout=600)
         try:
@@ -1629,7 +1751,10 @@ def cmd_list(d, project):
         note = "every container" if avail == "global" else (
             "this project (approved)" if here else "this project: listed in .warden, not approved" if names and n in names
             else "projects whose .warden lists it")
-        print(f"{'✔' if here else '·'} {n:<16} {r['upstream']}  [{r['auth'].split(':')[0]}; {note}]")
+        if names and n in names:
+            r = with_project(n, r, names[n])[0] or r
+        scope = "".join(f", {k} {r[k]}" for k in ("bucket", "prefix") if r.get(k))
+        print(f"{'✔' if here else '·'} {n:<16} {r['upstream']}  [{r['auth'].split(':')[0]}{scope}; {note}]")
     if names is None:
         print(f"⚠  {project_file(project)} is not valid INI")
     elif names and not approved:
@@ -1653,17 +1778,25 @@ def cmd_test(d, name):
     if not r:
         err(f"No resource '{name}' in {paths(d)['resources']}")
         sys.exit(1)
-    method, _, path = (r.get("test") or "GET /").partition(" ")
+    default = f"GET /{r['bucket']}?list-type=2&max-keys=1" if r.get("bucket") else "GET /"
+    method, _, path = (r.get("test") or default).partition(" ")
     try:
         secret = read_secret(r)
+        key_id = read_secret(r, "key-id") if r["auth"] == "sigv4" else None
     except (LookupError, OSError, subprocess.SubprocessError) as e:
         err(f"✖ {e}")
         sys.exit(1)
     up = urlsplit(r["upstream"])
-    headers, query = apply_auth(r, {"User-Agent": "warden-test"}, [], secret)
+    if r["auth"] == "sigv4":
+        target, _, raw_query = (up.path.rstrip("/") + path.strip()).partition("?")
+        headers = sign_v4(r, method.upper(), target, raw_query, {"User-Agent": "warden-test"}, up.netloc, key_id, secret)
+        target += ("?" + raw_query) if raw_query else ""
+    else:
+        headers, query = apply_auth(r, {"User-Agent": "warden-test"}, [], secret)
+        target = up.path.rstrip("/") + path.strip() + (("?" + urlencode(query)) if query else "")
     conn = (http.client.HTTPSConnection if up.scheme == "https" else http.client.HTTPConnection)(up.netloc, timeout=30)
     try:
-        conn.request(method.upper(), up.path.rstrip("/") + path.strip() + (("?" + urlencode(query)) if query else ""), headers=headers)
+        conn.request(method.upper(), target, headers=headers)
         status = conn.getresponse().status
     except (OSError, http.client.HTTPException) as e:
         err(f"✖ {name}: {up.netloc} unreachable ({e.__class__.__name__})")
@@ -2198,10 +2331,17 @@ _cbox_enter() {
   local _exec_args=(-it -w "/Workspace/$name")
   [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]] && [[ "$agent_bin" == "claude" ]] && \
     _exec_args+=(-e "PULSE_SERVER=$(_cbox_audio_pulse_server)")
+  local _run="$command"
   if [[ "$mode" != "safe" ]]; then
     local _w_env
     while IFS= read -r _w_env; do
-      if [[ -n "$_w_env" ]]; then _exec_args+=(-e "$_w_env"); fi
+      case "$_w_env" in
+        # S3-style resources: write their AWS profiles inside the container
+        # (base64 only; the profiles hold dummy keys and the broker URL).
+        WARDEN_AWS_CONFIG=*)
+          _run="mkdir -p ~/.aws && print -rn -- '${_w_env#*=}' | base64 -d >| ~/.aws/warden-config; $command" ;;
+        ?*) _exec_args+=(-e "$_w_env") ;;
+      esac
     done < <(_cbox_warden_start "$name")
   fi
 
@@ -2212,7 +2352,7 @@ _cbox_enter() {
   # The agent's exit status is irrelevant here, but under the script's
   # `set -e` a non-zero one would skip every teardown step below —
   # including stopping the container.
-  $_CBOX_CMD exec "${_exec_args[@]}" "$name" zsh -ic "$command" || true
+  $_CBOX_CMD exec "${_exec_args[@]}" "$name" zsh -ic "$_run" || true
 
   if [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]] && [[ "$agent_bin" == "claude" ]]; then
     _cbox_audio_stop

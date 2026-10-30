@@ -116,7 +116,8 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_KEEPALIVE_SECONDS` | `600` | Seconds container stays alive before auto-stop in keepalive mode |
 | `CBOX_DATA_DIR` | `~/.local/share/claudebox` | Per-project container config files (`.claude-<name>.json`), one per project |
 | `CBOX_CLAUDE_DIR` | `~/.claude` | Claude Code config, mounted as `~/.claude` (read-write; read-only in safe mode) |
-| `CBOX_HOST_CONFIG_DIR` | `~/.config` | Host config dir, mounted as `~/.config` in container (normal mode, read-write) |
+| `CBOX_HOST_CONFIG_DIR` | `~/.config/claudebox/.config` | The container's own `~/.config` (normal mode, read-write). Not your real `~/.config`: that holds config that runs on your Mac and tokens, so cbox refuses it |
+| `CBOX_SHARE_CONFIG` | *(unset)* | Folders of your real `~/.config` to share **read-only** into the container's `~/.config`, e.g. `"opencode nvim"`. Code in the container can read them, so leave out folders holding tokens (`gh`, `gcloud`). `claudebox` is never shared. Applies to newly created containers: `cbox reset` |
 | `CBOX_SHARE_DIR` | `~/.cache/claudebox/share` | Share folder, mounted as `~/share` in container; cleared on exit (read-write) |
 | `CBOX_PLAYWRIGHT_DIR` | `$CBOX_DATA_DIR/ms-playwright` | Playwright browser cache, mounted as `/opt/ms-playwright` (read-write; read-only in safe mode). Shared by all projects, kept across resets and rebuilds |
 | `CBOX_SSH_DIR` | *(unset)* | SSH dir to mount as `~/.ssh` in container (normal mode, **read-only**); unset = no SSH mount |
@@ -329,7 +330,7 @@ nohup pulseaudio --daemonize=no > /tmp/cbox-pulse.log 2>&1 &
 - Container name is derived from the current directory name (e.g. `my-project`)
 - Project directory is mounted at `/Workspace/<name>` inside the container
 - The active agent (`claude` or `opencode`) is updated automatically once per day on first use; each agent has its own independent update stamp
-- `cbox oc` (or `CBOX_AGENT=opencode` in `cbox.env`) selects opencode for the session; opencode reads its config from `~/.config/opencode`, which is already available via the `CBOX_HOST_CONFIG_DIR` mount
+- `cbox oc` (or `CBOX_AGENT=opencode` in `cbox.env`) selects opencode for the session; opencode reads its config from `~/.config/opencode`; to use your Mac's, add `CBOX_SHARE_CONFIG="opencode"` to `cbox.env`
 - On exit, the container is stopped and the share folder is cleared
 - `cbox keepalive` leaves the container running for 10 minutes (useful for follow-up `exec` calls)
 - Authentication is automatic — credentials are mounted from the host, so no re-authentication is needed inside the container

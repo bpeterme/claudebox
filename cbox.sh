@@ -95,7 +95,10 @@ CBOX_VERBOSE="${CBOX_VERBOSE:-0}"
 CBOX_AGENT="${CBOX_AGENT:-claude}"
 CBOX_DATA_DIR="${CBOX_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/claudebox}"
 CBOX_CLAUDE_DIR="${CBOX_CLAUDE_DIR:-$HOME/.claude}"
-CBOX_HOST_CONFIG_DIR="${CBOX_HOST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}}"
+# The container's ~/.config (normal mode): a folder of its own, because the real
+# ~/.config holds config that runs on this Mac (cbox.env, mcp.json, git) and
+# tokens. CBOX_SHARE_CONFIG shares chosen folders of it read-only.
+CBOX_HOST_CONFIG_DIR="${CBOX_HOST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/.config}"
 CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/claudebox/share}"
 # Playwright browser cache, mounted over the image's /opt/ms-playwright. Lives in
 # CBOX_DATA_DIR, not CBOX_SHARE_DIR: the share dir is wiped when the last session
@@ -119,6 +122,7 @@ CBOX_MEMORY="${CBOX_MEMORY:-4g}"
 # 0 lets the container change them again. Applies when a container is created.
 CBOX_PROTECT_GIT="${CBOX_PROTECT_GIT:-1}"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
+# CBOX_SHARE_CONFIG — folders of ~/.config to share read-only, e.g. "opencode nvim"
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
 _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 # For prefix-based installs (e.g. Homebrew), the dockerfile lives in share/claudebox
@@ -1283,6 +1287,7 @@ def container_mounts(d, extra=()):
     and the workspace of every active session."""
     found = [os.environ.get(v) for v in ("CBOX_CLAUDE_DIR", "CBOX_HOST_CONFIG_DIR", "CBOX_SHARE_DIR",
                                           "CBOX_PLAYWRIGHT_DIR", "CBOX_SSH_DIR", "CBOX_ZSHRC")]
+    found += os.environ.get("CBOX_SHARED_CONFIG_PATHS", "").split("\n")
     claude = os.environ.get("CBOX_CLAUDE_DIR")
     for level in ([claude] if claude and os.path.isdir(claude) else []):
         for e in os.scandir(level):
@@ -1892,6 +1897,7 @@ _cbox_warden_env() {
     "CBOX_CLAUDE_DIR=$CBOX_CLAUDE_DIR" "CBOX_HOST_CONFIG_DIR=$CBOX_HOST_CONFIG_DIR"
     "CBOX_SHARE_DIR=$CBOX_SHARE_DIR" "CBOX_PLAYWRIGHT_DIR=$CBOX_PLAYWRIGHT_DIR"
     "CBOX_SSH_DIR=${CBOX_SSH_DIR:-}" "CBOX_ZSHRC=${CBOX_ZSHRC:-}"
+    "CBOX_SHARED_CONFIG_PATHS=$(_cbox_shared_config_names | sed "s|^|${XDG_CONFIG_HOME:-$HOME/.config}/|")"
   )
 }
 
@@ -2121,12 +2127,55 @@ _cbox_seed_playwright() {
 # container creation
 # ---------------------------------------------------------
 
+# Folder names listed in CBOX_SHARE_CONFIG, one per line (zsh does not split
+# an unquoted variable, so no word splitting here).
+_cbox_shared_config_names() {
+  printf '%s\n' "${CBOX_SHARE_CONFIG:-}" | tr -s ' \t' '\n\n' | grep -v '^$' || true
+}
+
+# The -v values for the container's ~/.config and the folders of the real
+# ~/.config shared into it read-only, one per line. Fails when the container
+# would get write access to cbox's own config: cbox.env and mcp.json run on
+# this Mac.
+_cbox_config_mounts() {
+  local real="${XDG_CONFIG_HOME:-$HOME/.config}" own dir n
+  own=$(_cbox_resolve_path "$real/claudebox")
+  dir=$(_cbox_resolve_path "$CBOX_HOST_CONFIG_DIR")
+  if [[ "$own" == "$dir" || "$own" == "$dir"/* ]]; then
+    echo "✘ CBOX_HOST_CONFIG_DIR=$CBOX_HOST_CONFIG_DIR would let code in the container change config that runs on this Mac (cbox.env, mcp.json, git)." >&2
+    echo "  Remove that line from $real/claudebox/cbox.env (the default is $real/claudebox/.config)," >&2
+    echo "  and share the folders you need read-only instead, e.g.: CBOX_SHARE_CONFIG=\"opencode\"" >&2
+    return 1
+  fi
+  mkdir -p "$CBOX_HOST_CONFIG_DIR"
+  echo "$CBOX_HOST_CONFIG_DIR:/home/claude/.config"
+  while IFS= read -r n; do
+    if [[ ! "$n" =~ ^[A-Za-z0-9._-]+$ || "$n" == "." || "$n" == ".." ]]; then
+      echo "⚠  CBOX_SHARE_CONFIG: '$n' is not a folder name in $real — not shared." >&2
+    elif [[ "$n" == "claudebox" ]]; then
+      echo "⚠  CBOX_SHARE_CONFIG: claudebox is cbox's own config (MCP tokens) — not shared." >&2
+    elif [[ ! -d "$real/$n" ]]; then
+      echo "⚠  CBOX_SHARE_CONFIG: $real/$n does not exist — not shared." >&2
+    else
+      # The mount point, created here so the runtime does not create it as root.
+      mkdir -p "$CBOX_HOST_CONFIG_DIR/$n"
+      echo "$real/$n:/home/claude/.config/$n:ro"
+    fi
+  done < <(_cbox_shared_config_names)
+  return 0
+}
+
 _cbox_create() {
   local name="$1"
   local mode="$2"
 
   # A new container still has the image's flux.
   rm -f "$CBOX_DATA_DIR/.flux-installed-$name"
+
+  local config_mounts="" _cm
+  if [[ "$mode" == "normal" ]]; then
+    config_mounts=$(_cbox_config_mounts) || return 1
+  fi
 
   local agent_bin
   agent_bin=$(_cbox_agent_bin)
@@ -2216,10 +2265,12 @@ _cbox_create() {
     mkdir -p "$CBOX_SHARE_DIR"
     args+=(
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude"
-      -v "$CBOX_HOST_CONFIG_DIR:/home/claude/.config"
       -v "$CBOX_SHARE_DIR:/home/claude/share"
       -v "$CBOX_PLAYWRIGHT_DIR:/opt/ms-playwright"
     )
+    while IFS= read -r _cm; do
+      [[ -n "$_cm" ]] && args+=(-v "$_cm")
+    done <<<"$config_mounts"
   fi
 
   if [[ "$mode" == "safe" ]]; then
@@ -2731,6 +2782,7 @@ _cbox_doctor_inline() {
   fi
 
   local _opencode_cfg="${CBOX_HOST_CONFIG_DIR}/opencode"
+  _cbox_shared_config_names | grep -qx opencode && _opencode_cfg="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
   [[ -d "$_opencode_cfg" ]] \
     && echo "✔ opencode config dir exists ($_opencode_cfg)" \
     || echo "ℹ opencode config dir absent ($_opencode_cfg) — created on first run"

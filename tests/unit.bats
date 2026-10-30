@@ -1889,3 +1889,59 @@ _guard_repo() {
   run _cbox_git_guard_check "gp"
   [[ "$output" == *"core.fsmonitor"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# Container ~/.config: own folder by default, chosen folders shared read-only
+# ---------------------------------------------------------------------------
+
+@test "config dir: defaults to claudebox/.config, not the real ~/.config" {
+  run env -u CBOX_HOST_CONFIG_DIR -u XDG_CONFIG_HOME HOME="$HOME" bash -c 'source "$1"; echo "$CBOX_HOST_CONFIG_DIR"' _ "$CBOX_SH"
+  [ "$output" = "$HOME/.config/claudebox/.config" ]
+}
+
+@test "_cbox_create: refuses a config dir that contains cbox's own config" {
+  local capture="$BATS_TMPDIR/create-cfg-refused"
+  cd "$BATS_TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  for d in "$HOME/.config" "$HOME" "$HOME/.config/claudebox"; do
+    rm -f "$capture"
+    CBOX_HOST_CONFIG_DIR="$d" run _cbox_create "cfgbox" "normal"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"would let code in the container change config that runs on this Mac"* ]]
+    [ ! -e "$capture" ]
+  done
+  # Safe mode mounts no config dir, so it is not affected.
+  rm -f "$capture"
+  CBOX_HOST_CONFIG_DIR="$HOME/.config" run _cbox_create "cfgbox" "safe"
+  [ "$status" -eq 0 ]
+}
+
+@test "_cbox_create: CBOX_SHARE_CONFIG shares chosen folders read-only, never claudebox" {
+  local capture="$BATS_TMPDIR/create-cfg-share"
+  mkdir -p "$HOME/.config/opencode" "$HOME/.config/nvim" "$HOME/.config/claudebox"
+  cd "$BATS_TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  rm -f "$capture"
+  CBOX_SHARE_CONFIG="opencode  nvim claudebox missing ../x" run _cbox_create "cfgbox" "normal"
+  [ "$status" -eq 0 ]
+  grep -qx "$CBOX_HOST_CONFIG_DIR:/home/claude/.config" "$capture"
+  grep -qx "$HOME/.config/opencode:/home/claude/.config/opencode:ro" "$capture"
+  grep -qx "$HOME/.config/nvim:/home/claude/.config/nvim:ro" "$capture"
+  [ -d "$CBOX_HOST_CONFIG_DIR/opencode" ]
+  run grep -c 'claudebox:/home/claude/.config\|missing\|\.\./x' "$capture"
+  [ "$output" = "0" ]
+  CBOX_SHARE_CONFIG="claudebox missing ../x" run _cbox_create "cfgbox" "normal"
+  [[ "$output" == *"claudebox is cbox's own config"* ]]
+  [[ "$output" == *"/missing does not exist"* ]]
+  [[ "$output" == *"'../x' is not a folder name"* ]]
+}
+
+@test "warden: a folder shared with CBOX_SHARE_CONFIG counts as visible in containers" {
+  mkdir -p "$HOME/.config/awsx"
+  CBOX_SHARE_CONFIG="awsx" run _cbox_warden_cmd _exposed "$HOME/.config/awsx/config"
+  [ "$status" -eq 0 ]
+  run _cbox_warden_cmd _exposed "$HOME/.config/awsx/config"
+  [ "$status" -ne 0 ]
+}

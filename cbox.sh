@@ -2833,6 +2833,14 @@ _cbox_warden_cmd() {
       else
         echo "ℹ broker not running — starts with the next cbox session"
       fi
+      if _cbox_warden_has_ssh; then
+        local n
+        if n=$(SSH_AUTH_SOCK="$CBOX_WARDEN_DIR/ssh/agent.sock" ssh-add -l 2>/dev/null | grep -c .); then
+          echo "✔ ssh agent running ($n key(s) unlocked)"
+        else
+          echo "ℹ ssh agent has no keys unlocked — the next cbox session unlocks them"
+        fi
+      fi
       ;;
     edit)
       local file
@@ -3795,6 +3803,7 @@ cbox() {
       fi
       echo "Stopping container '$stop_target'..."
       _cbox_mcp_relay_stop "$stop_target"
+      _cbox_tunnel_stop "$stop_target"
       _cbox_warden_end "$stop_target"
       $_CBOX_CMD stop "$stop_target" >/dev/null
       ;;
@@ -3807,6 +3816,7 @@ cbox() {
       fi
       echo "Removing container '$reset_target'..."
       _cbox_mcp_relay_stop "$reset_target"
+      _cbox_tunnel_stop "$reset_target"
       _cbox_warden_end "$reset_target"
       $_CBOX_CMD rm -f "$reset_target"
       ;;

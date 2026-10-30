@@ -76,7 +76,7 @@ cbox oc safe   # opencode in safe mode
 | `cbox doctor` | Run environment diagnostics (includes companion tool status) |
 | `cbox mcp` | Show host MCP servers and relay status |
 | `cbox mcp import` | Import MCP servers from Claude Desktop / Claude Code on the host |
-| `cbox warden` | List credential resources and what this project gets (see [Credentials (warden)](#credentials-warden)) |
+| `cbox warden` | List credential resources (APIs, storage, ssh keys, MCP servers) and what this project gets (see [Credentials (warden)](#credentials-warden)) |
 | `cbox warden edit` | Define resources the container may use |
 | `cbox warden secret set <resource>` | Store a resource's secret in the macOS Keychain |
 | `cbox warden approve` | Approve this project's `.warden` file |
@@ -243,6 +243,13 @@ Keychain), checks each request against what you allowed, and adds the
 credential on the way out. Inside the container, requests go to
 `$WARDEN_URL/<resource>/...` — the key a client sends is always replaced.
 
+| You have | Resource | The container gets |
+|----------|----------|--------------------|
+| An API key (OpenRouter, OpenAI, …) | `type = http` | `$WARDEN_URL/<resource>` plus the env vars you choose |
+| S3-compatible storage keys (R2, S3, MinIO) | `type = http`, `auth = sigv4` | An AWS profile with dummy keys |
+| An SSH key (GitHub, GitLab, servers) | `type = ssh` | An ssh agent that signs only for the hosts you list |
+| A remote MCP server's token | `type = mcp` | The server in Claude's and opencode's MCP list |
+
 ```sh
 cbox warden secret set openrouter   # paste the key; stored in the Keychain
 cbox warden edit                    # define the resource (template included)
@@ -389,6 +396,7 @@ If `pactl` cannot connect, check on the host that PulseAudio runs (`pulseaudio -
 - `cbox keepalive` leaves the container running for 10 minutes (useful for follow-up `exec` calls)
 - Log in once inside a container (`/login`); the login is kept in `CBOX_CLAUDE_DIR` and shared by all containers
 - If [claudedot](https://github.com/bpeterme/claudedot) is installed, Claude config and history sync runs automatically at session start and exit (Claude sessions only)
+- Host services the container needs as sockets — warden's ssh agent and PulseAudio — reach it through one long-lived `exec` per container (a tunnel; log: `~/.local/share/claudebox/.tunnel-<name>.log`). Neither side opens a network port for them
 - If [flux](https://github.com/bpeterme/flux) is installed, the container runs the host's flux version, and flux projects reach their storage through warden: `dvc pull` and a plain `git push` (flux's pre-push hook uploads the data first) work inside the container
 
 ## Companion Tools

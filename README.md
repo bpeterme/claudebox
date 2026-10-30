@@ -325,7 +325,7 @@ nohup pulseaudio --daemonize=no > /tmp/cbox-pulse.log 2>&1 &
 - `cbox keepalive` leaves the container running for 10 minutes (useful for follow-up `exec` calls)
 - Authentication is automatic — credentials are mounted from the host, so no re-authentication is needed inside the container
 - If [claudedot](https://github.com/bpeterme/claudedot) is installed, Claude config and history sync runs automatically at session start and exit (Claude sessions only)
-- If [flux](https://github.com/bpeterme/flux) is installed and the project has a `.dvc/` directory, large-file sync runs automatically at session boundaries
+- If [flux](https://github.com/bpeterme/flux) is installed, the container runs the host's flux version, and flux projects reach their storage through warden: `dvc pull` and a plain `git push` (flux's pre-push hook uploads the data first) work inside the container
 
 ## Companion Tools
 
@@ -341,7 +341,7 @@ cdot config    # connect to your sync remote
 
 ### [flux](https://github.com/bpeterme/flux)
 
-[flux](https://github.com/bpeterme/flux) handles automatic file routing between any Git remote and Cloudflare R2 object storage. If your projects involve large assets alongside code, claudebox and flux complement each other naturally — claudebox scopes Claude Code to your project, flux manages the file transport layer for assets that don't belong in a regular git repo. claudebox calls `flux` automatically at session boundaries when a flux-managed project is detected.
+[flux](https://github.com/bpeterme/flux) handles automatic file routing between any Git remote and Cloudflare R2 object storage. If your projects involve large assets alongside code, claudebox and flux complement each other naturally — claudebox scopes Claude Code to your project, flux manages the file transport layer for assets that don't belong in a regular git repo. Inside a claudebox container, flux projects use their storage through warden (see Credentials): the container never holds the R2 keys.
 
 ```bash
 brew tap bpeterme/flux

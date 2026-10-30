@@ -775,6 +775,28 @@ _warden_relocate() {
   [[ "$(cat "$WT/stderr")" == *"warden is off"*"$CBOX_SHARE_DIR"* ]]
 }
 
+@test "warden: a broker from another cbox version is restarted; tokens keep working" {
+  _warden_setup
+  url=$(_warden_url)
+  pid1=$(_cbox_warden_broker_pid)
+  _warden_env >/dev/null
+  pid2=$(_cbox_warden_broker_pid)
+  # As left by an older cbox: no (or another) code id.
+  rm -f "$CBOX_WARDEN_DIR/broker.id"
+  _warden_env >/dev/null
+  pid3=$(_cbox_warden_broker_pid)
+  echo other > "$CBOX_WARDEN_DIR/broker.id"
+  url_after=$(_warden_url)
+  pid4=$(_cbox_warden_broker_pid)
+  out=$(curl -s "$url/llm/models")
+  _warden_teardown
+  [ "$pid1" = "$pid2" ]
+  [ "$pid3" != "$pid2" ]
+  [ "$pid4" != "$pid3" ]
+  [ "$url_after" = "$url" ]
+  [[ "$out" == *'"path": "/api/v1/models"'* ]]
+}
+
 @test "warden: waits for a slow-starting broker (cold python3 on macOS)" {
   _warden_setup
   mkdir -p "$WT/slowbin"
@@ -1183,40 +1205,56 @@ auth = sigv4"
 }
 
 # ---------------------------------------------------------------------------
-# _cbox_flux_push
+# _cbox_flux_install
 # ---------------------------------------------------------------------------
 
-@test "_cbox_flux_push: non-verbose, success stays silent" {
-  unset CBOX_VERBOSE
-  flux() { return 0; }
-  run _cbox_flux_push
+_flux_install_setup() {
+  FAKE_BIN="$BATS_TMPDIR/fake-flux-bin"
+  rm -rf "$FAKE_BIN"; mkdir -p "$FAKE_BIN"
+  printf '#!/usr/bin/env bash\necho "flux v1"\n' > "$FAKE_BIN/flux"
+  chmod +x "$FAKE_BIN/flux"
+  PATH="$FAKE_BIN:$PATH"
+  rm -f "$CBOX_DATA_DIR"/.flux-installed-*
+  INSTALLED="$BATS_TMPDIR/installed-flux"
+  rm -f "$INSTALLED"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { echo "$*" >> "$BATS_TMPDIR/runtime-calls"; cat > "$INSTALLED"; }
+  rm -f "$BATS_TMPDIR/runtime-calls"
+}
+
+@test "_cbox_flux_install: copies the host's flux into the container as root" {
+  _flux_install_setup
+  run _cbox_flux_install box1
+  [ "$status" -eq 0 ]
+  cmp -s "$FAKE_BIN/flux" "$INSTALLED"
+  [[ "$(cat "$BATS_TMPDIR/runtime-calls")" == "exec -i --user root box1 sh -c "* ]]
+}
+
+@test "_cbox_flux_install: skips when unchanged, reinstalls after a host upgrade" {
+  _flux_install_setup
+  _cbox_flux_install box1
+  _cbox_flux_install box1
+  [ "$(grep -c . "$BATS_TMPDIR/runtime-calls")" -eq 1 ]
+  printf '#!/usr/bin/env bash\necho "flux v2"\n' > "$FAKE_BIN/flux"
+  _cbox_flux_install box1
+  [ "$(grep -c . "$BATS_TMPDIR/runtime-calls")" -eq 2 ]
+  grep -q "flux v2" "$INSTALLED"
+}
+
+@test "_cbox_flux_install: a failed copy is reported and retried next time" {
+  _flux_install_setup
+  _fake_runtime() { cat >/dev/null; return 1; }
+  run _cbox_flux_install box1
+  [[ "$output" == *"Could not install the host's flux"* ]]
+  [ ! -f "$CBOX_DATA_DIR/.flux-installed-box1" ]
+}
+
+@test "_cbox_flux_install: does nothing without flux on the host" {
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { echo called; }
+  PATH="/usr/bin:/bin" run _cbox_flux_install box1
   [ "$status" -eq 0 ]
   [ -z "$output" ]
-}
-
-@test "_cbox_flux_push: non-verbose, failure is always surfaced" {
-  unset CBOX_VERBOSE
-  flux() { echo "dvc push: access denied" >&2; return 1; }
-  run _cbox_flux_push
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"⚠  flux push failed:"* ]]
-  [[ "$output" == *"dvc push: access denied"* ]]
-}
-
-@test "_cbox_flux_push: verbose, failure is shown and does not abort the caller" {
-  CBOX_VERBOSE=1
-  flux() { echo "dvc push: access denied" >&2; return 1; }
-  run _cbox_flux_push
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"dvc push: access denied"* ]]
-}
-
-@test "_cbox_flux_push: verbose, success output is shown" {
-  CBOX_VERBOSE=1
-  flux() { echo "Pushed to Git remote."; return 0; }
-  run _cbox_flux_push
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"Pushed to Git remote."* ]]
 }
 
 # ---------------------------------------------------------------------------

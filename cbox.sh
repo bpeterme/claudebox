@@ -23,50 +23,48 @@ _cbox_help() {
 cbox - AI Coding Agent Container Runtime
 
 Usage:
-  cbox [-v]             Start or enter normal container (Claude Code)
-  cbox safe             Start or enter safe container
-  cbox shell            Open zsh shell instead of the container
-  cbox keepalive        Keep container alive for 10 minutes after exit
-  cbox oc [...]         Same as above but use opencode instead of Claude Code
+  cbox [-v]                           Start or enter normal container (Claude Code)
+  cbox safe                           Start or enter safe container
+  cbox shell                          Open zsh shell instead of the container
+  cbox keepalive                      Keep container alive for 10 minutes after exit
+  cbox oc [...]                       Same as above but use opencode instead of Claude Code
 
 Agent:
-  CBOX_AGENT=opencode   Use opencode instead of Claude Code (set in cbox.env)
-  cbox oc               Shorthand: one-off opencode session
-  cbox oc safe          opencode in safe mode
-  cbox oc shell         zsh shell (opencode-mode container)
+  CBOX_AGENT=opencode                 Use opencode instead of Claude Code (set in cbox.env)
+  cbox oc                             Shorthand: one-off opencode session
+  cbox oc safe                        opencode in safe mode
+  cbox oc shell                       zsh shell (opencode-mode container)
 
 Options:
-  -v, --verbose         Show full output (updates, sync, MCP relay status)
+  -v, --verbose                       Show full output (updates, sync, MCP relay status)
 
 Container Management:
-  cbox list             List cbox containers
-  cbox stop [name]      Stop current (or named) container
-  cbox reset            Remove current project container
-  cbox prune            Remove stopped cbox containers
-  cbox rebuild          Rebuild container image
+  cbox list                           List cbox containers
+  cbox stop [name]                    Stop current (or named) container
+  cbox reset                          Remove current project container
+  cbox prune                          Remove stopped cbox containers
+  cbox rebuild                        Rebuild container image
 
 MCP servers on the host (~/.config/claudebox/mcp.json):
-  cbox mcp              Show configured host MCP servers and relay status
-  cbox mcp import       Import servers from Claude Desktop / Claude Code
+  cbox mcp                            Show configured host MCP servers and relay status
+  cbox mcp import                     Import servers from Claude Desktop / Claude Code
 
 Credentials without exposing them (warden):
-  cbox warden           List resources and what this project gets
-  cbox warden edit      Define resources (APIs, storage, ssh keys the container may use)
-  cbox warden secret set <resource>
-                        Store a secret in the Keychain
-  cbox warden approve   Approve this project's .warden file
-  cbox warden test <resource>
-                        Check a resource from the host
-  cbox warden log       Show recent broker requests
+  cbox warden                         List resources and what this project gets
+  cbox warden edit                    Define resources (APIs, storage, ssh keys, MCP servers)
+  cbox warden secret set <resource>   Store a secret in the Keychain
+  cbox warden approve                 Approve this project's .warden file
+  cbox warden test <resource>         Check a resource from the host
+  cbox warden log                     Show recent broker requests
 
 Maintenance:
-  cbox update           Force agent update (Claude Code or opencode)
-  cbox doctor           Run environment diagnostics
-  cbox version          Show version
+  cbox update                         Force agent update (Claude Code or opencode)
+  cbox doctor                         Run environment diagnostics
+  cbox version                        Show version
 
 Companion tools:
-  cdot help             claudedot — Config + history sync across machines
-  flux help             Large-file routing for your projects (git + R2 storage)
+  cdot help                           claudedot — Config + history sync across machines
+  flux help                           Large-file routing for your projects (git + R2 storage)
 
 Help:
   cbox help
@@ -1596,7 +1594,6 @@ AWS_CONFIG = "/home/claude/.aws/warden-config"  # container path; written by cbo
 TUNNEL_DIR = os.environ.get("CBOX_TUNNEL_DIR", "/tmp/cbox-tunnel")  # container path; = _CBOX_TUNNEL_DIR
 HOST_RE = re.compile(r"^[A-Za-z0-9*?][A-Za-z0-9*?.-]{0,252}$")
 IPV6_RE = re.compile(r"^[0-9A-Fa-f:]+$")
-KNOWN_HOSTS = ("~/.ssh/known_hosts", "~/.ssh/known_hosts2", "/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2")
 SSH_FAILURE, SSH_LIST, SSH_LIST_ANSWER, SSH_SIGN, SSH_EXTENSION = 5, 11, 12, 13, 27
 SSH_EXTENSIONS = {b"session-bind@openssh.com"}  # lets the agent enforce the hosts limit
 SSH_MAX = 256 * 1024
@@ -1629,7 +1626,7 @@ TEMPLATE = """\
 #
 # [github]
 # type         = ssh
-# key          = ~/.ssh/id_ed25519       # private key on this Mac; needs id_ed25519.pub next to it
+# key          = id_ed25519              # a key file in CBOX_SSH_DIR (never your own ~/.ssh); needs its .pub
 # hosts        = github.com              # the key signs only for these hosts (space-separated;
 #                                        #   name, IP or host:port, e.g. 203.0.113.5:2222)
 # availability = global                  # the container gets an ssh agent, never the key file
@@ -1794,11 +1791,15 @@ def validate_ssh(r):
     if extra:
         return f"{', '.join(sorted(extra))} is not used by type = ssh (it takes key, hosts, availability)"
     if not r.get("key"):
-        return "key (path of the private key on this Mac) is missing"
+        return "key (a key file in CBOX_SSH_DIR, e.g. key = id_ed25519) is missing"
+    try:
+        path = ssh_key_path(r)
+    except LookupError as e:
+        return str(e)
     try:
         ssh_blob(r)
     except (OSError, ValueError):
-        return f"{os.path.expanduser(r['key'])}.pub is missing or not a public key (create it: ssh-keygen -y -f {r['key']} > {r['key']}.pub)"
+        return f"{path}.pub is missing or not a public key (create it: ssh-keygen -y -f {path} > {path}.pub)"
     hosts = r.get("hosts", "").split()
     if not hosts:
         return "hosts is missing: the hosts this key may sign for, e.g. hosts = github.com"
@@ -1825,31 +1826,95 @@ def ssh_dest(h):
     return host if port == 22 else f"[{host}]:{port}"
 
 
-def ssh_host_keys(dest):
-    """Blobs of dest's host keys as the Mac knows them (from its first
-    connection there); empty when it never connected."""
-    found = set()
-    for f in KNOWN_HOSTS:
-        f = os.path.expanduser(f)
-        if not os.path.isfile(f):
-            continue
-        p = subprocess.run(["ssh-keygen", "-F", dest, "-f", f], stdin=subprocess.DEVNULL,
+def ssh_dir():
+    """The claudebox ssh folder (CBOX_SSH_DIR): the only place warden takes keys
+    from, as cbox did before warden. Your own ~/.ssh is never read."""
+    d = os.environ.get("CBOX_SSH_DIR", "")
+    return os.path.realpath(os.path.expanduser(d)) if d else None
+
+
+def ssh_key_path(r):
+    """Path of an ssh resource's key: a file name (or path) inside CBOX_SSH_DIR."""
+    base = ssh_dir()
+    if not base:
+        raise LookupError("ssh resources take their key from CBOX_SSH_DIR (the claudebox ssh folder), "
+                          "which is not set — add it to cbox.env, e.g. CBOX_SSH_DIR=\"$HOME/.ssh/claudebox\"")
+    raw = os.path.expanduser(r["key"])
+    path = os.path.realpath(raw if os.path.isabs(raw) else os.path.join(base, raw))
+    if not path.startswith(base + os.sep):
+        raise LookupError(f"key {r['key']} is outside CBOX_SSH_DIR ({base}); warden only uses keys "
+                          f"from there — write it as a file name, e.g. key = {os.path.basename(raw)}")
+    return path
+
+
+def ssh_trusted_file(d):
+    return os.path.join(d, "ssh", "known_hosts")
+
+
+def parse_host_keys(text):
+    """(keytype, blob) of the plain host key lines in known_hosts text."""
+    out = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or line.startswith("#") or parts[0].startswith("@"):
+            continue  # comments; @revoked and @cert-authority lines are not plain host keys
+        try:
+            out.append((parts[1], base64.b64decode(parts[2], validate=True)))
+        except ValueError:
+            pass
+    return out
+
+
+def ssh_host_keys(d, dest):
+    """Blobs of dest's host keys that you confirmed for warden. warden keeps
+    its own list: the claudebox known_hosts can be written from containers."""
+    try:
+        text = open(ssh_trusted_file(d)).read()
+    except OSError:
+        return set()
+    return {blob for line in text.splitlines() if line.split()[:1] and dest in line.split()[0].split(",")
+            for _, blob in parse_host_keys(line)}
+
+
+def fingerprint(blob):
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+def ssh_trust(d, h, interactive):
+    """Asks once to trust the host key of h for warden; True when trusted.
+    The key comes from the claudebox known_hosts if it lists h, else from
+    the server itself (ssh-keyscan from this Mac)."""
+    dest = ssh_dest(h)
+    if ssh_host_keys(d, dest):
+        return True
+    if not interactive:
+        err(f"ℹ  warden does not know the server key of {h} yet — start cbox from a terminal to confirm it")
+        return False
+    keys, source = [], None
+    kh = os.path.join(ssh_dir() or "", "known_hosts")
+    if ssh_dir() and os.path.isfile(kh):
+        p = subprocess.run(["ssh-keygen", "-F", dest, "-f", kh], stdin=subprocess.DEVNULL,
                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        for line in p.stdout.decode(errors="replace").splitlines():
-            parts = line.split()
-            if len(parts) < 3 or line.startswith("#") or parts[0].startswith("@"):
-                continue  # comments; @revoked and @cert-authority lines are not plain host keys
-            try:
-                found.add(base64.b64decode(parts[2], validate=True))
-            except ValueError:
-                pass
-    return found
-
-
-def ssh_connect_hint(h):
-    host, port = ssh_host(h)
-    user = "git" if host in ("github.com", "gitlab.com", "bitbucket.org") else "<user>"
-    return f"ssh {'' if port == 22 else f'-p {port} '}{user}@{host}"
+        keys, source = parse_host_keys(p.stdout.decode(errors="replace")), kh
+    if not keys and shutil.which("ssh-keyscan"):
+        host, port = ssh_host(h)
+        p = subprocess.run(["ssh-keyscan", "-T", "5", "-p", str(port), host], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        keys, source = parse_host_keys(p.stdout.decode(errors="replace")), f"the server ({host} port {port})"
+    if not keys:
+        err(f"⚠  could not get the server key of {h}: not in {kh} and the server did not answer")
+        return False
+    err(f"warden: the server key of {h}, from {source}:")
+    for kind, blob in keys:
+        err(f"     {kind:<20} {fingerprint(blob)}")
+    if not ask("   Trust it for signing with warden's ssh keys? Compare with the server if you can. [y/N] "):
+        err(f"ℹ  not trusted — resources for {h} stay off until you confirm its key")
+        return False
+    lines = "".join(f"{dest} {kind} {base64.b64encode(blob).decode()}\n" for kind, blob in keys)
+    path = ssh_trusted_file(d)
+    old = open(path).read() if os.path.exists(path) else ""
+    write_private(path, old + lines)
+    return True
 
 
 def read_secret(r, field="secret"):
@@ -2263,7 +2328,7 @@ def cmd_serve(d, bind, port, pidfile):
 
 def ssh_blob(r):
     """Public key blob of an ssh resource, from <key>.pub."""
-    with open(os.path.expanduser(r["key"]) + ".pub") as f:
+    with open(ssh_key_path(r) + ".pub") as f:
         parts = f.read().split()
     if len(parts) < 2:
         raise ValueError("not a public key")
@@ -2340,15 +2405,10 @@ def ssh_load(d, names, resources, interactive):
     for blob in dict.fromkeys(ssh_blob(resources[n]) for n in names):
         users = [n for n, r in resources.items() if r.get("type") == "ssh" and ssh_blob(r) == blob]
         hosts = list(dict.fromkeys(h for n in users for h in resources[n]["hosts"].split()))
-        # The agent checks each server by its host key, which the Mac learns on
-        # its first connection; ssh-add fails for a host it has never seen.
-        unknown = [h for h in hosts if not ssh_host_keys(ssh_dest(h))]
+        # The agent checks each server by its host key, from warden's own list.
+        unknown = [h for h in hosts if not ssh_trust(d, h, interactive)]
         dests = [ssh_dest(h) for h in hosts if h not in unknown]
         label = "', '".join(users)
-        if unknown:
-            err(f"⚠  this Mac has never connected to {', '.join(unknown)} (ssh key of '{label}').\n"
-                "   Connect once from the Mac (answer yes to the host key question), then start cbox again:\n"
-                + "\n".join(f"     {ssh_connect_hint(h)}" for h in unknown))
         if not dests:
             continue
         key = blob.hex()
@@ -2362,9 +2422,10 @@ def ssh_load(d, names, resources, interactive):
         argv = ["ssh-add"]
         if sys.platform == "darwin" and shutil.which("ssh-add") == "/usr/bin/ssh-add":
             argv.append("--apple-use-keychain")  # passphrase from / into the Keychain
+        argv += ["-H", ssh_trusted_file(d)]  # only warden's list, not ~/.ssh/known_hosts
         for dest in dests:
             argv += ["-h", dest]
-        argv.append(os.path.expanduser(resources[users[0]]["key"]))
+        argv.append(ssh_key_path(resources[users[0]]))
         shown = ", ".join(h for h in hosts if h not in unknown)
         err(f"warden: unlocking the ssh key of '{label}' — it will sign only for {shown}")
         if subprocess.run(argv, env=ssh_agent_env(d), stdout=sys.stderr).returncode == 0:
@@ -2389,7 +2450,7 @@ def ssh_granted(d, box):
         if r and r.get("type") == "ssh":
             servers = out.setdefault(ssh_blob(r), {})
             for h in r["hosts"].split():
-                for hk in ssh_host_keys(ssh_dest(h)):
+                for hk in ssh_host_keys(d, ssh_dest(h)):
                     servers.setdefault(hk, n)
     return out
 
@@ -2503,15 +2564,15 @@ def cmd_ssh_stop(d):
 
 
 def ssh_test(d, name, r):
-    unknown = [h for h in r["hosts"].split() if not ssh_host_keys(ssh_dest(h))]
-    for h in unknown:
-        print(f"⚠ {name}: this Mac has never connected to {h} — run once: {ssh_connect_hint(h)}")
+    for h in r["hosts"].split():
+        if not ssh_host_keys(d, ssh_dest(h)):
+            print(f"⚠ {name}: the server key of {h} is not confirmed yet — the next cbox session asks")
     hosts = ", ".join(r["hosts"].split())
     have = ssh_agent_keys(d)
     if have is not None and ssh_blob(r) in have:
         print(f"✔ {name}: unlocked in warden's agent, signs only for {hosts}")
     else:
-        print(f"· {name}: key and {r['key']}.pub found; it is unlocked at the next cbox start (signs only for {hosts})")
+        print(f"· {name}: {ssh_key_path(r)} and its .pub found; unlocked at the next cbox start (signs only for {hosts})")
 
 
 # --- tunnel: host end -------------------------------------------------------
@@ -2618,6 +2679,9 @@ def cmd_list(d, project):
             r = with_project(n, r, names[n])[0] or r
         if r.get("type") == "ssh":
             print(f"{'✔' if here else '·'} {n:<16} ssh {r['key']} → {', '.join(r['hosts'].split())}  [{note}]")
+            for h in r["hosts"].split():
+                if not ssh_host_keys(d, ssh_dest(h)):
+                    print(f"  ⚠ server key of {h} not confirmed yet — the next cbox session asks")
             continue
         if r.get("type") == "mcp":
             print(f"{'✔' if here else '·'} {n:<16} MCP {r['url']}  [{r['auth'].split(':')[0]}; {note}]")

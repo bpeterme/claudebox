@@ -283,27 +283,34 @@ prefix = my-project
 
 **SSH keys** (`type = ssh`) stay on the Mac. The container gets an ssh agent
 (`SSH_AUTH_SOCK`) instead of the key file, so `git push` and `ssh` work as
-usual, but nothing in the container can copy the key:
+usual, but nothing in the container can copy the key. Keys come only from
+`CBOX_SSH_DIR`, the claudebox ssh folder set in `cbox.env` — never from your own
+`~/.ssh`:
 
 ```ini
 [github]
 type  = ssh
-key   = ~/.ssh/id_ed25519     # id_ed25519.pub must sit next to it
+key   = id_ed25519            # a key file in CBOX_SSH_DIR; id_ed25519.pub must sit next to it
 hosts = github.com            # the key signs only for these hosts
 ```
 
 `hosts` takes names, IP addresses and `host:port`, e.g.
-`hosts = github.com 203.0.113.5 10.30.0.204:2222`. It names the servers the key
-may sign for; where ssh connects (IP, port, user) still comes from your ssh
-command or `~/.ssh/config`.
+`hosts = github.com 203.0.113.5 10.30.0.204:2222` — the servers as the
+container reaches them. Where ssh connects (IP, port, user) still comes from
+the ssh command or `$CBOX_SSH_DIR/config`. A key outside `CBOX_SSH_DIR` is
+refused; without `CBOX_SSH_DIR`, ssh resources stay off.
 
 - warden runs an agent of its own (not your usual one) and adds the key with
   `ssh-add -h <host>`, so the agent itself refuses to sign for any other host.
   The first `cbox` session after a Mac restart unlocks it; on macOS, ssh-add
   takes the passphrase from the Keychain, and asks once otherwise.
-- The agent recognises each server by its host key, which the Mac learns on its
-  first connection. For a server the Mac has never connected to, cbox prints the
-  command to run once on the Mac (e.g. `ssh -p 2222 <user>@10.30.0.204`).
+- The agent recognises each server by its host key. warden keeps its own list
+  of confirmed server keys (`$CBOX_WARDEN_DIR/ssh/known_hosts`, never mounted).
+  For a new server, the next `cbox` session shows the key's fingerprint and asks
+  once whether to trust it. The key comes from `$CBOX_SSH_DIR/known_hosts`
+  if it lists the server, otherwise from the server itself (`ssh-keyscan` from
+  the Mac). It is never trusted from that file alone, because containers can
+  write it. If a server's key changes, delete its line from warden's list.
 - Several resources may use the same key, e.g. `[github]` for every
   container and `[aivm]` with `availability = project`. Before each signature,
   ssh tells the agent which server it is connected to; warden signs only when
@@ -326,7 +333,8 @@ secret = cbox.warden.linear      # cbox warden secret set linear
 ```
 
 `cbox warden test linear` sends an MCP `initialize` from the host. Claude Code
-and opencode both get these servers.
+and opencode both get these servers. Servers that only offer an OAuth login (no
+API key) are not supported through warden.
 
 **opencode providers.** `opencode = <provider id>` on an http resource points
 that opencode provider at warden (base URL and a dummy key), so the API key can
@@ -338,8 +346,7 @@ upstream = https://openrouter.ai/api/v1
 auth     = bearer
 secret   = cbox.warden.openrouter
 opencode = openrouter
-``` Servers that
-only offer an OAuth login (no API key) are not supported through warden.
+```
 
 Not available in safe mode.
 

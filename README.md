@@ -263,6 +263,9 @@ mounts: if a container could edit it, it could point a resource at its own
 server. warden checks this and stays off, with a message, when the file or its
 directory is visible inside a container.
 
+Each `[section]` names a resource: lowercase letters, digits, `.`, `_` and `-`,
+up to 64 characters, starting with a letter or digit (e.g. `[github]`, `[build.server]`).
+
 A resource is either available to every container (`availability = global`)
 or only to projects that list it in a tracked `.warden` file **and** whose
 `.warden` you approved on the host (`project`). Editing `.warden` — also from
@@ -295,7 +298,7 @@ hosts = github.com            # the key signs only for these hosts
 ```
 
 `hosts` takes names, IP addresses and `host:port`, e.g.
-`hosts = github.com 203.0.113.5 10.30.0.204:2222` — the servers as the
+`hosts = github.com 203.0.113.5 198.51.100.7:2222` — the servers as the
 container reaches them. Where ssh connects (IP, port, user) still comes from
 the ssh command or `$CBOX_SSH_DIR/config`. A key outside `CBOX_SSH_DIR` is
 refused; without `CBOX_SSH_DIR`, ssh resources stay off.
@@ -314,7 +317,7 @@ refused; without `CBOX_SSH_DIR`, ssh resources stay off.
   The container's ssh gets the confirmed keys of its granted servers as its
   system list (`/etc/ssh/ssh_known_hosts`), so it does not ask again.
 - Several resources may use the same key, e.g. `[github]` for every
-  container and `[aivm]` with `availability = project`. Before each signature,
+  container and `[build.server]` with `availability = project`. Before each signature,
   ssh tells the agent which server it is connected to; warden signs only when
   that server belongs to a resource granted to the container. Adding, removing
   or locking keys is refused. Signatures are logged with the resource

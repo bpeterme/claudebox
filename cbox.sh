@@ -3303,7 +3303,7 @@ _cbox_create() {
 
   # For each symlink in CBOX_CLAUDE_DIR, resolve it to the real host path and
   # mount that target at its own absolute path inside the container. The symlink
-  # in ~/.claude points to e.g. /Users/work/.config/dotfiles/claude/settings.json;
+  # in ~/.claude points to e.g. /Users/me/.config/dotfiles/claude/settings.json;
   # mounting that path at the same path in the container lets the symlink resolve.
   # maxdepth 2 also covers symlinks one level down (e.g. output-styles/ELI5.md,
   # commands/foo.md) without recursing into large trees like projects/.

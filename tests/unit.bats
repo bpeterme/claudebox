@@ -1371,7 +1371,7 @@ _prune_collect() {
       printf '%s\n' \
         "Temp stopped" \
         "companyon-apps running" \
-        "Genesis stopped" \
+        "Myproject stopped" \
         "buildkit stopped"
     }
     _cbox_rt_label() {
@@ -1404,7 +1404,7 @@ _prune_collect() {
   run _prune_collect
   [ "$status" -eq 0 ]
   [ "${lines[0]}" = "Temp" ]
-  [ "${lines[1]}" = "Genesis" ]
+  [ "${lines[1]}" = "Myproject" ]
   [ "${#lines[@]}" -eq 2 ]
 }
 
@@ -2381,22 +2381,22 @@ INI
 @test "warden ssh: hosts takes names, IPs and host:port; ssh-add gets the known_hosts form" {
   _ssh_setup
   _ssh_stubs
-  _known_hosts github.com 203.0.113.5 "[10.30.0.204]:6673" "[2001:db8::1]:2222"
-  sed -i 's|^hosts = github.com$|hosts = github.com 203.0.113.5 10.30.0.204:6673 [2001:db8::1]:2222 example.org:22|' "$CBOX_WARDEN_DIR/resources"
+  _known_hosts github.com 203.0.113.5 "[198.51.100.7]:2200" "[2001:db8::1]:2222"
+  sed -i 's|^hosts = github.com$|hosts = github.com 203.0.113.5 198.51.100.7:2200 [2001:db8::1]:2222 example.org:22|' "$CBOX_WARDEN_DIR/resources"
   printf '[bad]\ntype = ssh\nkey = %s\nhosts = 10.0.0.1:99999\n' "$TT/keys/two" >> "$CBOX_WARDEN_DIR/resources"
   echo "example.org ssh-ed25519 $(_fake_host_key example.org)" >> "$CBOX_WARDEN_DIR/ssh/known_hosts"
   : > "$TT/loaded"
   _ssh_py 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1], warn=err), True)' "$CBOX_WARDEN_DIR" 2>"$TT/err"
   _warden_teardown
-  [ "$(cat "$TT/ssh-add.args")" = "-H $CBOX_WARDEN_DIR/ssh/known_hosts -h github.com -h 203.0.113.5 -h [10.30.0.204]:6673 -h [2001:db8::1]:2222 -h example.org $TT/keys/one" ]
+  [ "$(cat "$TT/ssh-add.args")" = "-H $CBOX_WARDEN_DIR/ssh/known_hosts -h github.com -h 203.0.113.5 -h [198.51.100.7]:2200 -h [2001:db8::1]:2222 -h example.org $TT/keys/one" ]
   grep -q "'bad': host '10.0.0.1:99999' is not a host name, IP address or host:port" "$TT/err"
 }
 
 @test "warden ssh: a new server's key is confirmed once, from the claudebox known_hosts" {
   _ssh_setup
   _ssh_stubs
-  sed -i 's|^hosts = github.com$|hosts = github.com 10.30.0.204:6673|' "$CBOX_WARDEN_DIR/resources"
-  echo "[10.30.0.204]:6673 ssh-ed25519 $(_fake_host_key vm)" > "$TT/keys/known_hosts"
+  sed -i 's|^hosts = github.com$|hosts = github.com 198.51.100.7:2200|' "$CBOX_WARDEN_DIR/resources"
+  echo "[198.51.100.7]:2200 ssh-ed25519 $(_fake_host_key vm)" > "$TT/keys/known_hosts"
   : > "$TT/loaded"
   # Declined: the server stays off, the key still unlocks for github.com.
   _ssh_py_answer n 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1]), True)' "$CBOX_WARDEN_DIR" 2>"$TT/err-no"
@@ -2410,27 +2410,27 @@ INI
   grep -q "not trusted" "$TT/err-no"
   grep -q "from $TT/keys/known_hosts" "$TT/err-yes"
   grep -q "$fp" "$TT/err-yes"
-  [ "$second" = "-H $CBOX_WARDEN_DIR/ssh/known_hosts -h github.com -h [10.30.0.204]:6673 $TT/keys/one" ]
-  [[ "$trusted" == *"[10.30.0.204]:6673 ssh-ed25519 $(_fake_host_key vm)"* ]]
+  [ "$second" = "-H $CBOX_WARDEN_DIR/ssh/known_hosts -h github.com -h [198.51.100.7]:2200 $TT/keys/one" ]
+  [[ "$trusted" == *"[198.51.100.7]:2200 ssh-ed25519 $(_fake_host_key vm)"* ]]
   [ ! -e "$TT/keyscan.args" ]
 }
 
 @test "warden ssh: without an entry warden asks the server itself, and never reads ~/.ssh/known_hosts" {
   _ssh_setup
   _ssh_stubs
-  sed -i 's|^hosts = github.com$|hosts = 10.30.0.204:6673|' "$CBOX_WARDEN_DIR/resources"
+  sed -i 's|^hosts = github.com$|hosts = 198.51.100.7:2200|' "$CBOX_WARDEN_DIR/resources"
   mkdir -p "$HOME/.ssh"
-  echo "[10.30.0.204]:6673 ssh-ed25519 $(_fake_host_key personal)" > "$HOME/.ssh/known_hosts"
-  echo "[10.30.0.204]:6673 ssh-ed25519 $(_fake_host_key scanned)" > "$TT/keyscan"
+  echo "[198.51.100.7]:2200 ssh-ed25519 $(_fake_host_key personal)" > "$HOME/.ssh/known_hosts"
+  echo "[198.51.100.7]:2200 ssh-ed25519 $(_fake_host_key scanned)" > "$TT/keyscan"
   : > "$TT/loaded"
   _ssh_py_answer y 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1]), True)' "$CBOX_WARDEN_DIR" 2>"$TT/err"
   trusted=$(cat "$CBOX_WARDEN_DIR/ssh/known_hosts")
   rm -f "$HOME/.ssh/known_hosts"
   _warden_teardown
-  [ "$(cat "$TT/keyscan.args")" = "-T 5 -p 6673 10.30.0.204" ]
+  [ "$(cat "$TT/keyscan.args")" = "-T 5 -p 2200 198.51.100.7" ]
   [[ "$trusted" == *"$(_fake_host_key scanned)"* ]]
   [[ "$trusted" != *"$(_fake_host_key personal)"* ]]
-  grep -q "from the server (10.30.0.204 port 6673)" "$TT/err"
+  grep -q "from the server (198.51.100.7 port 2200)" "$TT/err"
 }
 
 @test "warden ssh: keys come only from CBOX_SSH_DIR" {
@@ -2541,17 +2541,17 @@ os.execvp("python3", ["python3", "-c", sys.argv[1]])
 
 @test "warden: resource names may contain dots, like a host name" {
   _ssh_setup
-  printf '[ai.vm]\ntype = ssh\nkey = %s\nhosts = ai.vm\n[.hidden]\ntype = ssh\nkey = %s\nhosts = x\n' "$TT/keys/two" "$TT/keys/two" >> "$CBOX_WARDEN_DIR/resources"
+  printf '[build.server]\ntype = ssh\nkey = %s\nhosts = build.server\n[.hidden]\ntype = ssh\nkey = %s\nhosts = x\n' "$TT/keys/two" "$TT/keys/two" >> "$CBOX_WARDEN_DIR/resources"
   run _cbox_warden_python list "$CBOX_WARDEN_DIR" "$PWD"
   _warden_teardown
-  [[ "$output" == *"ai.vm"*"ssh $TT/keys/two → ai.vm"* ]]
+  [[ "$output" == *"build.server"*"ssh $TT/keys/two → build.server"* ]]
   [[ "$output" == *"'.hidden': name may only contain"* ]]
 }
 
 @test "warden ssh: the session hands the container the confirmed server keys of its granted hosts" {
   _ssh_setup
   _ssh_stubs
-  _known_hosts github.com "[10.30.0.204]:6673"
+  _known_hosts github.com "[198.51.100.7]:2200"
   _fake_pub "$TT/loaded" 1
   run _warden_env
   list=$(sed -n 's/^WARDEN_KNOWN_HOSTS=//p' <<<"$output" | base64 -d)

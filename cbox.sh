@@ -23,50 +23,48 @@ _cbox_help() {
 cbox - AI Coding Agent Container Runtime
 
 Usage:
-  cbox [-v]             Start or enter normal container (Claude Code)
-  cbox safe             Start or enter safe container
-  cbox shell            Open zsh shell instead of the container
-  cbox keepalive        Keep container alive for 10 minutes after exit
-  cbox oc [...]         Same as above but use opencode instead of Claude Code
+  cbox [-v]                           Start or enter normal container (Claude Code)
+  cbox safe                           Start or enter safe container
+  cbox shell                          Open zsh shell instead of the container
+  cbox keepalive                      Keep container alive for 10 minutes after exit
+  cbox oc [...]                       Same as above but use opencode instead of Claude Code
 
 Agent:
-  CBOX_AGENT=opencode   Use opencode instead of Claude Code (set in cbox.env)
-  cbox oc               Shorthand: one-off opencode session
-  cbox oc safe          opencode in safe mode
-  cbox oc shell         zsh shell (opencode-mode container)
+  CBOX_AGENT=opencode                 Use opencode instead of Claude Code (set in cbox.env)
+  cbox oc                             Shorthand: one-off opencode session
+  cbox oc safe                        opencode in safe mode
+  cbox oc shell                       zsh shell (opencode-mode container)
 
 Options:
-  -v, --verbose         Show full output (updates, sync, MCP relay status)
+  -v, --verbose                       Show full output (updates, sync, MCP relay status)
 
 Container Management:
-  cbox list             List cbox containers
-  cbox stop [name]      Stop current (or named) container
-  cbox reset            Remove current project container
-  cbox prune            Remove stopped cbox containers
-  cbox rebuild          Rebuild container image
+  cbox list                           List cbox containers
+  cbox stop [name]                    Stop current (or named) container
+  cbox reset                          Remove current project container
+  cbox prune                          Remove stopped cbox containers
+  cbox rebuild                        Rebuild container image
 
 MCP servers on the host (~/.config/claudebox/mcp.json):
-  cbox mcp              Show configured host MCP servers and relay status
-  cbox mcp import       Import servers from Claude Desktop / Claude Code
+  cbox mcp                            Show configured host MCP servers and relay status
+  cbox mcp import                     Import servers from Claude Desktop / Claude Code
 
 Credentials without exposing them (warden):
-  cbox warden           List resources and what this project gets
-  cbox warden edit      Define resources (APIs, storage, ssh keys the container may use)
-  cbox warden secret set <resource>
-                        Store a secret in the Keychain
-  cbox warden approve   Approve this project's .warden file
-  cbox warden test <resource>
-                        Check a resource from the host
-  cbox warden log       Show recent broker requests
+  cbox warden                         List resources and what this project gets
+  cbox warden edit                    Define resources (APIs, storage, ssh keys, MCP servers)
+  cbox warden secret set <resource>   Store a secret in the Keychain
+  cbox warden approve                 Approve this project's .warden file
+  cbox warden test <resource>         Check a resource from the host
+  cbox warden log                     Show recent broker requests
 
 Maintenance:
-  cbox update           Force agent update (Claude Code or opencode)
-  cbox doctor           Run environment diagnostics
-  cbox version          Show version
+  cbox update                         Force agent update (Claude Code or opencode)
+  cbox doctor                         Run environment diagnostics
+  cbox version                        Show version
 
 Companion tools:
-  cdot help             claudedot — Config + history sync across machines
-  flux help             Large-file routing for your projects (git + R2 storage)
+  cdot help                           claudedot — Config + history sync across machines
+  flux help                           Large-file routing for your projects (git + R2 storage)
 
 Help:
   cbox help

@@ -304,8 +304,11 @@ command or `~/.ssh/config`.
 - The agent recognises each server by its host key, which the Mac learns on its
   first connection. For a server the Mac has never connected to, cbox prints the
   command to run once on the Mac (e.g. `ssh -p 2222 <user>@10.30.0.204`).
-- The container may only list the keys granted to it and sign with them;
-  adding, removing or locking keys is refused. Signatures are logged
+- Several resources may use the same key, e.g. `[github]` for every
+  container and `[aivm]` with `availability = project`. Before each signature,
+  ssh tells the agent which server it is connected to; warden signs only when
+  that server belongs to a resource granted to the container. Adding, removing
+  or locking keys is refused. Signatures are logged with the resource
   (`cbox warden log`).
 - Once any ssh resource exists, `CBOX_SSH_DIR` mounts only `config`,
   `known_hosts` and `*.pub` files — no private keys (from the next `cbox reset`).

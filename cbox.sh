@@ -1721,10 +1721,6 @@ def load_resources(d, warn=None, extra=()):
     for name in cp.sections():
         r = dict(cp[name])
         problem = validate(name, r)
-        if not problem and r.get("type") == "ssh":
-            twin = [n for n, o in out.items() if o.get("type") == "ssh" and ssh_blob(o) == ssh_blob(r)]
-            if twin:
-                problem = f"its key is already used by '{twin[0]}' (one resource per key)"
         if problem:
             warn and warn(f"warden resource '{name}': {problem} — skipped")
             continue
@@ -1829,14 +1825,25 @@ def ssh_dest(h):
     return host if port == 22 else f"[{host}]:{port}"
 
 
-def ssh_known(dest):
-    """True when the Mac knows dest's host key (it connected there before)."""
+def ssh_host_keys(dest):
+    """Blobs of dest's host keys as the Mac knows them (from its first
+    connection there); empty when it never connected."""
+    found = set()
     for f in KNOWN_HOSTS:
         f = os.path.expanduser(f)
-        if os.path.isfile(f) and subprocess.run(["ssh-keygen", "-F", dest, "-f", f], stdin=subprocess.DEVNULL,
-                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-            return True
-    return False
+        if not os.path.isfile(f):
+            continue
+        p = subprocess.run(["ssh-keygen", "-F", dest, "-f", f], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        for line in p.stdout.decode(errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) < 3 or line.startswith("#") or parts[0].startswith("@"):
+                continue  # comments; @revoked and @cert-authority lines are not plain host keys
+            try:
+                found.add(base64.b64decode(parts[2], validate=True))
+            except ValueError:
+                pass
+    return found
 
 
 def ssh_connect_hint(h):
@@ -2245,11 +2252,14 @@ def cmd_serve(d, bind, port, pidfile):
 
 # --- ssh: warden's own agent, and the filter in front of it ------------------
 #
-# The keys of ssh resources live in an agent of warden's own (not the user's),
-# each added with `ssh-add -h <host>` so the agent itself refuses to sign for
-# other hosts. A container reaches it only through the tunnel and ssh_filter:
-# listing and signing with the keys granted to that container; adding,
-# removing or locking keys is refused.
+# The keys of ssh resources live in an agent of warden's own (not the user's).
+# A key used by several resources is added once, with `ssh-add -h` for the
+# hosts of all of them, so the agent itself refuses every other host. A
+# container reaches it only through the tunnel and ssh_filter, which narrows
+# that to the resources granted to the container: before signing, ssh tells
+# the agent which server it is connected to (session-bind, with the server's
+# host key), and the filter signs only when that server belongs to a granted
+# resource for the key. Adding, removing or locking keys is refused.
 
 def ssh_blob(r):
     """Public key blob of an ssh resource, from <key>.pub."""
@@ -2316,48 +2326,59 @@ def ssh_agent_start(d):
 
 
 def ssh_load(d, names, resources, interactive):
-    """Makes sure warden's agent holds the keys of names, each limited to its
-    hosts. True if at least one of them is loaded."""
+    """Makes sure warden's agent holds the keys of names, each limited to the
+    hosts of every resource that uses it. True if at least one is loaded."""
     if not shutil.which("ssh-agent") or not shutil.which("ssh-add"):
         err("⚠  ssh resources need OpenSSH (ssh-agent, ssh-add) on this host — skipped")
         return False
     if not ssh_agent_start(d):
         return False
     have = ssh_agent_keys(d) or set()
+    state_path = os.path.join(d, "ssh", "loaded.json")
+    state = load_json(state_path, {})
     loaded = False
-    for n in names:
-        r = resources[n]
-        if ssh_blob(r) in have:
+    for blob in dict.fromkeys(ssh_blob(resources[n]) for n in names):
+        users = [n for n, r in resources.items() if r.get("type") == "ssh" and ssh_blob(r) == blob]
+        hosts = list(dict.fromkeys(h for n in users for h in resources[n]["hosts"].split()))
+        # The agent checks each server by its host key, which the Mac learns on
+        # its first connection; ssh-add fails for a host it has never seen.
+        unknown = [h for h in hosts if not ssh_host_keys(ssh_dest(h))]
+        dests = [ssh_dest(h) for h in hosts if h not in unknown]
+        label = "', '".join(users)
+        if unknown:
+            err(f"⚠  this Mac has never connected to {', '.join(unknown)} (ssh key of '{label}').\n"
+                "   Connect once from the Mac (answer yes to the host key question), then start cbox again:\n"
+                + "\n".join(f"     {ssh_connect_hint(h)}" for h in unknown))
+        if not dests:
+            continue
+        key = blob.hex()
+        if blob in have and sorted(state.get(key, [])) == sorted(dests):
             loaded = True
             continue
         if not interactive:
-            err(f"ℹ  ssh key '{n}' is not unlocked yet — start cbox from a terminal once")
-            continue
-        hosts = r["hosts"].split()
-        # The agent checks each server by its host key, which the Mac learns on
-        # its first connection; ssh-add fails for a host it has never seen.
-        unknown = [h for h in hosts if not ssh_known(ssh_dest(h))]
-        if unknown:
-            err(f"⚠  ssh key '{n}' not unlocked: this Mac has never connected to {', '.join(unknown)}.\n"
-                "   Connect once from the Mac (answer yes to the host key question), then start cbox again:\n"
-                + "\n".join(f"     {ssh_connect_hint(h)}" for h in unknown))
+            err(f"ℹ  ssh key of '{label}' is not unlocked {'yet' if blob not in have else 'for its current hosts'} — start cbox from a terminal once")
+            loaded = loaded or blob in have
             continue
         argv = ["ssh-add"]
         if sys.platform == "darwin" and shutil.which("ssh-add") == "/usr/bin/ssh-add":
             argv.append("--apple-use-keychain")  # passphrase from / into the Keychain
-        for h in hosts:
-            argv += ["-h", ssh_dest(h)]
-        argv.append(os.path.expanduser(r["key"]))
-        err(f"warden: unlocking ssh key '{n}' — it will sign only for {', '.join(hosts)}")
+        for dest in dests:
+            argv += ["-h", dest]
+        argv.append(os.path.expanduser(resources[users[0]]["key"]))
+        shown = ", ".join(h for h in hosts if h not in unknown)
+        err(f"warden: unlocking the ssh key of '{label}' — it will sign only for {shown}")
         if subprocess.run(argv, env=ssh_agent_env(d), stdout=sys.stderr).returncode == 0:
             loaded = True
+            state[key] = dests
+            write_private(state_path, json.dumps(state, indent=2) + "\n")
         else:
-            err(f"⚠  ssh key '{n}' was not loaded (see ssh-add's message above)")
+            err(f"⚠  ssh key of '{label}' was not loaded (see ssh-add's message above)")
+            loaded = loaded or blob in have
     return loaded
 
 
 def ssh_granted(d, box):
-    """{public key blob: resource name} for the ssh keys box may use now."""
+    """{key blob: {server host key blob: resource name}} for what box may use now."""
     sess = load_json(os.path.join(paths(d)["sessions"], f"{box}.json"), {})
     if not sess or exposure(d):
         return {}
@@ -2366,7 +2387,10 @@ def ssh_granted(d, box):
     for n in sess.get("resources", []):
         r = resources.get(n)
         if r and r.get("type") == "ssh":
-            out[ssh_blob(r)] = n
+            servers = out.setdefault(ssh_blob(r), {})
+            for h in r["hosts"].split():
+                for hk in ssh_host_keys(ssh_dest(h)):
+                    servers.setdefault(hk, n)
     return out
 
 
@@ -2411,13 +2435,14 @@ def ssh_only(answer, keys):
             kept.append(blob)
     out = bytes([SSH_LIST_ANSWER]) + struct.pack(">I", len(kept))
     for blob in kept:
-        comment = f"warden:{keys[blob]}".encode()
+        comment = ("warden:" + "+".join(sorted(set(keys[blob].values())))).encode()
         out += struct.pack(">I", len(blob)) + blob + struct.pack(">I", len(comment)) + comment
     return out
 
 
 def ssh_filter(d, box, client, agent, keys):
-    """Serves one agent connection from the container."""
+    """Serves one agent connection from the container. keys is ssh_granted()."""
+    bound = None  # host key of the server this connection's ssh is talking to
     try:
         while True:
             msg = ssh_recv(client)
@@ -2428,14 +2453,23 @@ def ssh_filter(d, box, client, agent, keys):
                 reply = ssh_only(ssh_ask(agent, msg), keys)
             elif msg[0] == SSH_SIGN:
                 blob, _ = ssh_string(msg, 1)
-                if blob in keys:
+                name = keys.get(blob, {}).get(bound) if bound else None
+                if name:
                     reply = ssh_ask(agent, msg)
-                    log_line(d, f"{box} ssh: signed with '{keys[blob]}'"
-                                + ("" if reply[:1] != bytes([SSH_FAILURE]) else " — refused by the agent (host not allowed?)"))
-                else:
+                    log_line(d, f"{box} ssh: signed for '{name}'"
+                                + ("" if reply[:1] != bytes([SSH_FAILURE]) else " — refused by the agent"))
+                elif blob not in keys:
                     log_line(d, f"{box} ssh: refused to sign with a key not granted to it")
+                elif bound is None:
+                    log_line(d, f"{box} ssh: refused to sign — the client did not say which server it is for")
+                else:
+                    log_line(d, f"{box} ssh: refused to sign for a server none of its resources lists")
             elif msg[0] == SSH_EXTENSION and ssh_string(msg, 1)[0] in SSH_EXTENSIONS:
+                _, off = ssh_string(msg, 1)
+                hostkey, _ = ssh_string(msg, off)
                 reply = ssh_ask(agent, msg)
+                if reply[:1] == bytes([6]):  # the agent verified the binding
+                    bound = hostkey
             else:
                 log_line(d, f"{box} ssh: refused agent request type {msg[0]}")
             client.sendall(struct.pack(">I", len(reply)) + reply)
@@ -2461,7 +2495,7 @@ def cmd_ssh_stop(d):
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass
-    for f in (pidfile, ssh_agent_sock(d)):
+    for f in (pidfile, ssh_agent_sock(d), os.path.join(d, "ssh", "loaded.json")):
         try:
             os.remove(f)
         except OSError:
@@ -2469,6 +2503,9 @@ def cmd_ssh_stop(d):
 
 
 def ssh_test(d, name, r):
+    unknown = [h for h in r["hosts"].split() if not ssh_host_keys(ssh_dest(h))]
+    for h in unknown:
+        print(f"⚠ {name}: this Mac has never connected to {h} — run once: {ssh_connect_hint(h)}")
     hosts = ", ".join(r["hosts"].split())
     have = ssh_agent_keys(d)
     if have is not None and ssh_blob(r) in have:

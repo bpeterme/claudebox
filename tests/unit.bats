@@ -2078,44 +2078,63 @@ EOF
   [[ "$output" == *"gh"*"ssh $TT/keys/one → github.com"* ]]
   [[ "$output" == *"'nopub': $TT/keys/missing.pub is missing"* ]]
   [[ "$output" == *"'nohosts': hosts is missing"* ]]
-  [[ "$output" == *"'twin': its key is already used by 'gh'"* ]]
+  # Several resources may share a key.
+  [[ "$output" == *"twin"*"ssh $TT/keys/one → gitlab.com"* ]]
+  [[ "$output" != *"'twin':"* ]]
   [[ "$output" == *"'mixed': upstream is not used by type = ssh"* ]]
 }
 
-@test "warden ssh: the filter lists and signs only granted keys and refuses key management" {
+@test "warden ssh: the filter signs only for servers of granted resources and refuses key management" {
   _ssh_setup
   agent_pid=$(_fake_agent "$TT/agent.sock" "$TT/agent.log")
   for _ in $(seq 50); do [ -S "$TT/agent.sock" ] && break; sleep 0.1; done
   run _ssh_py '
 s = lambda b: struct.pack(">I", len(b)) + b
 key = lambda n: s(b"ssh-ed25519") + s(bytes([n]) * 32)
-ours, theirs = socket.socketpair()
-agent = socket.socket(socket.AF_UNIX); agent.connect(sys.argv[2])
-threading.Thread(target=ssh_filter, args=(sys.argv[1], "box", theirs, agent, {key(1): "gh"}), daemon=True).start()
-def ask(m):
-    ours.sendall(struct.pack(">I", len(m)) + m)
-    return ssh_recv(ours)
+granted = {key(1): {key(5): "gh", key(6): "lab"}}  # key 1 for the servers with host keys 5 and 6
+def conn():
+    ours, theirs = socket.socketpair()
+    agent = socket.socket(socket.AF_UNIX); agent.connect(sys.argv[2])
+    threading.Thread(target=ssh_filter, args=(sys.argv[1], "box", theirs, agent, granted), daemon=True).start()
+    def ask(m):
+        ours.sendall(struct.pack(">I", len(m)) + m)
+        return ssh_recv(ours)
+    return ask
+bind = lambda hk: bytes([27]) + s(b"session-bind@openssh.com") + s(hk) + s(b"sid") + s(b"sig") + b"\0"
+sign = lambda k: bytes([13]) + s(k) + s(b"data") + struct.pack(">I", 0)
+ask = conn()
 ids = ask(bytes([11]))
-print("list", struct.unpack(">I", ids[1:5])[0], key(1) in ids, key(2) in ids, b"warden:gh" in ids, b"/Users" in ids)
-print("sign-granted", ask(bytes([13]) + s(key(1)) + s(b"data") + struct.pack(">I", 0))[0])
-print("sign-other", ask(bytes([13]) + s(key(2)) + s(b"data") + struct.pack(">I", 0))[0])
+print("list", struct.unpack(">I", ids[1:5])[0], key(1) in ids, key(2) in ids, b"warden:gh+lab" in ids, b"/Users" in ids)
+print("sign-unbound", ask(sign(key(1)))[0])
+print("bind", ask(bind(key(5)))[0])
+print("sign-granted", ask(sign(key(1)))[0])
+print("sign-other-key", ask(sign(key(2)))[0])
 print("add", ask(bytes([17]) + s(b"ssh-ed25519"))[0])
 print("lock", ask(bytes([22]) + s(b"pw"))[0])
-print("bind", ask(bytes([27]) + s(b"session-bind@openssh.com"))[0])
 print("other-ext", ask(bytes([27]) + s(b"something@else"))[0])
+ask = conn()
+ask(bind(key(9)))  # a server no granted resource lists
+print("sign-other-server", ask(sign(key(1)))[0])
 ' "$CBOX_WARDEN_DIR" "$TT/agent.sock"
   kill "$agent_pid" 2>/dev/null || true
   reached=$(sort -u "$TT/agent.log" | tr '\n' ' ')
+  signs=$(grep -c '^13$' "$TT/agent.log")
   _warden_teardown
   [[ "$output" == *"list 1 True False True False"* ]]
+  [[ "$output" == *"sign-unbound 5"* ]]
+  [[ "$output" == *"bind 6"* ]]
   [[ "$output" == *"sign-granted 14"* ]]
-  [[ "$output" == *"sign-other 5"* ]]
+  [[ "$output" == *"sign-other-key 5"* ]]
   [[ "$output" == *"add 5"* ]]
   [[ "$output" == *"lock 5"* ]]
-  [[ "$output" == *"bind 6"* ]]
   [[ "$output" == *"other-ext 5"* ]]
-  # Only list, sign (granted key) and session-bind ever reached the agent.
+  [[ "$output" == *"sign-other-server 5"* ]]
+  # Only list, session-bind and the one allowed signature reached the agent.
   [ "$reached" = "11 13 27 " ]
+  [ "$signs" -eq 1 ]
+  grep -q "box ssh: signed for 'gh'" "$CBOX_WARDEN_DIR/broker.log"
+  grep -q "did not say which server" "$CBOX_WARDEN_DIR/broker.log"
+  grep -q "for a server none of its resources lists" "$CBOX_WARDEN_DIR/broker.log"
   grep -q "box ssh: refused agent request type 17" "$CBOX_WARDEN_DIR/broker.log"
 }
 
@@ -2357,7 +2376,33 @@ INI
   : > "$TT/loaded"
   _ssh_py 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1]), True)' "$CBOX_WARDEN_DIR" 2>"$TT/err"
   _warden_teardown
-  [ ! -e "$TT/ssh-add.args" ]
+  # Unlocked for the hosts the Mac knows; the other one gets the command.
+  [ "$(cat "$TT/ssh-add.args")" = "-h github.com $TT/keys/one" ]
   grep -q "never connected to 10.30.0.204:6673" "$TT/err"
   grep -q "ssh -p 6673 <user>@10.30.0.204" "$TT/err"
+}
+
+@test "warden ssh: resources sharing a key load it once for all their hosts; grants stay per resource" {
+  _ssh_setup
+  _ssh_stubs
+  _known_hosts github.com gitlab.com
+  printf '[lab]\ntype = ssh\nkey = %s\nhosts = gitlab.com\navailability = project\n' "$TT/keys/one" >> "$CBOX_WARDEN_DIR/resources"
+  : > "$TT/loaded"
+  _ssh_py 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1]), True)' "$CBOX_WARDEN_DIR" 2>/dev/null
+  _ssh_py 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1]), True)' "$CBOX_WARDEN_DIR" 2>/dev/null
+  once=$(cat "$TT/ssh-add.args")
+  # A host added later: the key is added again with the new list.
+  _known_hosts github.com gitlab.com example.org
+  sed -i 's|^hosts = gitlab.com$|hosts = gitlab.com example.org|' "$CBOX_WARDEN_DIR/resources"
+  _ssh_py 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1]), True)' "$CBOX_WARDEN_DIR" 2>/dev/null
+  again=$(sed -n 2p "$TT/ssh-add.args")
+  _warden_env >/dev/null   # wbox: only the global 'gh' is granted
+  _cbox_warden_env
+  servers=$(env "${_CBOX_WARDEN_ENV[@]}" python3 -c "$(_cbox_warden_py | sed '/^if __name__/,$d')
+print(sorted(set(v for k in ssh_granted(sys.argv[1], 'wbox').values() for v in k.values())), sum(len(k) for k in ssh_granted(sys.argv[1], 'wbox').values()))" "$CBOX_WARDEN_DIR")
+  _warden_teardown
+  [ "$once" = "-h github.com -h gitlab.com $TT/keys/one" ]
+  [ "$again" = "-h github.com -h gitlab.com -h example.org $TT/keys/one" ]
+  # wbox may sign with the key only for github.com's host key, as 'gh'.
+  [ "$servers" = "['gh'] 1" ]
 }

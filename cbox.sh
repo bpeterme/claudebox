@@ -2063,6 +2063,16 @@ def cmd_session(d, box, project, base_url, interactive):
     keys = [n for n in sorted(granted) if resources[n].get("type") == "ssh"]
     if keys and ssh_load(d, keys, resources, interactive == "1"):
         print(f"SSH_AUTH_SOCK={TUNNEL_DIR}/ssh-agent.sock")
+        # The container's ssh checks the same confirmed server keys (its system
+        # known_hosts), so one confirmation covers both and it never asks again.
+        dests = {ssh_dest(h) for n in keys for h in resources[n]["hosts"].split()}
+        try:
+            confirmed = [l for l in open(ssh_trusted_file(d)).read().splitlines()
+                         if l.split()[:1] and set(l.split()[0].split(",")) & dests]
+        except OSError:
+            confirmed = []
+        if confirmed:
+            print("WARDEN_KNOWN_HOSTS=" + base64.b64encode(("\n".join(confirmed) + "\n").encode()).decode())
     profiles = []
     for n in sorted(granted):
         r = resources[n]
@@ -3684,6 +3694,10 @@ _cbox_enter() {
         WARDEN_AWS_CONFIG=*)
           _run="mkdir -p ~/.aws && print -rn -- '${_w_env#*=}' | base64 -d >| ~/.aws/warden-config; $_run" ;;
         SSH_AUTH_SOCK=*) _tunnel=1; _exec_args+=(-e "$_w_env") ;;
+        # Server keys confirmed for warden: the container's ssh gets them as
+        # its system list (needs the image's sudo; the list is not secret).
+        WARDEN_KNOWN_HOSTS=*)
+          _run="print -rn -- '${_w_env#*=}' | base64 -d | sudo tee /etc/ssh/ssh_known_hosts >/dev/null 2>&1; $_run" ;;
         # Remote MCP servers behind warden: for the agent's config, not the env.
         WARDEN_MCP=*) _warden_mcp=$(printf '%s' "${_w_env#*=}" | base64 -d 2>/dev/null) || _warden_mcp="" ;;
         WARDEN_OPENCODE=*) _warden_oc=$(printf '%s' "${_w_env#*=}" | base64 -d 2>/dev/null) || _warden_oc="" ;;

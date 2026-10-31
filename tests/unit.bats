@@ -2547,3 +2547,14 @@ os.execvp("python3", ["python3", "-c", sys.argv[1]])
   [[ "$output" == *"ai.vm"*"ssh $TT/keys/two → ai.vm"* ]]
   [[ "$output" == *"'.hidden': name may only contain"* ]]
 }
+
+@test "warden ssh: the session hands the container the confirmed server keys of its granted hosts" {
+  _ssh_setup
+  _ssh_stubs
+  _known_hosts github.com "[10.30.0.204]:6673"
+  _fake_pub "$TT/loaded" 1
+  run _warden_env
+  list=$(sed -n 's/^WARDEN_KNOWN_HOSTS=//p' <<<"$output" | base64 -d)
+  _warden_teardown
+  [ "$list" = "github.com ssh-ed25519 $(_fake_host_key github.com)" ]
+}

@@ -311,6 +311,8 @@ refused; without `CBOX_SSH_DIR`, ssh resources stay off.
   if it lists the server, otherwise from the server itself (`ssh-keyscan` from
   the Mac). It is never trusted from that file alone, because containers can
   write it. If a server's key changes, delete its line from warden's list.
+  The container's ssh gets the confirmed keys of its granted servers as its
+  system list (`/etc/ssh/ssh_known_hosts`), so it does not ask again.
 - Several resources may use the same key, e.g. `[github]` for every
   container and `[aivm]` with `availability = project`. Before each signature,
   ssh tells the agent which server it is connected to; warden signs only when

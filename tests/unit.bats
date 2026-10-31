@@ -2133,6 +2133,16 @@ EOF
   printf '#!/bin/sh\necho "SSH_AGENT_PID=999999; export SSH_AGENT_PID;"\n' > "$TT/bin/ssh-agent"
   chmod +x "$TT/bin/ssh-add" "$TT/bin/ssh-agent"
   export PATH="$TT/bin:$PATH"
+  _known_hosts github.com
+}
+
+# The Mac's known_hosts with a made-up (public) host key for each name given.
+_known_hosts() {
+  local key h
+  key=$(cut -d' ' -f2 "$TT/keys/two.pub")
+  mkdir -p "$HOME/.ssh"
+  : > "$HOME/.ssh/known_hosts"
+  for h in "$@"; do echo "$h ssh-ed25519 $key" >> "$HOME/.ssh/known_hosts"; done
 }
 
 @test "warden ssh: session sets SSH_AUTH_SOCK only once the key is unlocked" {
@@ -2324,4 +2334,30 @@ INI
   _warden_teardown
   [ "$oc" = "{\"openrouter\": {\"options\": {\"baseURL\": \"$base/llm\", \"apiKey\": \"warden\"}}}" ]
   grep -q "'s3x': opencode must be the id of an opencode provider" "$WT/stderr"
+}
+
+@test "warden ssh: hosts takes names, IPs and host:port; ssh-add gets the known_hosts form" {
+  _ssh_setup
+  _ssh_stubs
+  _known_hosts github.com 203.0.113.5 "[10.30.0.204]:6673" "[2001:db8::1]:2222"
+  sed -i 's|^hosts = github.com$|hosts = github.com 203.0.113.5 10.30.0.204:6673 [2001:db8::1]:2222 example.org:22|' "$CBOX_WARDEN_DIR/resources"
+  printf '[bad]\ntype = ssh\nkey = %s\nhosts = 10.0.0.1:99999\n' "$TT/keys/two" >> "$CBOX_WARDEN_DIR/resources"
+  echo "example.org ssh-ed25519 $(cut -d' ' -f2 "$TT/keys/two.pub")" >> "$HOME/.ssh/known_hosts"
+  : > "$TT/loaded"
+  _ssh_py 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1], warn=err), True)' "$CBOX_WARDEN_DIR" 2>"$TT/err"
+  _warden_teardown
+  [ "$(cat "$TT/ssh-add.args")" = "-h github.com -h 203.0.113.5 -h [10.30.0.204]:6673 -h [2001:db8::1]:2222 -h example.org $TT/keys/one" ]
+  grep -q "'bad': host '10.0.0.1:99999' is not a host name, IP address or host:port" "$TT/err"
+}
+
+@test "warden ssh: a host the Mac never connected to gets the command to do it, not an ssh-add error" {
+  _ssh_setup
+  _ssh_stubs
+  sed -i 's|^hosts = github.com$|hosts = github.com 10.30.0.204:6673|' "$CBOX_WARDEN_DIR/resources"
+  : > "$TT/loaded"
+  _ssh_py 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1]), True)' "$CBOX_WARDEN_DIR" 2>"$TT/err"
+  _warden_teardown
+  [ ! -e "$TT/ssh-add.args" ]
+  grep -q "never connected to 10.30.0.204:6673" "$TT/err"
+  grep -q "ssh -p 6673 <user>@10.30.0.204" "$TT/err"
 }

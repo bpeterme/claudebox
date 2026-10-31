@@ -292,12 +292,18 @@ key   = ~/.ssh/id_ed25519     # id_ed25519.pub must sit next to it
 hosts = github.com            # the key signs only for these hosts
 ```
 
+`hosts` takes names, IP addresses and `host:port`, e.g.
+`hosts = github.com 203.0.113.5 10.30.0.204:2222`. It names the servers the key
+may sign for; where ssh connects (IP, port, user) still comes from your ssh
+command or `~/.ssh/config`.
+
 - warden runs an agent of its own (not your usual one) and adds the key with
   `ssh-add -h <host>`, so the agent itself refuses to sign for any other host.
   The first `cbox` session after a Mac restart unlocks it; on macOS, ssh-add
   takes the passphrase from the Keychain, and asks once otherwise.
-- `ssh-add -h` needs the host's key in `~/.ssh/known_hosts` on the Mac. If it
-  says none were found, connect once from the Mac (`ssh -T git@github.com`).
+- The agent recognises each server by its host key, which the Mac learns on its
+  first connection. For a server the Mac has never connected to, cbox prints the
+  command to run once on the Mac (e.g. `ssh -p 2222 <user>@10.30.0.204`).
 - The container may only list the keys granted to it and sign with them;
   adding, removing or locking keys is refused. Signatures are logged
   (`cbox warden log`).

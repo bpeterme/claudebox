@@ -1595,6 +1595,8 @@ PROJECT_KEYS = {"prefix"}  # settings a project's .warden may add to a resource;
 AWS_CONFIG = "/home/claude/.aws/warden-config"  # container path; written by cbox at session start
 TUNNEL_DIR = os.environ.get("CBOX_TUNNEL_DIR", "/tmp/cbox-tunnel")  # container path; = _CBOX_TUNNEL_DIR
 HOST_RE = re.compile(r"^[A-Za-z0-9*?][A-Za-z0-9*?.-]{0,252}$")
+IPV6_RE = re.compile(r"^[0-9A-Fa-f:]+$")
+KNOWN_HOSTS = ("~/.ssh/known_hosts", "~/.ssh/known_hosts2", "/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2")
 SSH_FAILURE, SSH_LIST, SSH_LIST_ANSWER, SSH_SIGN, SSH_EXTENSION = 5, 11, 12, 13, 27
 SSH_EXTENSIONS = {b"session-bind@openssh.com"}  # lets the agent enforce the hosts limit
 SSH_MAX = 256 * 1024
@@ -1628,7 +1630,8 @@ TEMPLATE = """\
 # [github]
 # type         = ssh
 # key          = ~/.ssh/id_ed25519       # private key on this Mac; needs id_ed25519.pub next to it
-# hosts        = github.com              # the key signs only for these hosts (space-separated)
+# hosts        = github.com              # the key signs only for these hosts (space-separated;
+#                                        #   name, IP or host:port, e.g. 203.0.113.5:2222)
 # availability = global                  # the container gets an ssh agent, never the key file
 #
 # [linear]
@@ -1804,9 +1807,42 @@ def validate_ssh(r):
     if not hosts:
         return "hosts is missing: the hosts this key may sign for, e.g. hosts = github.com"
     for h in hosts:
-        if not HOST_RE.match(h):
-            return f"host '{h}' is not a host name"
+        if ssh_host(h) is None:
+            return f"host '{h}' is not a host name, IP address or host:port"
     return None
+
+
+def ssh_host(h):
+    """(host, port) for an entry of hosts — name, IP, host:port or [host]:port —
+    or None when it is none of these."""
+    m = re.fullmatch(r"\[([^\]]+)\]:(\d{1,5})", h) or re.fullmatch(r"([^:\[\]]+):(\d{1,5})", h)
+    host, port = (m.group(1), int(m.group(2))) if m else (h, 22)
+    if not (HOST_RE.match(host) or (":" in host and IPV6_RE.match(host))) or not 0 < port < 65536:
+        return None
+    return host, port
+
+
+def ssh_dest(h):
+    """An entry of hosts as ssh-add -h and known_hosts write it: a port other
+    than 22 goes in the [host]:port form."""
+    host, port = ssh_host(h)
+    return host if port == 22 else f"[{host}]:{port}"
+
+
+def ssh_known(dest):
+    """True when the Mac knows dest's host key (it connected there before)."""
+    for f in KNOWN_HOSTS:
+        f = os.path.expanduser(f)
+        if os.path.isfile(f) and subprocess.run(["ssh-keygen", "-F", dest, "-f", f], stdin=subprocess.DEVNULL,
+                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            return True
+    return False
+
+
+def ssh_connect_hint(h):
+    host, port = ssh_host(h)
+    user = "git" if host in ("github.com", "gitlab.com", "bitbucket.org") else "<user>"
+    return f"ssh {'' if port == 22 else f'-p {port} '}{user}@{host}"
 
 
 def read_secret(r, field="secret"):
@@ -2298,18 +2334,25 @@ def ssh_load(d, names, resources, interactive):
             err(f"ℹ  ssh key '{n}' is not unlocked yet — start cbox from a terminal once")
             continue
         hosts = r["hosts"].split()
+        # The agent checks each server by its host key, which the Mac learns on
+        # its first connection; ssh-add fails for a host it has never seen.
+        unknown = [h for h in hosts if not ssh_known(ssh_dest(h))]
+        if unknown:
+            err(f"⚠  ssh key '{n}' not unlocked: this Mac has never connected to {', '.join(unknown)}.\n"
+                "   Connect once from the Mac (answer yes to the host key question), then start cbox again:\n"
+                + "\n".join(f"     {ssh_connect_hint(h)}" for h in unknown))
+            continue
         argv = ["ssh-add"]
         if sys.platform == "darwin" and shutil.which("ssh-add") == "/usr/bin/ssh-add":
             argv.append("--apple-use-keychain")  # passphrase from / into the Keychain
         for h in hosts:
-            argv += ["-h", h]
+            argv += ["-h", ssh_dest(h)]
         argv.append(os.path.expanduser(r["key"]))
         err(f"warden: unlocking ssh key '{n}' — it will sign only for {', '.join(hosts)}")
         if subprocess.run(argv, env=ssh_agent_env(d), stdout=sys.stderr).returncode == 0:
             loaded = True
         else:
-            err(f"⚠  ssh key '{n}' was not loaded. If ssh-add found no host keys, connect once\n"
-                f"   from this Mac first (e.g. ssh -T git@{hosts[0]}), then start cbox again.")
+            err(f"⚠  ssh key '{n}' was not loaded (see ssh-add's message above)")
     return loaded
 
 

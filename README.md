@@ -76,7 +76,7 @@ cbox oc safe   # opencode in safe mode
 | `cbox doctor` | Run environment diagnostics (includes companion tool status) |
 | `cbox mcp` | Show host MCP servers and relay status |
 | `cbox mcp import` | Import MCP servers from Claude Desktop / Claude Code on the host |
-| `cbox warden` | List credential resources and what this project gets (see [Credentials (warden)](#credentials-warden)) |
+| `cbox warden` | List credential resources (APIs, storage, ssh keys, MCP servers) and what this project gets (see [Credentials (warden)](#credentials-warden)) |
 | `cbox warden edit` | Define resources the container may use |
 | `cbox warden secret set <resource>` | Store a resource's secret in the macOS Keychain |
 | `cbox warden approve` | Approve this project's `.warden` file |
@@ -121,7 +121,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_SHARE_CONFIG` | *(unset)* | Folders of your real `~/.config` to share **read-only** into the container's `~/.config`, e.g. `"opencode nvim"`. Code in the container can read them, so leave out folders holding tokens (`gh`, `gcloud`). `claudebox` is never shared. Applies to newly created containers: `cbox reset` |
 | `CBOX_SHARE_DIR` | `~/.cache/claudebox/share` | Share folder, mounted as `~/share` in container; cleared on exit (read-write) |
 | `CBOX_PLAYWRIGHT_DIR` | `$CBOX_DATA_DIR/ms-playwright` | Playwright browser cache, mounted as `/opt/ms-playwright` (read-write; read-only in safe mode). Shared by all projects, kept across resets and rebuilds |
-| `CBOX_SSH_DIR` | *(unset)* | SSH dir to mount as `~/.ssh` in container (normal mode, **read-only**); unset = no SSH mount |
+| `CBOX_SSH_DIR` | *(unset)* | SSH dir to mount as `~/.ssh` in container (normal mode, **read-only**); unset = no SSH mount. With a warden ssh resource, only `config`, `known_hosts` and `*.pub` are mounted |
 | `CBOX_ZSHRC` | *(unset)* | `.zshrc` to source as `~/.zshrc.global` inside the container (**read-only**); unset = none |
 | `CBOX_BUILD_DIR` | cbox.sh directory | Build context for `cbox rebuild` |
 | `BUILD_PLAYWRIGHT` | `0` | Set to `1` to bake Playwright + Chromium into the image on the next `cbox rebuild` (or pass it inline). Decides whether the browser download happens at build time or on first use |
@@ -171,6 +171,8 @@ Keychain. List those in `~/.config/claudebox/mcp.json`, in the usual format:
 ```
 
 Or import them from Claude Desktop / Claude Code on the host with `cbox mcp import`.
+Both agents get them: Claude Code in its `~/.claude.json`, opencode through an extra
+config file cbox writes in the container (`OPENCODE_CONFIG`, merged over your own).
 Changes take effect with the next `cbox` session; `cbox mcp` shows what is configured.
 
 **How it works.** The server runs on the host; Claude in the container talks to it over
@@ -184,8 +186,11 @@ Each connection starts a fresh server process, just like a local stdio server.
 |--------|-------|
 | Needs macOS (apps, Keychain, local hardware) | `~/.config/claudebox/mcp.json` (host) |
 | Works on files or repositories (filesystem, git, …) | Inside the container: the project's `.mcp.json` or `claude mcp add` — a host server would see host paths, not `/Workspace` |
-| Remote (`https://…`) | Either; entries with a `url` in `mcp.json` are passed through as-is |
+| Remote (`https://…`) without a token | `mcp.json` (passed through as-is) or inside the container |
+| Remote with an API key or token | A warden resource with `type = mcp` (see [Credentials](#credentials-warden)) — the token stays on the host |
 
+A remote entry in `mcp.json` is copied into the container as-is, `headers`
+included — anything in them is readable there, and cbox warns about it.
 URLs on the host's `localhost` are not supported and are skipped with a warning.
 Host MCP servers are not available in safe mode.
 
@@ -238,6 +243,13 @@ Keychain), checks each request against what you allowed, and adds the
 credential on the way out. Inside the container, requests go to
 `$WARDEN_URL/<resource>/...` — the key a client sends is always replaced.
 
+| You have | Resource | The container gets |
+|----------|----------|--------------------|
+| An API key (OpenRouter, OpenAI, …) | `type = http` | `$WARDEN_URL/<resource>` plus the env vars you choose |
+| S3-compatible storage keys (R2, S3, MinIO) | `type = http`, `auth = sigv4` | An AWS profile with dummy keys |
+| An SSH key (GitHub, GitLab, servers) | `type = ssh` | An ssh agent that signs only for the hosts you list |
+| A remote MCP server's token | `type = mcp` | The server in Claude's and opencode's MCP list |
+
 ```sh
 cbox warden secret set openrouter   # paste the key; stored in the Keychain
 cbox warden edit                    # define the resource (template included)
@@ -269,8 +281,67 @@ project in a bucket:
 prefix = my-project
 ```
 
-Not available in safe mode. Full documentation follows with the remaining
-resource types (SSH, MCP, audio).
+**SSH keys** (`type = ssh`) stay on the Mac. The container gets an ssh agent
+(`SSH_AUTH_SOCK`) instead of the key file, so `git push` and `ssh` work as
+usual, but nothing in the container can copy the key:
+
+```ini
+[github]
+type  = ssh
+key   = ~/.ssh/id_ed25519     # id_ed25519.pub must sit next to it
+hosts = github.com            # the key signs only for these hosts
+```
+
+`hosts` takes names, IP addresses and `host:port`, e.g.
+`hosts = github.com 203.0.113.5 10.30.0.204:2222`. It names the servers the key
+may sign for; where ssh connects (IP, port, user) still comes from your ssh
+command or `~/.ssh/config`.
+
+- warden runs an agent of its own (not your usual one) and adds the key with
+  `ssh-add -h <host>`, so the agent itself refuses to sign for any other host.
+  The first `cbox` session after a Mac restart unlocks it; on macOS, ssh-add
+  takes the passphrase from the Keychain, and asks once otherwise.
+- The agent recognises each server by its host key, which the Mac learns on its
+  first connection. For a server the Mac has never connected to, cbox prints the
+  command to run once on the Mac (e.g. `ssh -p 2222 <user>@10.30.0.204`).
+- Several resources may use the same key, e.g. `[github]` for every
+  container and `[aivm]` with `availability = project`. Before each signature,
+  ssh tells the agent which server it is connected to; warden signs only when
+  that server belongs to a resource granted to the container. Adding, removing
+  or locking keys is refused. Signatures are logged with the resource
+  (`cbox warden log`).
+- Once any ssh resource exists, `CBOX_SSH_DIR` mounts only `config`,
+  `known_hosts` and `*.pub` files — no private keys (from the next `cbox reset`).
+
+**Remote MCP servers** that take an API key (`type = mcp`) are added to Claude's
+MCP servers in the container with a warden URL; the broker adds the key and
+passes only the server's own endpoint:
+
+```ini
+[linear]
+type   = mcp
+url    = https://mcp.linear.app/mcp
+auth   = bearer                  # bearer | basic | header:<Name> | query:<param>
+secret = cbox.warden.linear      # cbox warden secret set linear
+```
+
+`cbox warden test linear` sends an MCP `initialize` from the host. Claude Code
+and opencode both get these servers.
+
+**opencode providers.** `opencode = <provider id>` on an http resource points
+that opencode provider at warden (base URL and a dummy key), so the API key can
+leave `opencode.json` — which a container can read when it is shared:
+
+```ini
+[openrouter]
+upstream = https://openrouter.ai/api/v1
+auth     = bearer
+secret   = cbox.warden.openrouter
+opencode = openrouter
+``` Servers that
+only offer an OAuth login (no API key) are not supported through warden.
+
+Not available in safe mode.
 
 ## macOS: Screenshot Script
 
@@ -281,7 +352,7 @@ resource types (SSH, MCP, audio).
 > [!NOTE]
 > Voice mode is Claude Code only. It has no equivalent in opencode and is not activated for `cbox oc` sessions.
 
-Claude Code's `/voice` command lets you dictate prompts using your microphone. Inside a container there is no direct audio device, so claudebox bridges your Mac's microphone via PulseAudio over TCP.
+Claude Code's `/voice` command lets you dictate prompts using your microphone. Inside a container there is no direct audio device, so claudebox bridges your Mac's microphone through PulseAudio. The container reaches it through a private socket that only cbox relays — PulseAudio opens no network port.
 
 ### Setup (one time)
 
@@ -304,12 +375,14 @@ CBOX_AUDIO=1
 cbox rebuild
 ```
 
-That's it. On every `cbox` session, claudebox automatically starts PulseAudio before entering the container and stops it on exit. Inside the container, run `/voice` to activate dictation.
+That's it. claudebox starts PulseAudio with the first `cbox` session and stops it when the last one closes (only if it started it). Inside the container, run `/voice` to activate dictation.
+
+Older claudebox versions opened PulseAudio on TCP port 4713 for every private network. claudebox now removes that line from `~/.config/pulse/default.pa` and closes a listener that is still open.
 
 ### Requirements
 
 - Claude.ai account (voice dictation is not available with a raw API key or third-party providers)
-- macOS with Apple Container or Docker Desktop; PulseAudio TCP is not supported in `cbox safe` mode
+- macOS with Apple Container or Docker Desktop; not available in `cbox safe` mode
 
 ### Troubleshooting
 
@@ -320,11 +393,7 @@ Run `cbox doctor` to check PulseAudio status. If voice fails inside the containe
 pactl info
 ```
 
-If `pactl` cannot connect, PulseAudio may not be running on the host. Start it manually:
-
-```bash
-nohup pulseaudio --daemonize=no > /tmp/cbox-pulse.log 2>&1 &
-```
+If `pactl` cannot connect, check on the host that PulseAudio runs (`pulseaudio --check`) and look at the tunnel's log: `~/.local/share/claudebox/.tunnel-<project>.log`.
 
 ## How It Works
 
@@ -333,9 +402,11 @@ nohup pulseaudio --daemonize=no > /tmp/cbox-pulse.log 2>&1 &
 - The active agent (`claude` or `opencode`) is updated automatically once per day on first use; each agent has its own independent update stamp
 - `cbox oc` (or `CBOX_AGENT=opencode` in `cbox.env`) selects opencode for the session; opencode reads its config from `~/.config/opencode`; to use your Mac's, add `CBOX_SHARE_CONFIG="opencode"` to `cbox.env`
 - On exit, the container is stopped and the share folder is cleared
+- The container's first process is a small init that cleans up finished processes. Containers created before claudebox had it ran `tail` instead, and stopped once too many finished processes piled up; cbox points them out at session start (`cbox reset` recreates one)
 - `cbox keepalive` leaves the container running for 10 minutes (useful for follow-up `exec` calls)
 - Log in once inside a container (`/login`); the login is kept in `CBOX_CLAUDE_DIR` and shared by all containers
 - If [claudedot](https://github.com/bpeterme/claudedot) is installed, Claude config and history sync runs automatically at session start and exit (Claude sessions only)
+- Host services the container needs as sockets — warden's ssh agent and PulseAudio — reach it through one long-lived `exec` per container (a tunnel; log: `~/.local/share/claudebox/.tunnel-<name>.log`). Neither side opens a network port for them
 - If [flux](https://github.com/bpeterme/flux) is installed, the container runs the host's flux version, and flux projects reach their storage through warden: `dvc pull` and a plain `git push` (flux's pre-push hook uploads the data first) work inside the container
 
 ## Companion Tools

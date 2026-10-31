@@ -659,8 +659,8 @@ cmd_approve(sys.argv[2], sys.argv[3])" "$CBOX_WARDEN_DIR" "$PWD" 2>/dev/null
   pid=$(_cbox_warden_broker_pid)
   _cbox_warden_end wbox
   sleep 0.3
-  # A zombie counts as stopped: in a container whose PID 1 never reaps
-  # orphans (tail -f /dev/null), the killed broker lingers as one.
+  # A zombie counts as stopped: where PID 1 never reaps orphans (a container
+  # created by an older cbox), the killed broker lingers as one.
   alive=no; [[ "$(ps -o stat= -p "$pid" 2>/dev/null)" =~ ^[^Z] ]] && alive=yes
   run _cbox_warden_broker_pid
   _warden_teardown
@@ -1018,64 +1018,32 @@ auth = sigv4"
 # _cbox_audio_ensure_config
 # ---------------------------------------------------------------------------
 
-@test "_cbox_audio_ensure_config: creates default.pa with TCP module when absent" {
+@test "_cbox_audio_ensure_config: leaves PulseAudio's own default.pa alone" {
   export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config"
+  rm -rf "$XDG_CONFIG_HOME"
   _cbox_audio_ensure_config
-  run grep "module-native-protocol-tcp" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$status" -eq 0 ]
-  run grep "module-coreaudio" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$status" -eq 0 ]
+  [ ! -e "$XDG_CONFIG_HOME/pulse/default.pa" ]
 }
 
-@test "_cbox_audio_ensure_config: uses HOMEBREW_PREFIX over global brew paths" {
-  export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config-hbp"
-  local fake_brew="$BATS_TMPDIR/fakebrew"
-  mkdir -p "$fake_brew/etc/pulse"
-  echo "# custom brew default.pa" > "$fake_brew/etc/pulse/default.pa"
-  # Also create a decoy at the standard path to confirm it is not used
-  mkdir -p "$BATS_TMPDIR/opt-homebrew/etc/pulse"
-  echo "# global brew default.pa" > "$BATS_TMPDIR/opt-homebrew/etc/pulse/default.pa"
-  HOMEBREW_PREFIX="$fake_brew" _cbox_audio_ensure_config
-  # Generated file must .include the custom brew path
-  run grep "$fake_brew" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$status" -eq 0 ]
-  # The global decoy path must not be referenced
-  run grep "opt-homebrew" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$status" -ne 0 ]
-}
-
-@test "_cbox_audio_ensure_config: appends TCP module to existing default.pa without overwriting" {
+@test "_cbox_audio_ensure_config: removes the network listener older cbox versions added" {
   export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config2"
   mkdir -p "$XDG_CONFIG_HOME/pulse"
-  echo "existing-content" > "$XDG_CONFIG_HOME/pulse/default.pa"
+  printf '%s\n' ".include /opt/homebrew/etc/pulse/default.pa" "$_CBOX_PULSE_TCP_LINE" "load-module module-coreaudio-detect" \
+    > "$XDG_CONFIG_HOME/pulse/default.pa"
   _cbox_audio_ensure_config
-  run grep "existing-content" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$status" -eq 0 ]
-  run grep "module-native-protocol-tcp" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$status" -eq 0 ]
-  run grep "module-coreaudio" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$status" -eq 0 ]
+  run cat "$XDG_CONFIG_HOME/pulse/default.pa"
+  [[ "$output" != *"module-native-protocol-tcp"* ]]
+  [[ "$output" == *".include /opt/homebrew/etc/pulse/default.pa"* ]]
+  [[ "$output" == *"module-coreaudio-detect"* ]]
 }
 
-@test "_cbox_audio_ensure_config: does not duplicate TCP module if already present" {
+@test "_cbox_audio_ensure_config: keeps a TCP listener the user configured" {
   export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config3"
   mkdir -p "$XDG_CONFIG_HOME/pulse"
-  echo "load-module module-native-protocol-tcp" > "$XDG_CONFIG_HOME/pulse/default.pa"
+  echo "load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1" > "$XDG_CONFIG_HOME/pulse/default.pa"
   _cbox_audio_ensure_config
   run grep -c "module-native-protocol-tcp" "$XDG_CONFIG_HOME/pulse/default.pa"
   [ "$output" -eq 1 ]
-  run grep "module-coreaudio" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$status" -eq 0 ]
-}
-
-@test "_cbox_audio_ensure_config: does not add coreaudio if .include already present" {
-  export XDG_CONFIG_HOME="$BATS_TMPDIR/xdg-config5"
-  mkdir -p "$XDG_CONFIG_HOME/pulse"
-  printf ".include /opt/homebrew/etc/pulse/default.pa\nload-module module-native-protocol-tcp\n" \
-    > "$XDG_CONFIG_HOME/pulse/default.pa"
-  _cbox_audio_ensure_config
-  run grep -c "module-coreaudio" "$XDG_CONFIG_HOME/pulse/default.pa"
-  [ "$output" -eq 0 ]
 }
 
 @test "_cbox_audio_ensure_config: adds exit-idle-time to daemon.conf" {
@@ -1085,22 +1053,25 @@ auth = sigv4"
   [ "$status" -eq 0 ]
 }
 
-# ---------------------------------------------------------------------------
-# _cbox_audio_pulse_server
-# ---------------------------------------------------------------------------
-
-@test "_cbox_audio_pulse_server: returns apple gateway for apple runtime" {
-  _CBOX_RUNTIME="apple"
-  run _cbox_audio_pulse_server
-  [ "$status" -eq 0 ]
-  [ "$output" = "tcp:192.168.64.1:4713" ]
+@test "_cbox_audio_stop: keeps PulseAudio while any cbox session is open" {
+  local dir; dir=$(_cbox_audio_socket); dir="${dir%/*}"
+  mkdir -p "$dir"; : > "$dir/started-by-cbox"
+  _CBOX_SESSION_DIR="$BATS_TMPDIR/sessions-audio"; mkdir -p "$_CBOX_SESSION_DIR"
+  : > "$_CBOX_SESSION_DIR/.cbox-active-other-$$"
+  pulseaudio() { echo "killed"; }
+  run _cbox_audio_stop
+  [[ "$output" != *killed* ]]
+  rm -f "$_CBOX_SESSION_DIR/.cbox-active-other-$$"
+  run _cbox_audio_stop
+  [[ "$output" == *killed* ]]
+  [ ! -e "$dir/started-by-cbox" ]
 }
 
-@test "_cbox_audio_pulse_server: returns docker hostname for docker runtime" {
-  _CBOX_RUNTIME="docker"
-  run _cbox_audio_pulse_server
-  [ "$status" -eq 0 ]
-  [ "$output" = "tcp:host.docker.internal:4713" ]
+@test "_cbox_audio_stop: never stops a PulseAudio cbox did not start" {
+  local dir; dir=$(_cbox_audio_socket); rm -f "${dir%/*}/started-by-cbox"
+  pulseaudio() { echo "killed"; }
+  run _cbox_audio_stop
+  [ -z "$output" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -2028,4 +1999,492 @@ _guard_repo() {
   cdot() { echo "dir=$CDOT_CLAUDE_DIR args=$*"; }
   run _cbox_cdot _pull
   [ "$output" = "dir=$CBOX_CLAUDE_DIR args=_pull" ]
+}
+
+# ---------------------------------------------------------------------------
+# tunnel and warden ssh
+# ---------------------------------------------------------------------------
+
+# A public key file with a made-up key (byte $2 repeated); no private key exists.
+_fake_pub() {
+  python3 -c 'import base64, struct, sys
+s = lambda b: struct.pack(">I", len(b)) + b
+print("ssh-ed25519 " + base64.b64encode(s(b"ssh-ed25519") + s(bytes([int(sys.argv[1])]) * 32)).decode() + " me@mac")' "$2" > "$1"
+}
+
+# Stand-in agent on $1: lists keys 1 and 2, signs anything, accepts extensions,
+# and records every request type in $2.
+_fake_agent() {
+  python3 -c '
+import os, socket, struct, sys, threading
+s = lambda b: struct.pack(">I", len(b)) + b
+key = lambda n: s(b"ssh-ed25519") + s(bytes([n]) * 32)
+def serve(c):
+    while True:
+        h = c.recv(4)
+        if len(h) < 4: return
+        m = c.recv(struct.unpack(">I", h)[0])
+        open(sys.argv[2], "a").write(f"{m[0]}\n")
+        if m[0] == 11: r = bytes([12]) + struct.pack(">I", 2) + s(key(1)) + s(b"/Users/me/.ssh/one") + s(key(2)) + s(b"/Users/me/.ssh/two")
+        elif m[0] == 13: r = bytes([14]) + s(b"signature")
+        else: r = bytes([6])
+        c.sendall(struct.pack(">I", len(r)) + r)
+srv = socket.socket(socket.AF_UNIX); srv.bind(sys.argv[1]); srv.listen(8)
+while True: threading.Thread(target=serve, args=(srv.accept()[0],), daemon=True).start()
+' "$1" "$2" </dev/null >/dev/null 2>&1 &
+  echo $!
+}
+
+_ssh_setup() {
+  _warden_setup
+  TT="$BATS_TMPDIR/tun"; rm -rf "$TT"; mkdir -p "$TT/keys"
+  _fake_pub "$TT/keys/one.pub" 1
+  _fake_pub "$TT/keys/two.pub" 2
+  cat > "$CBOX_WARDEN_DIR/resources" <<EOF
+[gh]
+type = ssh
+key = $TT/keys/one
+hosts = github.com
+EOF
+}
+
+_ssh_py() {  # runs python with the warden functions loaded
+  python3 -c "$(_cbox_warden_py | sed '/^if __name__/,$d')
+$1" "${@:2}"
+}
+
+@test "warden ssh: a valid ssh resource is listed; broken ones are skipped with a reason" {
+  _ssh_setup
+  cat >> "$CBOX_WARDEN_DIR/resources" <<EOF
+[nopub]
+type = ssh
+key = $TT/keys/missing
+hosts = github.com
+[nohosts]
+type = ssh
+key = $TT/keys/two
+[twin]
+type = ssh
+key = $TT/keys/one
+hosts = gitlab.com
+[mixed]
+type = ssh
+key = $TT/keys/two
+hosts = github.com
+upstream = https://example.com
+EOF
+  run _cbox_warden_python list "$CBOX_WARDEN_DIR" "$PWD"
+  _warden_teardown
+  [[ "$output" == *"gh"*"ssh $TT/keys/one → github.com"* ]]
+  [[ "$output" == *"'nopub': $TT/keys/missing.pub is missing"* ]]
+  [[ "$output" == *"'nohosts': hosts is missing"* ]]
+  # Several resources may share a key.
+  [[ "$output" == *"twin"*"ssh $TT/keys/one → gitlab.com"* ]]
+  [[ "$output" != *"'twin':"* ]]
+  [[ "$output" == *"'mixed': upstream is not used by type = ssh"* ]]
+}
+
+@test "warden ssh: the filter signs only for servers of granted resources and refuses key management" {
+  _ssh_setup
+  agent_pid=$(_fake_agent "$TT/agent.sock" "$TT/agent.log")
+  for _ in $(seq 50); do [ -S "$TT/agent.sock" ] && break; sleep 0.1; done
+  run _ssh_py '
+s = lambda b: struct.pack(">I", len(b)) + b
+key = lambda n: s(b"ssh-ed25519") + s(bytes([n]) * 32)
+granted = {key(1): {key(5): "gh", key(6): "lab"}}  # key 1 for the servers with host keys 5 and 6
+def conn():
+    ours, theirs = socket.socketpair()
+    agent = socket.socket(socket.AF_UNIX); agent.connect(sys.argv[2])
+    threading.Thread(target=ssh_filter, args=(sys.argv[1], "box", theirs, agent, granted), daemon=True).start()
+    def ask(m):
+        ours.sendall(struct.pack(">I", len(m)) + m)
+        return ssh_recv(ours)
+    return ask
+bind = lambda hk: bytes([27]) + s(b"session-bind@openssh.com") + s(hk) + s(b"sid") + s(b"sig") + b"\0"
+sign = lambda k: bytes([13]) + s(k) + s(b"data") + struct.pack(">I", 0)
+ask = conn()
+ids = ask(bytes([11]))
+print("list", struct.unpack(">I", ids[1:5])[0], key(1) in ids, key(2) in ids, b"warden:gh+lab" in ids, b"/Users" in ids)
+print("sign-unbound", ask(sign(key(1)))[0])
+print("bind", ask(bind(key(5)))[0])
+print("sign-granted", ask(sign(key(1)))[0])
+print("sign-other-key", ask(sign(key(2)))[0])
+print("add", ask(bytes([17]) + s(b"ssh-ed25519"))[0])
+print("lock", ask(bytes([22]) + s(b"pw"))[0])
+print("other-ext", ask(bytes([27]) + s(b"something@else"))[0])
+ask = conn()
+ask(bind(key(9)))  # a server no granted resource lists
+print("sign-other-server", ask(sign(key(1)))[0])
+' "$CBOX_WARDEN_DIR" "$TT/agent.sock"
+  kill "$agent_pid" 2>/dev/null || true
+  reached=$(sort -u "$TT/agent.log" | tr '\n' ' ')
+  signs=$(grep -c '^13$' "$TT/agent.log")
+  _warden_teardown
+  [[ "$output" == *"list 1 True False True False"* ]]
+  [[ "$output" == *"sign-unbound 5"* ]]
+  [[ "$output" == *"bind 6"* ]]
+  [[ "$output" == *"sign-granted 14"* ]]
+  [[ "$output" == *"sign-other-key 5"* ]]
+  [[ "$output" == *"add 5"* ]]
+  [[ "$output" == *"lock 5"* ]]
+  [[ "$output" == *"other-ext 5"* ]]
+  [[ "$output" == *"sign-other-server 5"* ]]
+  # Only list, session-bind and the one allowed signature reached the agent.
+  [ "$reached" = "11 13 27 " ]
+  [ "$signs" -eq 1 ]
+  grep -q "box ssh: signed for 'gh'" "$CBOX_WARDEN_DIR/broker.log"
+  grep -q "did not say which server" "$CBOX_WARDEN_DIR/broker.log"
+  grep -q "for a server none of its resources lists" "$CBOX_WARDEN_DIR/broker.log"
+  grep -q "box ssh: refused agent request type 17" "$CBOX_WARDEN_DIR/broker.log"
+}
+
+# Stub OpenSSH: ssh-add -L prints $TT/loaded; ssh-add <args> appends the key's
+# .pub to it and records the args; ssh-agent pretends to start.
+_ssh_stubs() {
+  mkdir -p "$TT/bin"
+  cat > "$TT/bin/ssh-add" <<EOF
+#!/bin/sh
+if [ "\$1" = "-L" ]; then [ -s "$TT/loaded" ] || exit 1; cat "$TT/loaded"; exit 0; fi
+echo "\$*" >> "$TT/ssh-add.args"
+for last; do :; done
+cat "\$last.pub" >> "$TT/loaded"
+EOF
+  printf '#!/bin/sh\necho "SSH_AGENT_PID=999999; export SSH_AGENT_PID;"\n' > "$TT/bin/ssh-agent"
+  chmod +x "$TT/bin/ssh-add" "$TT/bin/ssh-agent"
+  export PATH="$TT/bin:$PATH"
+  _known_hosts github.com
+}
+
+# The Mac's known_hosts with a made-up (public) host key for each name given.
+# Each host gets its own key (_fake_host_key). The system's known_hosts may
+# add real ones (GitHub's runners ship github.com's), so tests check for
+# these keys, never for a count.
+_known_hosts() {
+  local h
+  mkdir -p "$HOME/.ssh"
+  : > "$HOME/.ssh/known_hosts"
+  for h in "$@"; do echo "$h ssh-ed25519 $(_fake_host_key "$h")" >> "$HOME/.ssh/known_hosts"; done
+}
+
+_fake_host_key() {
+  python3 -c 'import base64, hashlib, struct, sys
+s = lambda b: struct.pack(">I", len(b)) + b
+print(base64.b64encode(s(b"ssh-ed25519") + s(hashlib.sha256(sys.argv[1].encode()).digest())).decode())' "$1"
+}
+
+@test "warden ssh: session sets SSH_AUTH_SOCK only once the key is unlocked" {
+  _ssh_setup
+  _ssh_stubs
+  : > "$TT/loaded"
+  run _warden_env
+  first="$output"
+  # Unlocking happens with a terminal: ssh-add -h <host> <key>
+  _ssh_py 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1]), True)' "$CBOX_WARDEN_DIR" 2>/dev/null
+  run _warden_env
+  second="$output"
+  _warden_teardown
+  [[ "$first" != *SSH_AUTH_SOCK* ]]
+  grep -q "not unlocked yet" "$WT/stderr" || [[ "$first" != *SSH_AUTH_SOCK* ]]
+  [ "$(cat "$TT/ssh-add.args")" = "-h github.com $TT/keys/one" ]
+  [[ "$second" == *"SSH_AUTH_SOCK=/tmp/cbox-tunnel/ssh-agent.sock"* ]]
+}
+
+@test "warden ssh: the broker does not treat an ssh resource as an http route" {
+  _ssh_setup
+  _ssh_stubs
+  _fake_pub "$TT/loaded" 1
+  url=$(_warden_url)
+  run curl -s "$url/gh/anything"
+  _warden_teardown
+  [[ "$output" == *"'gh' is not an http resource"* ]]
+}
+
+@test "tunnel: carries many connections at once to the host, and grants decide per channel" {
+  _ssh_setup
+  _ssh_stubs
+  _fake_pub "$TT/loaded" 1
+  _warden_env >/dev/null   # session file for wbox: gh granted
+  mkdir -p "$CBOX_WARDEN_DIR/ssh"
+  agent_pid=$(_fake_agent "$CBOX_WARDEN_DIR/ssh/agent.sock" "$TT/agent.log")
+  # Echo server standing in for PulseAudio's socket.
+  python3 -c '
+import socket, sys, threading
+def echo(c):
+    while (b := c.recv(65536)): c.sendall(b)
+    c.close()
+srv = socket.socket(socket.AF_UNIX); srv.bind(sys.argv[1]); srv.listen(16)
+while True: threading.Thread(target=echo, args=(srv.accept()[0],), daemon=True).start()
+' "$TT/pulse" </dev/null >/dev/null 2>&1 &
+  echo_pid=$!
+  # Fake runtime: `rt exec -i box cmd...` runs cmd here.
+  printf '#!/bin/sh\nshift 3\nexec "$@"\n' > "$TT/rt"; chmod +x "$TT/rt"
+  _cbox_tunnel_py > "$TT/cbox-tunnel"; chmod +x "$TT/cbox-tunnel"
+  export CBOX_TUNNEL_DIR="$TT/sock"
+  _cbox_warden_env
+  env "${_CBOX_WARDEN_ENV[@]}" CBOX_TUNNEL_DIR="$TT/sock" python3 -c "$(_cbox_warden_py)" tunnel \
+    "$CBOX_WARDEN_DIR" "$TT/rt" wbox "$TT/cbox-tunnel" "$TT/tunnel.pid" "$TT/pulse" </dev/null >"$TT/tunnel.log" 2>&1 &
+  for _ in $(seq 100); do [ -S "$TT/sock/pulse.sock" ] && [ -S "$TT/sock/ssh-agent.sock" ] && break; sleep 0.1; done
+  run python3 -c '
+import os, socket, struct, sys, threading
+d = sys.argv[1]
+results = {}
+def one(i):
+    data = os.urandom(200000 + i)
+    c = socket.socket(socket.AF_UNIX); c.connect(d + "/pulse.sock")
+    threading.Thread(target=lambda: (c.sendall(data), c.shutdown(socket.SHUT_WR)), daemon=True).start()
+    got = b""
+    while (b := c.recv(65536)): got += b
+    results[i] = got == data
+ts = [threading.Thread(target=one, args=(i,)) for i in range(6)]
+[t.start() for t in ts]; [t.join(30) for t in ts]
+print("echo", sum(results.values()), "of 6")
+c = socket.socket(socket.AF_UNIX); c.connect(d + "/ssh-agent.sock")
+c.sendall(struct.pack(">I", 1) + bytes([11]))
+h = c.recv(4); ans = c.recv(struct.unpack(">I", h)[0])
+print("ssh keys", struct.unpack(">I", ans[1:5])[0], b"warden:gh" in ans)
+' "$TT/sock"
+  echo_out="$output"
+  # Without the grant, the ssh channel closes at once.
+  rm -f "$CBOX_WARDEN_DIR/sessions/wbox.json"
+  run python3 -c '
+import socket, struct, sys
+c = socket.socket(socket.AF_UNIX); c.settimeout(10); c.connect(sys.argv[1] + "/ssh-agent.sock")
+c.sendall(struct.pack(">I", 1) + bytes([11]))
+print("closed" if c.recv(4) == b"" else "answered")
+' "$TT/sock"
+  nogrant="$output"
+  kill -TERM -- "-$(cat "$TT/tunnel.pid")" 2>/dev/null || true
+  kill "$agent_pid" "$echo_pid" 2>/dev/null || true
+  _warden_teardown
+  [ "$echo_out" = "echo 6 of 6
+ssh keys 1 True" ] || { cat "$TT/tunnel.log"; false; }
+  [ "$nogrant" = "closed" ]
+}
+
+@test "_cbox_create: with a warden ssh resource only public SSH files are mounted" {
+  local capture="$BATS_TMPDIR/create-ssh-args"
+  cd "$BATS_TMPDIR"
+  export CBOX_SSH_DIR="$BATS_TMPDIR/dot-ssh"
+  mkdir -p "$CBOX_SSH_DIR"
+  : > "$CBOX_SSH_DIR/known_hosts"; : > "$CBOX_SSH_DIR/config"; : > "$CBOX_SSH_DIR/work"; : > "$CBOX_SSH_DIR/work.pub"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  mkdir -p "$CBOX_WARDEN_DIR"; rm -f "$CBOX_WARDEN_DIR/resources"
+  rm -f "$capture"; _cbox_create "cbox-unit-ssh" "normal"
+  before=$(cat "$capture")
+  printf '[gh]\ntype = ssh   # agent only\nkey = x\nhosts = github.com\n' > "$CBOX_WARDEN_DIR/resources"
+  rm -f "$capture"; _cbox_create "cbox-unit-ssh" "normal"
+  after=$(cat "$capture")
+  rm -f "$CBOX_WARDEN_DIR/resources"
+  [[ "$before" == *"$CBOX_SSH_DIR/work:/home/claude/.ssh/work:ro"* ]]
+  [[ "$after" != *"$CBOX_SSH_DIR/work:/home/claude/.ssh/work:ro"* ]]
+  [[ "$after" == *"$CBOX_SSH_DIR/work.pub:/home/claude/.ssh/work.pub:ro"* ]]
+  [[ "$after" == *"$CBOX_SSH_DIR/config:/home/claude/.ssh/config:ro"* ]]
+  [[ "$after" == *"$CBOX_SSH_DIR/known_hosts:/home/claude/.ssh/known_hosts"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# warden mcp
+# ---------------------------------------------------------------------------
+
+_mcp_setup() {
+  _warden_setup
+  cat >> "$CBOX_WARDEN_DIR/resources" <<INI
+[tracker]
+type   = mcp
+url    = http://127.0.0.1:$UP_PORT/api/mcp?team=x
+auth   = bearer
+secret = cbox.warden.tracker
+[broken]
+type = mcp
+url  = http://127.0.0.1:$UP_PORT/mcp
+auth = bearer
+INI
+}
+
+@test "warden mcp: the session hands out a warden URL for the server; the token stays on the host" {
+  _mcp_setup
+  run _warden_env
+  env_out="$output"
+  base=$(sed -n 's/^WARDEN_URL=//p' <<<"$env_out")
+  mcp=$(sed -n 's/^WARDEN_MCP=//p' <<<"$env_out" | base64 -d)
+  url=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["tracker"])' "$mcp")
+  post=$(curl -s -H 'Authorization: Bearer fake' -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0"}' "$url")
+  other=$(curl -s -o /dev/null -w '%{http_code}' "$base/tracker/admin")
+  _warden_teardown
+  [ "$url" = "$base/tracker/api/mcp?team=x" ]
+  [[ "$post" == *'"path": "/api/mcp?team=x"'* ]]
+  [[ "$post" == *'"authorization": "Bearer sk-test-REDACTED-cbox.warden.tracker"'* ]]
+  [ "$other" = "403" ]
+  grep -q "'broken': secret (Keychain item name) is missing" "$WT/stderr"
+}
+
+@test "_cbox_generate_claude_json: warden MCP servers are added as http servers and managed" {
+  _cbox_generate_claude_json "mcpapp" "normal" '{"tracker": "http://192.168.64.1:47100/w/tok/tracker/mcp"}'
+  run python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mcpServers"]["tracker"])' "$CBOX_DATA_DIR/.claude-mcpapp.json"
+  [[ "$output" == *"'type': 'http'"*"'url': 'http://192.168.64.1:47100/w/tok/tracker/mcp'"* ]]
+  # Gone again once warden no longer grants it.
+  _cbox_generate_claude_json "mcpapp" "normal"
+  run python3 -c 'import json,sys; print(sorted(json.load(open(sys.argv[1])).get("mcpServers", {})))' "$CBOX_DATA_DIR/.claude-mcpapp.json"
+  [ "$output" = "[]" ]
+}
+
+@test "_cbox_generate_claude_json: warns that headers of a remote MCP server are readable in the container" {
+  echo '{"mcpServers": {"remote": {"type": "http", "url": "https://mcp.example.com/mcp", "headers": {"Authorization": "Bearer x"}}}}' > "$CBOX_MCP_CONFIG"
+  run _cbox_generate_claude_json "hdrapp" "normal"
+  [[ "$output" == *"'remote': its headers are readable inside the container"*"type = mcp"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# opencode
+# ---------------------------------------------------------------------------
+
+@test "opencode config: host servers, warden MCP servers and warden providers, or nothing" {
+  rm -f "$CBOX_MCP_CONFIG"
+  run python3 -c "$(_cbox_mcp_py)" opencode-config "$CBOX_MCP_CONFIG" /relay "" ""
+  [ -z "$output" ]
+  echo '{"mcpServers": {"imcp": {"command": "/Applications/iMCP.app/x"}, "open": {"url": "https://mcp.example.com/mcp"}}}' > "$CBOX_MCP_CONFIG"
+  run python3 -c "$(_cbox_mcp_py)" opencode-config "$CBOX_MCP_CONFIG" /relay \
+    '{"tracker": "http://h/w/t/tracker/mcp"}' '{"openrouter": {"options": {"baseURL": "http://h/w/t/llm", "apiKey": "warden"}}}'
+  [ "$status" -eq 0 ]
+  run python3 -c 'import json,sys; c=json.loads(sys.argv[1]); print(c["mcp"]["imcp"], c["mcp"]["open"], c["mcp"]["tracker"], c["provider"]["openrouter"]["options"]["baseURL"])' "$output"
+  [ "$output" = "{'type': 'local', 'command': ['/relay', 'connect', 'imcp']} {'type': 'remote', 'url': 'https://mcp.example.com/mcp'} {'type': 'remote', 'url': 'http://h/w/t/tracker/mcp'} http://h/w/t/llm" ]
+}
+
+@test "warden opencode: a resource with opencode = <provider> routes that provider through warden" {
+  _warden_setup
+  sed -i 's|^env          = OPENAI_BASE_URL={url} OPENAI_API_KEY=warden|&\nopencode     = openrouter|' "$CBOX_WARDEN_DIR/resources"
+  printf '[s3x]\nupstream = http://127.0.0.1:1\nauth = sigv4\nkey-id = a\nsecret = b\nopencode = x\n' >> "$CBOX_WARDEN_DIR/resources"
+  run _warden_env
+  base=$(sed -n 's/^WARDEN_URL=//p' <<<"$output")
+  oc=$(sed -n 's/^WARDEN_OPENCODE=//p' <<<"$output" | base64 -d)
+  _warden_teardown
+  [ "$oc" = "{\"openrouter\": {\"options\": {\"baseURL\": \"$base/llm\", \"apiKey\": \"warden\"}}}" ]
+  grep -q "'s3x': opencode must be the id of an opencode provider" "$WT/stderr"
+}
+
+@test "warden ssh: hosts takes names, IPs and host:port; ssh-add gets the known_hosts form" {
+  _ssh_setup
+  _ssh_stubs
+  _known_hosts github.com 203.0.113.5 "[10.30.0.204]:6673" "[2001:db8::1]:2222"
+  sed -i 's|^hosts = github.com$|hosts = github.com 203.0.113.5 10.30.0.204:6673 [2001:db8::1]:2222 example.org:22|' "$CBOX_WARDEN_DIR/resources"
+  printf '[bad]\ntype = ssh\nkey = %s\nhosts = 10.0.0.1:99999\n' "$TT/keys/two" >> "$CBOX_WARDEN_DIR/resources"
+  echo "example.org ssh-ed25519 $(cut -d' ' -f2 "$TT/keys/two.pub")" >> "$HOME/.ssh/known_hosts"
+  : > "$TT/loaded"
+  _ssh_py 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1], warn=err), True)' "$CBOX_WARDEN_DIR" 2>"$TT/err"
+  _warden_teardown
+  [ "$(cat "$TT/ssh-add.args")" = "-h github.com -h 203.0.113.5 -h [10.30.0.204]:6673 -h [2001:db8::1]:2222 -h example.org $TT/keys/one" ]
+  grep -q "'bad': host '10.0.0.1:99999' is not a host name, IP address or host:port" "$TT/err"
+}
+
+@test "warden ssh: a host the Mac never connected to gets the command to do it, not an ssh-add error" {
+  _ssh_setup
+  _ssh_stubs
+  sed -i 's|^hosts = github.com$|hosts = github.com 10.30.0.204:6673|' "$CBOX_WARDEN_DIR/resources"
+  : > "$TT/loaded"
+  _ssh_py 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1]), True)' "$CBOX_WARDEN_DIR" 2>"$TT/err"
+  _warden_teardown
+  # Unlocked for the hosts the Mac knows; the other one gets the command.
+  [ "$(cat "$TT/ssh-add.args")" = "-h github.com $TT/keys/one" ]
+  grep -q "never connected to 10.30.0.204:6673" "$TT/err"
+  grep -q "ssh -p 6673 <user>@10.30.0.204" "$TT/err"
+}
+
+@test "warden ssh: resources sharing a key load it once for all their hosts; grants stay per resource" {
+  _ssh_setup
+  _ssh_stubs
+  _known_hosts github.com gitlab.com
+  printf '[lab]\ntype = ssh\nkey = %s\nhosts = gitlab.com\navailability = project\n' "$TT/keys/one" >> "$CBOX_WARDEN_DIR/resources"
+  : > "$TT/loaded"
+  _ssh_py 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1]), True)' "$CBOX_WARDEN_DIR" 2>/dev/null
+  _ssh_py 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1]), True)' "$CBOX_WARDEN_DIR" 2>/dev/null
+  once=$(cat "$TT/ssh-add.args")
+  # A host added later: the key is added again with the new list.
+  _known_hosts github.com gitlab.com example.org
+  sed -i 's|^hosts = gitlab.com$|hosts = gitlab.com example.org|' "$CBOX_WARDEN_DIR/resources"
+  _ssh_py 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1]), True)' "$CBOX_WARDEN_DIR" 2>/dev/null
+  again=$(sed -n 2p "$TT/ssh-add.args")
+  _warden_env >/dev/null   # wbox: only the global 'gh' is granted
+  _cbox_warden_env
+  servers=$(env "${_CBOX_WARDEN_ENV[@]}" python3 -c "$(_cbox_warden_py | sed '/^if __name__/,$d')
+g = {hk: n for k in ssh_granted(sys.argv[1], 'wbox').values() for hk, n in k.items()}
+hub, lab = (base64.b64decode(x) for x in sys.argv[2:])
+print(sorted(set(g.values())), g.get(hub), lab in g)" "$CBOX_WARDEN_DIR" "$(_fake_host_key github.com)" "$(_fake_host_key gitlab.com)")
+  _warden_teardown
+  [ "$once" = "-h github.com -h gitlab.com $TT/keys/one" ]
+  [ "$again" = "-h github.com -h gitlab.com -h example.org $TT/keys/one" ]
+  # wbox may sign with the key for github.com's host key (as 'gh'), not gitlab.com's.
+  [ "$servers" = "['gh'] gh False" ]
+}
+
+# ---------------------------------------------------------------------------
+# container PID 1
+# ---------------------------------------------------------------------------
+
+@test "_cbox_create: PID 1 is cbox's init, not tail" {
+  local capture="$BATS_TMPDIR/create-init-args"
+  rm -f "$capture"
+  cd "$BATS_TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  _cbox_create "cbox-unit-init" "normal"
+  run cat "$capture"
+  [[ "$output" == *"-c"$'\n'"$_CBOX_INIT_SH"$'\n'"sh"$'\n'"import os, signal, time"* ]]
+  [[ "$output" != *$'\n'"tail"$'\n'* ]]
+}
+
+@test "_CBOX_INIT_SH: runs the init with python3, and tail in images without it" {
+  mkdir -p "$BATS_TMPDIR/init-bin"
+  printf '#!/bin/sh\necho "python3 $1 $2"\n' > "$BATS_TMPDIR/init-bin/python3"
+  chmod +x "$BATS_TMPDIR/init-bin/python3"
+  run env PATH="$BATS_TMPDIR/init-bin:/usr/bin:/bin" sh -c "$_CBOX_INIT_SH" sh "CODE"
+  [ "$output" = "python3 -c CODE" ]
+  mkdir -p "$BATS_TMPDIR/init-nopy"
+  ln -sf "$(command -v tail)" "$BATS_TMPDIR/init-nopy/tail"
+  run timeout 1 env PATH="$BATS_TMPDIR/init-nopy" /bin/sh -c "$_CBOX_INIT_SH" sh "CODE"
+  [ "$status" -eq 124 ]  # tail -f keeps running
+}
+
+@test "_cbox_init_py: collects orphaned processes and stops on SIGTERM" {
+  # A subreaper stands in for PID 1: orphans of its children come to it.
+  run timeout 20 python3 -c '
+import ctypes, os, signal, subprocess, sys, time
+ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
+if os.fork() == 0:
+    if os.fork() == 0:
+        time.sleep(0.5)
+        os._exit(0)  # ends after its parent: an orphan
+    os._exit(0)
+time.sleep(0.2)
+os.waitpid(-1, 0)  # the direct child; the orphan is now ours
+pid = os.getpid()
+if os.fork() == 0:
+    time.sleep(2)
+    st = subprocess.run(["ps", "-o", "stat=", "--ppid", str(pid)], capture_output=True, text=True).stdout.split()
+    print("zombies", sum(s.startswith("Z") for s in st), flush=True)
+    t = time.time(); os.kill(pid, signal.SIGTERM)
+    os._exit(0)
+os.execvp("python3", ["python3", "-c", sys.argv[1]])
+' "$(_cbox_init_py)"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"zombies 0"* ]]
+}
+
+@test "_cbox_old_init: recognises containers created with tail as PID 1" {
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { echo '[{"configuration": {"initProcess": {"executable": "tail", "arguments": ["-f", "/dev/null"]}}}]'; }
+  run _cbox_old_init box
+  [ "$status" -eq 0 ]
+  _fake_runtime() { echo '[{"configuration": {"initProcess": {"executable": "python3", "arguments": ["-c", "import os"]}}}]'; }
+  run _cbox_old_init box
+  [ "$status" -ne 0 ]
+}
+
+@test "warden: resource names may contain dots, like a host name" {
+  _ssh_setup
+  printf '[ai.vm]\ntype = ssh\nkey = %s\nhosts = ai.vm\n[.hidden]\ntype = ssh\nkey = %s\nhosts = x\n' "$TT/keys/two" "$TT/keys/two" >> "$CBOX_WARDEN_DIR/resources"
+  run _cbox_warden_python list "$CBOX_WARDEN_DIR" "$PWD"
+  _warden_teardown
+  [[ "$output" == *"ai.vm"*"ssh $TT/keys/two → ai.vm"* ]]
+  [[ "$output" == *"'.hidden': name may only contain"* ]]
 }

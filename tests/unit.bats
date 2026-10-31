@@ -2156,12 +2156,20 @@ EOF
 }
 
 # The Mac's known_hosts with a made-up (public) host key for each name given.
+# Each host gets its own key (_fake_host_key). The system's known_hosts may
+# add real ones (GitHub's runners ship github.com's), so tests check for
+# these keys, never for a count.
 _known_hosts() {
-  local key h
-  key=$(cut -d' ' -f2 "$TT/keys/two.pub")
+  local h
   mkdir -p "$HOME/.ssh"
   : > "$HOME/.ssh/known_hosts"
-  for h in "$@"; do echo "$h ssh-ed25519 $key" >> "$HOME/.ssh/known_hosts"; done
+  for h in "$@"; do echo "$h ssh-ed25519 $(_fake_host_key "$h")" >> "$HOME/.ssh/known_hosts"; done
+}
+
+_fake_host_key() {
+  python3 -c 'import base64, hashlib, struct, sys
+s = lambda b: struct.pack(">I", len(b)) + b
+print(base64.b64encode(s(b"ssh-ed25519") + s(hashlib.sha256(sys.argv[1].encode()).digest())).decode())' "$1"
 }
 
 @test "warden ssh: session sets SSH_AUTH_SOCK only once the key is unlocked" {
@@ -2399,12 +2407,14 @@ INI
   _warden_env >/dev/null   # wbox: only the global 'gh' is granted
   _cbox_warden_env
   servers=$(env "${_CBOX_WARDEN_ENV[@]}" python3 -c "$(_cbox_warden_py | sed '/^if __name__/,$d')
-print(sorted(set(v for k in ssh_granted(sys.argv[1], 'wbox').values() for v in k.values())), sum(len(k) for k in ssh_granted(sys.argv[1], 'wbox').values()))" "$CBOX_WARDEN_DIR")
+g = {hk: n for k in ssh_granted(sys.argv[1], 'wbox').values() for hk, n in k.items()}
+hub, lab = (base64.b64decode(x) for x in sys.argv[2:])
+print(sorted(set(g.values())), g.get(hub), lab in g)" "$CBOX_WARDEN_DIR" "$(_fake_host_key github.com)" "$(_fake_host_key gitlab.com)")
   _warden_teardown
   [ "$once" = "-h github.com -h gitlab.com $TT/keys/one" ]
   [ "$again" = "-h github.com -h gitlab.com -h example.org $TT/keys/one" ]
-  # wbox may sign with the key only for github.com's host key, as 'gh'.
-  [ "$servers" = "['gh'] 1" ]
+  # wbox may sign with the key for github.com's host key (as 'gh'), not gitlab.com's.
+  [ "$servers" = "['gh'] gh False" ]
 }
 
 # ---------------------------------------------------------------------------

@@ -402,6 +402,7 @@ If `pactl` cannot connect, check on the host that PulseAudio runs (`pulseaudio -
 - The active agent (`claude` or `opencode`) is updated automatically once per day on first use; each agent has its own independent update stamp
 - `cbox oc` (or `CBOX_AGENT=opencode` in `cbox.env`) selects opencode for the session; opencode reads its config from `~/.config/opencode`; to use your Mac's, add `CBOX_SHARE_CONFIG="opencode"` to `cbox.env`
 - On exit, the container is stopped and the share folder is cleared
+- The container's first process is a small init that cleans up finished processes. Containers created before claudebox had it ran `tail` instead, and stopped once too many finished processes piled up; cbox points them out at session start (`cbox reset` recreates one)
 - `cbox keepalive` leaves the container running for 10 minutes (useful for follow-up `exec` calls)
 - Log in once inside a container (`/login`); the login is kept in `CBOX_CLAUDE_DIR` and shared by all containers
 - If [claudedot](https://github.com/bpeterme/claudedot) is installed, Claude config and history sync runs automatically at session start and exit (Claude sessions only)

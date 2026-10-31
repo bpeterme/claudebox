@@ -357,7 +357,7 @@ _cbox_session_markers() {
 }
 
 # Asks the container itself whether any exec session is still attached.
-# Exec'd processes run with PPID 0 (PID 1 is the keep-alive entrypoint);
+# Exec'd processes run with PPID 0 (PID 1 is _cbox_init_py);
 # the probe's own `ps` is excluded. Returns 0 if a session is active,
 # 1 if none, 2 if the probe failed (caller must not treat that as "none").
 # Marker files alone can outlive their session (interrupted cbox in a
@@ -1583,7 +1583,7 @@ import base64, configparser, datetime, hashlib, hmac, http.client, http.server, 
 from fnmatch import fnmatchcase
 from urllib.parse import urlsplit, unquote, parse_qsl, quote, urlencode
 
-NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")  # also a URL path segment: never "." or ".."
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 AUTH_SCHEMES = ("bearer", "basic", "header:", "query:", "sigv4")
 HOP = {"connection", "keep-alive", "proxy-connection", "proxy-authorization", "te", "trailer",
@@ -1730,7 +1730,7 @@ def load_resources(d, warn=None, extra=()):
 
 def validate(name, r):
     if not NAME_RE.match(name):
-        return "name may only contain a-z, 0-9, '_' and '-'"
+        return "name may only contain a-z, 0-9, '.', '_' and '-' (and starts with a letter or digit)"
     if r.get("availability", "global") not in ("global", "project"):
         return "availability must be global or project"
     kind = r.get("type", "http")
@@ -2888,8 +2888,8 @@ _cbox_warden_end() {
 
 _cbox_warden_secret_set() {
   local res="$1"
-  if [[ ! "$res" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]]; then
-    echo "Usage: cbox warden secret set <resource>   (a-z, 0-9, '_' and '-')"
+  if [[ ! "$res" =~ ^[a-z0-9][a-z0-9_.-]{0,63}$ ]]; then
+    echo "Usage: cbox warden secret set <resource>   (a-z, 0-9, '.', '_' and '-')"
     return 1
   fi
   if [[ "$(/usr/bin/uname)" != "Darwin" ]]; then
@@ -3262,10 +3262,35 @@ _cbox_create() {
 
   args+=(
     "$CBOX_IMAGE"
-    tail -f /dev/null
+    sh -c "$_CBOX_INIT_SH" sh "$(_cbox_init_py)"
   )
 
   $_CBOX_CMD "${args[@]}"
+}
+
+# The container's PID 1. Every process whose parent exits is handed to PID 1,
+# which has to collect it when it ends; `tail -f /dev/null`, used before,
+# never did, so finished processes piled up until the process limit stopped
+# the container. This one collects them, and stops at once on `container stop`.
+# Runs it; images without python3 (a custom CBOX_IMAGE) keep the old tail.
+# shellcheck disable=SC2016
+_CBOX_INIT_SH='command -v python3 >/dev/null 2>&1 && exec python3 -c "$1"; exec tail -f /dev/null'
+
+_cbox_init_py() {
+  cat <<'PYEOF'
+import os, signal, time
+signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+while True:
+    try:
+        os.wait()
+    except ChildProcessError:
+        time.sleep(1)
+PYEOF
+}
+
+# True for a container created by an older cbox, whose PID 1 is `tail`.
+_cbox_old_init() {
+  $_CBOX_CMD inspect "$1" 2>/dev/null | grep -Eq '"(/usr/bin/)?tail"'
 }
 
 # ---------------------------------------------------------
@@ -3622,6 +3647,11 @@ _cbox_enter() {
   _cbox_flux_install "$name"
 
   echo "Entering container '$name'..."
+
+  if _cbox_old_init "$name"; then
+    echo "ℹ  This container never cleans up finished processes and stops once too many"
+    echo "   have piled up (after long sessions). Recreate it when convenient: cbox reset"
+  fi
 
   _cbox_git_guard_start "$name" || true
   _cbox_session_start "$name"

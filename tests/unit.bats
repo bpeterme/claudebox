@@ -659,8 +659,8 @@ cmd_approve(sys.argv[2], sys.argv[3])" "$CBOX_WARDEN_DIR" "$PWD" 2>/dev/null
   pid=$(_cbox_warden_broker_pid)
   _cbox_warden_end wbox
   sleep 0.3
-  # A zombie counts as stopped: in a container whose PID 1 never reaps
-  # orphans (tail -f /dev/null), the killed broker lingers as one.
+  # A zombie counts as stopped: where PID 1 never reaps orphans (a container
+  # created by an older cbox), the killed broker lingers as one.
   alive=no; [[ "$(ps -o stat= -p "$pid" 2>/dev/null)" =~ ^[^Z] ]] && alive=yes
   run _cbox_warden_broker_pid
   _warden_teardown
@@ -2405,4 +2405,76 @@ print(sorted(set(v for k in ssh_granted(sys.argv[1], 'wbox').values() for v in k
   [ "$again" = "-h github.com -h gitlab.com -h example.org $TT/keys/one" ]
   # wbox may sign with the key only for github.com's host key, as 'gh'.
   [ "$servers" = "['gh'] 1" ]
+}
+
+# ---------------------------------------------------------------------------
+# container PID 1
+# ---------------------------------------------------------------------------
+
+@test "_cbox_create: PID 1 is cbox's init, not tail" {
+  local capture="$BATS_TMPDIR/create-init-args"
+  rm -f "$capture"
+  cd "$BATS_TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  _cbox_create "cbox-unit-init" "normal"
+  run cat "$capture"
+  [[ "$output" == *"-c"$'\n'"$_CBOX_INIT_SH"$'\n'"sh"$'\n'"import os, signal, time"* ]]
+  [[ "$output" != *$'\n'"tail"$'\n'* ]]
+}
+
+@test "_CBOX_INIT_SH: runs the init with python3, and tail in images without it" {
+  mkdir -p "$BATS_TMPDIR/init-bin"
+  printf '#!/bin/sh\necho "python3 $1 $2"\n' > "$BATS_TMPDIR/init-bin/python3"
+  chmod +x "$BATS_TMPDIR/init-bin/python3"
+  run env PATH="$BATS_TMPDIR/init-bin:/usr/bin:/bin" sh -c "$_CBOX_INIT_SH" sh "CODE"
+  [ "$output" = "python3 -c CODE" ]
+  mkdir -p "$BATS_TMPDIR/init-nopy"
+  ln -sf "$(command -v tail)" "$BATS_TMPDIR/init-nopy/tail"
+  run timeout 1 env PATH="$BATS_TMPDIR/init-nopy" /bin/sh -c "$_CBOX_INIT_SH" sh "CODE"
+  [ "$status" -eq 124 ]  # tail -f keeps running
+}
+
+@test "_cbox_init_py: collects orphaned processes and stops on SIGTERM" {
+  # A subreaper stands in for PID 1: orphans of its children come to it.
+  run timeout 20 python3 -c '
+import ctypes, os, signal, subprocess, sys, time
+ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
+if os.fork() == 0:
+    if os.fork() == 0:
+        time.sleep(0.5)
+        os._exit(0)  # ends after its parent: an orphan
+    os._exit(0)
+time.sleep(0.2)
+os.waitpid(-1, 0)  # the direct child; the orphan is now ours
+pid = os.getpid()
+if os.fork() == 0:
+    time.sleep(2)
+    st = subprocess.run(["ps", "-o", "stat=", "--ppid", str(pid)], capture_output=True, text=True).stdout.split()
+    print("zombies", sum(s.startswith("Z") for s in st), flush=True)
+    t = time.time(); os.kill(pid, signal.SIGTERM)
+    os._exit(0)
+os.execvp("python3", ["python3", "-c", sys.argv[1]])
+' "$(_cbox_init_py)"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"zombies 0"* ]]
+}
+
+@test "_cbox_old_init: recognises containers created with tail as PID 1" {
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { echo '[{"configuration": {"initProcess": {"executable": "tail", "arguments": ["-f", "/dev/null"]}}}]'; }
+  run _cbox_old_init box
+  [ "$status" -eq 0 ]
+  _fake_runtime() { echo '[{"configuration": {"initProcess": {"executable": "python3", "arguments": ["-c", "import os"]}}}]'; }
+  run _cbox_old_init box
+  [ "$status" -ne 0 ]
+}
+
+@test "warden: resource names may contain dots, like a host name" {
+  _ssh_setup
+  printf '[ai.vm]\ntype = ssh\nkey = %s\nhosts = ai.vm\n[.hidden]\ntype = ssh\nkey = %s\nhosts = x\n' "$TT/keys/two" "$TT/keys/two" >> "$CBOX_WARDEN_DIR/resources"
+  run _cbox_warden_python list "$CBOX_WARDEN_DIR" "$PWD"
+  _warden_teardown
+  [[ "$output" == *"ai.vm"*"ssh $TT/keys/two → ai.vm"* ]]
+  [[ "$output" == *"'.hidden': name may only contain"* ]]
 }

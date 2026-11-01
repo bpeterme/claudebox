@@ -592,6 +592,38 @@ cmd_approve(sys.argv[2], sys.argv[3])" "$CBOX_WARDEN_DIR" "$PWD" 2>/dev/null
   [ "$got" = "403 403 403 403 403 403 403 404 " ]
 }
 
+@test "warden: a one-route resource reaches an endpoint outside the main upstream path" {
+  _warden_setup
+  # As in the README: OpenRouter's decisions endpoint sits under /api/alpha,
+  # beside the main resource's /api/v1, so it gets its own resource and route.
+  cat >> "$CBOX_WARDEN_DIR/resources" <<INI
+[dec]
+upstream = http://127.0.0.1:$UP_PORT/api/alpha
+auth     = bearer
+secret   = cbox.warden.llm
+allow    = POST /decisions
+env      = DECISIONS_URL={url}/decisions
+INI
+  env=$(_warden_env)
+  url=$(printf '%s\n' "$env" | sed -n 's/^WARDEN_URL=//p')
+  ok=$(curl -s -H 'Authorization: Bearer sk-or-REDACTED' -d '{"m":1}' "$url/dec/decisions")
+  code() { curl -s -o /dev/null -w '%{http_code} ' --path-as-is "$@"; }
+  got=$(code "$url/dec/decisions")                  # GET
+  got+=$(code -X PUT -d x "$url/dec/decisions")     # other method
+  got+=$(code -d x "$url/dec/anything-else")        # /api/alpha/anything-else
+  got+=$(code -d x "$url/dec/decisions/x")          # below the route
+  got+=$(code -d x "$url/dec/v1/keys")              # /api/alpha/v1/keys
+  got+=$(code -d x "$url/dec/../llm/keys")          # out of the resource
+  got+=$(code -d x "$url/llm/keys")                 # /api/v1/keys
+  got+=$(code -d x "$url/llm/alpha/decisions")      # still not via the main resource
+  _warden_teardown
+  [[ "$env" == *"DECISIONS_URL=$url/dec/decisions"* ]]
+  [[ "$ok" == *'"path": "/api/alpha/decisions"'* ]]
+  [[ "$ok" == *'"authorization": "Bearer sk-test-REDACTED-cbox.warden.llm"'* ]]
+  [[ "$ok" == *'"body": "{\"m\":1}"'* ]]
+  [ "$got" = "403 403 403 403 403 403 403 403 " ]
+}
+
 @test "warden: the secret never appears in the broker log" {
   _warden_setup
   url=$(_warden_url)

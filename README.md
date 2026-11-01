@@ -353,6 +353,26 @@ secret   = cbox.warden.openrouter
 opencode = openrouter
 ```
 
+**One endpoint outside the upstream path.** A request to
+`$WARDEN_URL/<resource>/<path>` goes to the upstream URL plus `<path>`, and
+`..` is refused, so an endpoint beside the upstream path needs a resource of
+its own. Give it the same secret and allow just that one call. Example:
+OpenRouter's decisions models (e.g. TypeSafe Jev, used for classification)
+only answer at `https://openrouter.ai/api/alpha/decisions`, next to `/api/v1`:
+
+```ini
+[openrouter-decisions]
+upstream = https://openrouter.ai/api/alpha
+auth     = bearer
+secret   = cbox.warden.openrouter            # the same Keychain item as [openrouter]
+allow    = POST /decisions                   # this one call, nothing else
+env      = OPENROUTER_DECISIONS_URL={url}/decisions
+```
+
+The container then posts to `$OPENROUTER_DECISIONS_URL`. A new resource
+reaches a container at its next session start (exit its sessions, start
+`cbox` again); a changed `allow` on an existing one applies at once.
+
 Not available in safe mode.
 
 ## macOS: Screenshot Script

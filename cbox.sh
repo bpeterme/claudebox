@@ -252,8 +252,29 @@ _cbox_generate_claude_json() {
     "$claude_json" "$name" "$CBOX_MCP_CONFIG" "$managed" "$_CBOX_MCP_RELAY" "$mode" "${3:-}"
 }
 
+# Prints the exec arguments for a safe container's proxy (see "egress"):
+# its only way out.
+_cbox_proxy_args() {
+  local proxy="http://127.0.0.1:$_CBOX_EGRESS_PORT" p
+  for p in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy; do printf '%s\n' -e "$p=$proxy"; done
+  printf '%s\n' -e "NO_PROXY=localhost,127.0.0.1,::1" -e "no_proxy=localhost,127.0.0.1,::1" \
+    -e "NODE_USE_ENV_PROXY=1"
+}
+
+# Fills _CBOX_UPDATE_ARGS with what an npm update in the container needs. A
+# safe container has no network: the tunnel's proxy has to be up first, or npm
+# retries for minutes. Fails when it is not.
+_cbox_update_args() {
+  local name="$1" mode="$2" _a
+  _CBOX_UPDATE_ARGS=()
+  [[ "$mode" == "safe" ]] || return 0
+  _cbox_tunnel_start "$name" on
+  _cbox_egress_ready "$name" || return 1
+  while IFS= read -r _a; do _CBOX_UPDATE_ARGS+=("$_a"); done < <(_cbox_proxy_args)
+}
+
 _cbox_maybe_update() {
-  local name="$1"
+  local name="$1" mode="${2:-normal}"
 
   local agent_bin agent_pkg
   agent_bin=$(_cbox_agent_bin)
@@ -262,12 +283,16 @@ _cbox_maybe_update() {
   local stamp="${TMPDIR:-/tmp}/.cbox-update-${agent_bin}-$(date +%Y-%m-%d)"
 
   if [[ ! -f "$stamp" ]]; then
+    if ! _cbox_update_args "$name" "$mode"; then
+      echo "⚠  Skipped the ${agent_bin} update: the container cannot reach npm this session"
+      return 0
+    fi
     _cbox_log "Updating ${agent_bin}..."
     if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-      $_CBOX_CMD exec --user root "$name" \
+      $_CBOX_CMD exec --user root ${_CBOX_UPDATE_ARGS[@]+"${_CBOX_UPDATE_ARGS[@]}"} "$name" \
         npm update -g --no-fund "$agent_pkg"
     else
-      $_CBOX_CMD exec --user root "$name" \
+      $_CBOX_CMD exec --user root ${_CBOX_UPDATE_ARGS[@]+"${_CBOX_UPDATE_ARGS[@]}"} "$name" \
         npm update -g --no-fund "$agent_pkg" >/dev/null 2>&1
     fi
     touch "$stamp"
@@ -292,10 +317,21 @@ _cbox_force_update() {
   agent_bin=$(_cbox_agent_bin)
   agent_pkg=$(_cbox_agent_pkg)
 
+  local mode had_tunnel=0
+  mode=$(_cbox_mode "$name")
+  _cbox_tunnel_pid "$name" >/dev/null && had_tunnel=1
+  if ! _cbox_update_args "$name" "$mode"; then
+    echo "✖ The safe container cannot reach npm (its tunnel did not start) — update not run"
+    (( had_tunnel )) || _cbox_tunnel_stop "$name"
+    return 1
+  fi
+
   echo "Updating ${agent_bin}..."
 
-  $_CBOX_CMD exec --user root "$name" \
+  $_CBOX_CMD exec --user root ${_CBOX_UPDATE_ARGS[@]+"${_CBOX_UPDATE_ARGS[@]}"} "$name" \
     npm update -g --no-fund "$agent_pkg"
+  # A tunnel started just for this goes again; a session's stays.
+  (( had_tunnel )) || _cbox_tunnel_stop "$name"
 }
 
 # Prints the network for safe containers, which have no way out of their own:
@@ -1585,6 +1621,21 @@ _cbox_tunnel_start() {
   else
     echo "⚠  tunnel did not start — check $logfile"
   fi
+}
+
+# True once the container's end of the egress proxy accepts connections (up
+# to ~10s). The host side starts first, the listener a moment later.
+_cbox_egress_ready() {
+  local name="$1" _i
+  _cbox_tunnel_pid "$name" >/dev/null || return 1
+  for ((_i = 0; _i < 20; _i++)); do
+    $_CBOX_CMD exec "$name" python3 -c \
+      "import socket; socket.create_connection(('127.0.0.1', $_CBOX_EGRESS_PORT), 1).close()" \
+      >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  echo "⚠  safe mode's proxy did not come up — check $CBOX_DATA_DIR/.tunnel-$name.log" >&2
+  return 1
 }
 
 _cbox_tunnel_stop() {
@@ -3886,7 +3937,7 @@ _cbox_enter() {
   agent_bin=$(_cbox_agent_bin)
 
   if [[ "$command" != "zsh" ]]; then
-    _cbox_maybe_update "$name"
+    _cbox_maybe_update "$name" "$mode"
     if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
       if [[ "$agent_bin" == "claude" ]]; then
         if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
@@ -3926,10 +3977,8 @@ _cbox_enter() {
     # The container's only way out: the tunnel's proxy, which lets through
     # allowed hosts only (CBOX_EGRESS_ALLOW).
     _egress=on _tunnel=1
-    local _proxy="http://127.0.0.1:$_CBOX_EGRESS_PORT" _p
-    for _p in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy; do _exec_args+=(-e "$_p=$_proxy"); done
-    _exec_args+=(-e "NO_PROXY=localhost,127.0.0.1,::1" -e "no_proxy=localhost,127.0.0.1,::1"
-                 -e "NODE_USE_ENV_PROXY=1")
+    local _p
+    while IFS= read -r _p; do _exec_args+=("$_p"); done < <(_cbox_proxy_args)
     if [[ "$(_cbox_rt_label "$name" cbox.egress)" != "allowlist" ]]; then
       echo "⚠  This safe container was created before cbox limited its outbound traffic:"
       echo "   it can still reach the whole internet. Recreate it: cbox reset"
@@ -3969,7 +4018,11 @@ _cbox_enter() {
     fi
   fi
 
-  (( _tunnel )) && _cbox_tunnel_start "$name" "$_egress"
+  if (( _tunnel )); then
+    _cbox_tunnel_start "$name" "$_egress"
+    # The agent's first request must not beat the proxy's listener.
+    [[ -n "$_egress" ]] && { _cbox_egress_ready "$name" || true; }
+  fi
 
   _cbox_flux_install "$name"
 

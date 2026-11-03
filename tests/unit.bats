@@ -2656,6 +2656,7 @@ _enter_safe() {
   _cbox_rt_label() { echo "$LABEL"; }
   _cbox_tunnel_start() { echo "tunnel $*" >> "$capture"; }
   _cbox_tunnel_stop() { :; }
+  _cbox_egress_ready() { echo "ready $*" >> "$capture"; }
   _cbox_warden_start() { :; }
   _cbox_warden_end() { :; }
   _cbox_mcp_relay_start() { :; }
@@ -2678,6 +2679,48 @@ _enter_safe() {
   [[ "$output" == *"-e HTTPS_PROXY=http://127.0.0.1:3128 "* ]]
   [[ "$output" == *"-e http_proxy=http://127.0.0.1:3128 "* ]]
   [[ "$output" == *"-e NO_PROXY=localhost,127.0.0.1,::1 "* ]]
+}
+
+@test "_cbox_enter: the agent starts only after the proxy's listener is up" {
+  MODE=safe LABEL=allowlist
+  run _enter_safe
+  run cat "$BATS_TMPDIR/enter-egress"
+  [[ "$output" == *"tunnel ebox on"*"ready ebox"*"exec -it"* ]]
+}
+
+# _cbox_maybe_update for container ubox in $MODE; READY decides whether the
+# proxy comes up. Runtime calls and tunnel starts land in $capture.
+_update() {
+  capture="$BATS_TMPDIR/update-egress"; rm -f "$capture"
+  export TMPDIR="$BATS_TMPDIR/update-tmp"; rm -rf "$TMPDIR"; mkdir -p "$TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { echo "$*" >> "$capture"; }
+  _cbox_tunnel_start() { echo "tunnel $*" >> "$capture"; }
+  _cbox_egress_ready() { [[ "$READY" == 1 ]]; }
+  _cbox_maybe_update ubox "$MODE"
+}
+
+@test "_cbox_maybe_update: in safe mode npm goes through the proxy, started first" {
+  MODE=safe READY=1
+  run _update
+  run cat "$BATS_TMPDIR/update-egress"
+  [[ "$output" == "tunnel ubox on"*"exec --user root -e HTTPS_PROXY=http://127.0.0.1:3128 "*"ubox npm update"* ]]
+}
+
+@test "_cbox_maybe_update: without the proxy a safe container skips the update instead of hanging" {
+  MODE=safe READY=0
+  run _update
+  [[ "$output" == *"Skipped the claude update"* ]]
+  run grep -c "npm update" "$BATS_TMPDIR/update-egress"
+  [ "$output" = "0" ]
+  [ -z "$(ls "$BATS_TMPDIR/update-tmp")" ]   # tried again next session
+}
+
+@test "_cbox_maybe_update: normal mode needs no proxy" {
+  MODE=normal READY=0
+  run _update
+  run cat "$BATS_TMPDIR/update-egress"
+  [ "$output" = "exec --user root ubox npm update -g --no-fund @anthropic-ai/claude-code" ]
 }
 
 @test "_cbox_enter: a safe container from before egress filtering gets a reset hint" {

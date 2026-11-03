@@ -2653,7 +2653,8 @@ _enter_safe() {
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { echo "$*" >> "$capture"; }
   _cbox_mode() { echo "$MODE"; }
-  _cbox_rt_label() { echo "$LABEL"; }
+  _cbox_rt_label() { case "$2" in cbox.egress) echo "$EGRESS" ;; cbox.safe-login) echo "$LOGIN" ;; esac; }
+  _cbox_safe_claude_dir() { echo "safe-claude $*" >> "$capture"; }
   _cbox_tunnel_start() { echo "tunnel $*" >> "$capture"; }
   _cbox_tunnel_stop() { :; }
   _cbox_egress_ready() { echo "ready $*" >> "$capture"; }
@@ -2671,7 +2672,7 @@ _enter_safe() {
 }
 
 @test "_cbox_enter: safe sessions go out through the tunnel's proxy" {
-  MODE=safe LABEL=allowlist
+  MODE=safe EGRESS=allowlist LOGIN=shared
   run _enter_safe
   [[ "$output" != *"created before cbox limited"* ]]
   run cat "$BATS_TMPDIR/enter-egress"
@@ -2682,7 +2683,7 @@ _enter_safe() {
 }
 
 @test "_cbox_enter: the agent starts only after the proxy's listener is up" {
-  MODE=safe LABEL=allowlist
+  MODE=safe EGRESS=allowlist LOGIN=shared
   run _enter_safe
   run cat "$BATS_TMPDIR/enter-egress"
   [[ "$output" == *"tunnel ebox on"*"ready ebox"*"exec -it"* ]]
@@ -2723,14 +2724,26 @@ _update() {
   [ "$output" = "exec --user root ubox npm update -g --no-fund @anthropic-ai/claude-code" ]
 }
 
-@test "_cbox_enter: a safe container from before egress filtering gets a reset hint" {
-  MODE=safe LABEL=""
+@test "_cbox_enter: a safe container from an older cbox gets a reset hint naming what it lacks" {
+  MODE=safe EGRESS="" LOGIN=""
   run _enter_safe
-  [[ "$output" == *"it can still reach the whole internet. Recreate it: cbox reset"* ]]
+  [[ "$output" == *"created by an older cbox"*"whole internet"*"log in again"*"cbox reset"* ]]
+  MODE=safe EGRESS=allowlist LOGIN=""
+  run _enter_safe
+  [[ "$output" == *"log in again"* ]]
+  [[ "$output" != *"whole internet"* ]]
+}
+
+@test "_cbox_enter: safe sessions refresh their Claude folder and send no telemetry" {
+  MODE=safe EGRESS=allowlist LOGIN=shared
+  run _enter_safe
+  run cat "$BATS_TMPDIR/enter-egress"
+  [[ "$output" == *"safe-claude ebox"* ]]
+  [[ "$output" == *"-e CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 "* ]]
 }
 
 @test "_cbox_enter: normal sessions get no proxy" {
-  MODE=normal LABEL=""
+  MODE=normal EGRESS="" LOGIN=""
   run _enter_safe
   run cat "$BATS_TMPDIR/enter-egress"
   [[ "$output" != *"HTTPS_PROXY"* ]]
@@ -2837,4 +2850,87 @@ unlisted True
 other port True
 name to this host True" ] || { echo "$result"; cat "$TT/tunnel.log"; false; }
   grep -q "egress: blocked example.invalid:443" "$TT/tunnel.log"
+}
+
+# ---------------------------------------------------------------------------
+# safe mode's Claude folder
+# ---------------------------------------------------------------------------
+
+_safe_setup() {
+  rm -rf "$CBOX_CLAUDE_DIR" "$CBOX_DATA_DIR/safe-claude"
+  mkdir -p "$CBOX_CLAUDE_DIR/skills" "$CBOX_CLAUDE_DIR/.git"
+  echo '{}' > "$CBOX_CLAUDE_DIR/settings.json"
+  echo 'old' > "$CBOX_CLAUDE_DIR/.credentials.json"
+  SD="$CBOX_DATA_DIR/safe-claude/sbox"
+}
+
+@test "_cbox_safe_claude_dir: entries link to the read-only shared folder; the login is the shared file" {
+  _safe_setup
+  _cbox_safe_claude_dir sbox
+  [ "$(readlink "$SD/settings.json")" = "/home/claude/.cbox-claude/settings.json" ]
+  [ "$(readlink "$SD/skills")" = "/home/claude/.cbox-claude/skills" ]
+  [ ! -e "$SD/.git" ]
+  [ ! -L "$SD/.git" ]
+  [ "$SD/.credentials.json" -ef "$CBOX_CLAUDE_DIR/.credentials.json" ]
+  # Claude Code refreshes in place: the other side sees it.
+  echo 'refreshed' > "$SD/.credentials.json"
+  [ "$(cat "$CBOX_CLAUDE_DIR/.credentials.json")" = "refreshed" ]
+}
+
+@test "_cbox_safe_claude_dir: follows the shared folder at every run" {
+  _safe_setup
+  _cbox_safe_claude_dir sbox
+  rm -rf "$CBOX_CLAUDE_DIR/skills"
+  mkdir -p "$CBOX_CLAUDE_DIR/agents"
+  rm -f "$SD/settings.json"; echo '{"hooks": "planted"}' > "$SD/settings.json"
+  touch "$SD/own-file"
+  _cbox_safe_claude_dir sbox
+  [ ! -L "$SD/skills" ]
+  [ ! -e "$SD/skills" ]
+  [ "$(readlink "$SD/agents")" = "/home/claude/.cbox-claude/agents" ]
+  [ "$(readlink "$SD/settings.json")" = "/home/claude/.cbox-claude/settings.json" ]
+  [ -f "$SD/own-file" ]
+}
+
+@test "_cbox_safe_claude_dir: a login made in safe mode since replaces the shared one" {
+  _safe_setup
+  _cbox_safe_claude_dir sbox
+  # /logout + /login in the container: a new file, newer than the shared one.
+  rm -f "$SD/.credentials.json"; echo 'new login' > "$SD/.credentials.json"
+  touch -d '2000-01-01' "$CBOX_CLAUDE_DIR/.credentials.json"
+  _cbox_safe_claude_dir sbox
+  [ "$SD/.credentials.json" -ef "$CBOX_CLAUDE_DIR/.credentials.json" ]
+  [ "$(cat "$CBOX_CLAUDE_DIR/.credentials.json")" = "new login" ]
+}
+
+@test "_cbox_safe_claude_dir: a newer login in the shared folder replaces the safe one" {
+  _safe_setup
+  mkdir -p "$SD"; echo 'stale' > "$SD/.credentials.json"; touch -d '2000-01-01' "$SD/.credentials.json"
+  _cbox_safe_claude_dir sbox
+  [ "$SD/.credentials.json" -ef "$CBOX_CLAUDE_DIR/.credentials.json" ]
+  [ "$(cat "$SD/.credentials.json")" = "old" ]
+}
+
+@test "_cbox_safe_claude_dir: the first login, made in safe mode, becomes the shared one" {
+  _safe_setup
+  rm -f "$CBOX_CLAUDE_DIR/.credentials.json"
+  mkdir -p "$SD"; echo 'first' > "$SD/.credentials.json"
+  _cbox_safe_claude_dir sbox
+  [ "$SD/.credentials.json" -ef "$CBOX_CLAUDE_DIR/.credentials.json" ]
+}
+
+@test "_cbox_create: safe mode mounts the shared Claude folder read-only and its own ~/.claude" {
+  local capture="$BATS_TMPDIR/create-safe-claude"
+  _safe_setup
+  cd "$BATS_TMPDIR"
+  _CBOX_RUNTIME=docker
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  rm -f "$capture"; _cbox_create "sbox" "safe"
+  run cat "$capture"
+  [[ "$output" == *"$CBOX_CLAUDE_DIR:/home/claude/.cbox-claude:ro"* ]]
+  [[ "$output" == *"$CBOX_DATA_DIR/safe-claude/sbox:/home/claude/.claude"* ]]
+  [[ "$output" == *"cbox.safe-login=shared"* ]]
+  [[ "$output" != *"$CBOX_CLAUDE_DIR:/home/claude/.claude"* ]]
+  [ "$CBOX_DATA_DIR/safe-claude/sbox/.credentials.json" -ef "$CBOX_CLAUDE_DIR/.credentials.json" ]
 }

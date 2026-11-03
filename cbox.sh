@@ -117,6 +117,9 @@ _CBOX_TUNNEL_DIR="/tmp/cbox-tunnel"
 # Safe mode's proxy port on the container's 127.0.0.1, served through the
 # tunnel; the warden python has the same port as EGRESS_PORT.
 _CBOX_EGRESS_PORT=3128
+# Where a safe container sees the shared CBOX_CLAUDE_DIR (read-only); its own
+# ~/.claude links into it (see _cbox_safe_claude_dir).
+_CBOX_SAFE_SHARED="/home/claude/.cbox-claude"
 # Extra opencode config cbox writes in the container (OPENCODE_CONFIG): host MCP
 # servers and warden routes, merged over the user's own opencode.json.
 _CBOX_OPENCODE_CONFIG="/home/claude/.cache/cbox/opencode.json"
@@ -3398,6 +3401,47 @@ _cbox_seed_claude_dir() {
   return 0
 }
 
+# Safe mode's ~/.claude: a folder per container whose entries are symlinks
+# into the shared Claude folder, which the container sees read-only at
+# $_CBOX_SAFE_SHARED. The one exception is the login, .credentials.json: it is
+# the shared file itself (a hard link). Claude Code rewrites that file in place
+# when it refreshes the login, so a refresh in any container reaches all of
+# them; a symlink would not do, Claude Code refuses to open one there.
+# Runs at create and at every session start, so it follows the shared folder.
+_cbox_safe_claude_dir() {
+  local name="$1" src="$CBOX_CLAUDE_DIR" dir="$CBOX_DATA_DIR/safe-claude/$1" e base want
+  mkdir -p "$dir"
+  # Names of the shared folder link there; a local entry of the same name goes.
+  while IFS= read -r e; do
+    base="${e##*/}"
+    want="$_CBOX_SAFE_SHARED/$base"
+    [[ -L "$dir/$base" && "$(readlink "$dir/$base")" == "$want" ]] && continue
+    rm -rf "${dir:?}/$base"
+    ln -s "$want" "$dir/$base"
+  done < <(find "$src" -mindepth 1 -maxdepth 1 ! -name .credentials.json ! -name .git 2>/dev/null)
+  # Links to entries the shared folder no longer has.
+  while IFS= read -r e; do
+    [[ "$(readlink "$e")" == "$_CBOX_SAFE_SHARED/"* && ! -e "$src/${e##*/}" ]] && rm -f "$e"
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 -type l)
+
+  local s="$src/.credentials.json" l="$dir/.credentials.json"
+  [[ -L "$s" || -L "$l" ]] && return 0  # Claude Code would not open it anyway
+  if [[ -f "$s" && ! "$s" -ef "$l" ]]; then
+    # A login made in this safe container since (it replaced its file) wins.
+    if [[ -f "$l" && "$l" -nt "$s" ]]; then
+      ln -f "$l" "$s" 2>/dev/null && return 0
+    elif ln -f "$s" "$l" 2>/dev/null; then
+      return 0
+    fi
+    command cp -p "$s" "$l"
+    echo "⚠  Safe mode cannot share your login: $src and $CBOX_DATA_DIR are on different disks." >&2
+    echo "   A login refreshed in safe mode lasts for that session only." >&2
+  elif [[ ! -e "$s" && -f "$l" ]]; then
+    ln "$l" "$s" 2>/dev/null || true  # first login made in safe mode
+  fi
+  return 0
+}
+
 # Folder names listed in CBOX_SHARE_CONFIG, one per line (zsh does not split
 # an unquoted variable, so no word splitting here).
 _cbox_shared_config_names() {
@@ -3567,12 +3611,17 @@ _cbox_create() {
   if [[ "$mode" == "safe" ]]; then
     local _net
     _net=$(_cbox_safe_network) || return 1
+    _cbox_safe_claude_dir "$name"
     args+=(
       --network "$_net"
       --label "cbox.egress=allowlist"
+      --label "cbox.safe-login=shared"
       --cap-drop=ALL
       --cpus=2
-      -v "$CBOX_CLAUDE_DIR:/home/claude/.claude:ro"
+      # The shared Claude folder read-only; the container's own ~/.claude
+      # links into it and shares only the login (see _cbox_safe_claude_dir).
+      -v "$CBOX_CLAUDE_DIR:$_CBOX_SAFE_SHARED:ro"
+      -v "$CBOX_DATA_DIR/safe-claude/$name:/home/claude/.claude"
       # Read-only for the same reason .claude is: safe mode must not be able to
       # write host state shared with every other container. Baked browsers still
       # work; a playwright self-install inside the container will fail, which is
@@ -3979,9 +4028,16 @@ _cbox_enter() {
     _egress=on _tunnel=1
     local _p
     while IFS= read -r _p; do _exec_args+=("$_p"); done < <(_cbox_proxy_args)
-    if [[ "$(_cbox_rt_label "$name" cbox.egress)" != "allowlist" ]]; then
-      echo "⚠  This safe container was created before cbox limited its outbound traffic:"
-      echo "   it can still reach the whole internet. Recreate it: cbox reset"
+    # Telemetry and error reports would only be blocked by the proxy.
+    _exec_args+=(-e "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1")
+    _cbox_safe_claude_dir "$name"
+    # Containers made by an older cbox lack what their labels name.
+    if [[ "$(_cbox_rt_label "$name" cbox.safe-login)" != "shared" ]]; then
+      echo "⚠  This safe container was created by an older cbox:"
+      [[ "$(_cbox_rt_label "$name" cbox.egress)" == "allowlist" ]] ||
+        echo "   - it can still reach the whole internet"
+      echo "   - it cannot keep your login fresh, so Claude asks you to log in again"
+      echo "   Recreate it: cbox reset"
     fi
   else
     local _w_env

@@ -94,7 +94,8 @@ cbox oc safe   # opencode in safe mode
 - All Linux capabilities dropped (`--cap-drop=ALL`)
 - No privilege escalation (`--security-opt no-new-privileges`; Docker only — Apple's runtime has no such option, so `sudo` works inside its containers)
 - 4 GB memory limit, 2 CPU cores, 512 max PIDs (PID limit: Docker only)
-- Agent config mounted read-only
+- Agent config read-only, except the login: safe and normal containers share one login, and a refresh in either keeps it valid for both. Each safe container has its own `~/.claude` (in `$CBOX_DATA_DIR/safe-claude/<name>`) whose entries link to the shared folder; its `.credentials.json` is the shared file itself (a hard link). A safe container can therefore change the shared login, but not your settings, hooks or skills
+- Claude Code's telemetry and error reports are off (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`)
 - Internet access only to allowed hosts (see below)
 
 #### Outbound traffic in safe mode
@@ -119,7 +120,7 @@ Limits:
 - Only programs that use the proxy settings get out: curl, git over https, npm, pip, uv, Claude Code, opencode. git over ssh does not work in safe mode.
 - A host name never leads to your Mac itself or a link-local address. To reach a server on your local network, list its IP address.
 - On Apple's runtime the host-only network still reaches services on your Mac that listen on all interfaces.
-- Safe containers created before this filtering existed can still reach everything; cbox says so at session start. Recreate one with `cbox reset`.
+- Safe containers created by an older cbox can still reach everything, or cannot keep the login fresh; cbox says so at session start. Recreate one with `cbox reset`.
 
 ### Git safety (both modes)
 
@@ -140,7 +141,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_LABEL` | `cbox.project=true` | Label applied to all cbox containers |
 | `CBOX_KEEPALIVE_SECONDS` | `600` | Seconds container stays alive before auto-stop in keepalive mode |
 | `CBOX_DATA_DIR` | `~/.local/share/claudebox` | Per-project container config files (`.claude-<name>.json`), one per project |
-| `CBOX_CLAUDE_DIR` | `~/.config/claudebox/.claude` | The container's Claude Code folder, mounted as `~/.claude` (read-write; read-only in safe mode). Not your Mac's `~/.claude`: Claude Code on the Mac runs the hooks in its `settings.json`, so cbox refuses it. On first use cbox copies your settings, `CLAUDE.md`, keybindings, agents, commands, skills and output styles into it (copies, not links); log in once inside the container |
+| `CBOX_CLAUDE_DIR` | `~/.config/claudebox/.claude` | The container's Claude Code folder, mounted as `~/.claude` (read-write; read-only in safe mode, except the login). Not your Mac's `~/.claude`: Claude Code on the Mac runs the hooks in its `settings.json`, so cbox refuses it. On first use cbox copies your settings, `CLAUDE.md`, keybindings, agents, commands, skills and output styles into it (copies, not links); log in once inside the container |
 | `CBOX_HOST_CONFIG_DIR` | `~/.config/claudebox/.config` | The container's own `~/.config` (normal mode, read-write). Not your real `~/.config`: that holds config that runs on your Mac and tokens, so cbox refuses it |
 | `CBOX_SHARE_CONFIG` | *(unset)* | Folders of your real `~/.config` to share **read-only** into the container's `~/.config`, e.g. `"opencode nvim"`. Code in the container can read them, so leave out folders holding tokens (`gh`, `gcloud`). `claudebox` is never shared. Applies to newly created containers: `cbox reset` |
 | `CBOX_SHARE_DIR` | `~/.cache/claudebox/share` | Share folder, mounted as `~/share` in container; cleared on exit (read-write) |

@@ -25,7 +25,7 @@ cbox - AI Coding Agent Container Runtime
 Usage:
   cbox [-v]                           Start or enter normal container (Claude Code)
   cbox safe                           Start or enter safe container
-  cbox shell                          Open zsh shell instead of the container
+  cbox shell                          Open a zsh shell in the container (safe or normal)
   cbox keepalive                      Keep container alive for 10 minutes after exit
   cbox oc [...]                       Same as above but use opencode instead of Claude Code
 
@@ -3720,13 +3720,16 @@ _cbox_ensure() {
     fi
   fi
 
+  # "existing": whatever mode the container has; a new one is normal.
   if ! _cbox_exists "$name"; then
+    [[ "$requested_mode" == "existing" ]] && requested_mode="normal"
     _cbox_create "$name" "$requested_mode"
     return
   fi
 
   local actual_mode
   actual_mode=$(_cbox_mode "$name")
+  [[ "$requested_mode" == "existing" ]] && requested_mode="$actual_mode"
 
   if [[ "$actual_mode" != "$requested_mode" ]]; then
     echo "ERROR:"
@@ -4331,7 +4334,8 @@ cbox() {
       ;;
 
     shell)
-      _cbox_ensure "$name" "normal" || return 1
+      # Joins a safe container too, with its limits (no new normal one).
+      _cbox_ensure "$name" "existing" || return 1
       _cbox_enter "$name" "zsh"
       ;;
 

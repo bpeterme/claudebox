@@ -54,7 +54,7 @@ cbox oc safe   # opencode in safe mode
 |---------|-------------|
 | `cbox` | Start or enter normal container (Claude Code) |
 | `cbox safe` | Start or enter sandboxed container |
-| `cbox shell` | Open a zsh shell in the container |
+| `cbox shell` | Open a zsh shell in the container, in whatever mode it has (a new one is normal) |
 | `cbox keepalive` | Run agent; keep container alive for 10 min after exit |
 | `cbox oc [...]` | Same as above but use opencode (e.g. `cbox oc safe`, `cbox oc shell`) |
 

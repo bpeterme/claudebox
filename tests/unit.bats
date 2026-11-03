@@ -2934,3 +2934,29 @@ _safe_setup() {
   [[ "$output" != *"$CBOX_CLAUDE_DIR:/home/claude/.claude"* ]]
   [ "$CBOX_DATA_DIR/safe-claude/sbox/.credentials.json" -ef "$CBOX_CLAUDE_DIR/.credentials.json" ]
 }
+
+# ---------------------------------------------------------------------------
+# cbox shell
+# ---------------------------------------------------------------------------
+
+@test "_cbox_ensure existing: joins a container in its own mode, creates a normal one otherwise" {
+  _CBOX_RUNTIME=docker
+  _cbox_running() { return 0; }
+  _cbox_create() { echo "create $*"; }
+  _cbox_exists() { return 0; }
+  _cbox_mode() { echo safe; }
+  run _cbox_ensure box existing
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  _cbox_exists() { return 1; }
+  run _cbox_ensure box existing
+  [ "$output" = "create box normal" ]
+}
+
+@test "cbox shell: opens zsh in an existing safe container" {
+  cd "$BATS_TMPDIR"
+  _cbox_ensure() { echo "ensure $*"; }
+  _cbox_enter() { echo "enter $*"; }
+  run cbox shell
+  [[ "$output" == *"ensure "*" existing"*"enter "*" zsh"* ]]
+}

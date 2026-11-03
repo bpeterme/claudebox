@@ -2590,3 +2590,373 @@ os.execvp("python3", ["python3", "-c", sys.argv[1]])
   _warden_teardown
   [ "$list" = "github.com ssh-ed25519 $(_fake_host_key github.com)" ]
 }
+
+# ---------------------------------------------------------------------------
+# safe mode egress
+# ---------------------------------------------------------------------------
+
+@test "_cbox_create: safe containers get no network on Docker and are marked as filtered" {
+  local capture="$BATS_TMPDIR/create-egress-args"
+  cd "$BATS_TMPDIR"
+  _CBOX_RUNTIME=docker
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  rm -f "$capture"; _cbox_create "cbox-unit-egress" "safe"
+  safe=$(grep -A1 -x -- '--network' "$capture" | tail -1)
+  label=$(grep -c -x 'cbox.egress=allowlist' "$capture")
+  rm -f "$capture"; _cbox_create "cbox-unit-egress" "normal"
+  normal=$(grep -c -x -- '--network' "$capture" || true)
+  [ "$safe" = "none" ]
+  [ "$label" -eq 1 ]
+  [ "$normal" -eq 0 ]
+}
+
+@test "_cbox_create: Apple runtime puts safe containers on a host-only network, made once" {
+  local capture="$BATS_TMPDIR/create-egress-apple"
+  cd "$BATS_TMPDIR"
+  _CBOX_RUNTIME=apple
+  _CBOX_CMD=_fake_runtime
+  # The network exists after the first create.
+  _fake_runtime() {
+    echo "$*" >> "$capture"
+    [[ "$1 $2" == "network inspect" ]] && { [[ -f "$capture.net" ]]; return; }
+    [[ "$1 $2" == "network create" ]] && : > "$capture.net"
+    return 0
+  }
+  rm -f "$capture" "$capture.net"
+  _cbox_create "cbox-unit-egress" "safe"
+  _cbox_create "cbox-unit-egress" "safe"
+  run cat "$capture"
+  [ "$(grep -c '^network create --internal cbox-safe$' "$capture")" -eq 1 ]
+  [[ "$output" == *"run "*"--network cbox-safe "* ]]
+}
+
+@test "_cbox_create: safe mode does not start unfiltered when no host-only network can be made" {
+  local capture="$BATS_TMPDIR/create-egress-fail"
+  cd "$BATS_TMPDIR"
+  _CBOX_RUNTIME=apple
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { echo "$*" >> "$capture"; [[ "$1" != "network" ]]; }
+  rm -f "$capture"
+  run _cbox_create "cbox-unit-egress" "safe"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Safe mode needs a host-only network"* ]]
+  run grep -c '^run -d ' "$capture"   # the container itself (not the playwright seeding)
+  [ "$output" = "0" ]
+}
+
+# Runs _cbox_enter for container ebox with every runtime call faked; the exec's
+# arguments and the tunnel start land in $capture.
+_enter_safe() {
+  capture="$BATS_TMPDIR/enter-egress"; rm -f "$capture"
+  cd "$BATS_TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { echo "$*" >> "$capture"; }
+  _cbox_mode() { echo "$MODE"; }
+  _cbox_rt_label() { case "$2" in cbox.egress) echo "$EGRESS" ;; cbox.safe-login) echo "$LOGIN" ;; esac; }
+  _cbox_safe_claude_dir() { echo "safe-claude $*" >> "$capture"; }
+  _cbox_tunnel_start() { echo "tunnel $*" >> "$capture"; }
+  _cbox_tunnel_stop() { :; }
+  _cbox_egress_ready() { echo "ready $*" >> "$capture"; }
+  _cbox_warden_start() { :; }
+  _cbox_warden_end() { :; }
+  _cbox_mcp_relay_start() { :; }
+  _cbox_mcp_relay_stop() { :; }
+  _cbox_flux_install() { :; }
+  _cbox_old_init() { return 1; }
+  _cbox_git_guard_start() { :; }
+  _cbox_git_guard_check() { :; }
+  _cbox_session_start() { :; }
+  _cbox_session_end() { return 1; }
+  _cbox_enter ebox zsh no
+}
+
+@test "_cbox_enter: safe sessions go out through the tunnel's proxy" {
+  MODE=safe EGRESS=allowlist LOGIN=shared
+  run _enter_safe
+  [[ "$output" != *"created before cbox limited"* ]]
+  run cat "$BATS_TMPDIR/enter-egress"
+  [[ "$output" == *"tunnel ebox on"* ]]
+  [[ "$output" == *"-e HTTPS_PROXY=http://127.0.0.1:3128 "* ]]
+  [[ "$output" == *"-e http_proxy=http://127.0.0.1:3128 "* ]]
+  [[ "$output" == *"-e NO_PROXY=localhost,127.0.0.1,::1 "* ]]
+}
+
+@test "_cbox_enter: the agent starts only after the proxy's listener is up" {
+  MODE=safe EGRESS=allowlist LOGIN=shared
+  run _enter_safe
+  run cat "$BATS_TMPDIR/enter-egress"
+  [[ "$output" == *"tunnel ebox on"*"ready ebox"*"exec -it"* ]]
+}
+
+# _cbox_maybe_update for container ubox in $MODE; READY decides whether the
+# proxy comes up. Runtime calls and tunnel starts land in $capture.
+_update() {
+  capture="$BATS_TMPDIR/update-egress"; rm -f "$capture"
+  export TMPDIR="$BATS_TMPDIR/update-tmp"; rm -rf "$TMPDIR"; mkdir -p "$TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { echo "$*" >> "$capture"; }
+  _cbox_tunnel_start() { echo "tunnel $*" >> "$capture"; }
+  _cbox_egress_ready() { [[ "$READY" == 1 ]]; }
+  _cbox_maybe_update ubox "$MODE"
+}
+
+@test "_cbox_maybe_update: in safe mode npm goes through the proxy, started first" {
+  MODE=safe READY=1
+  run _update
+  run cat "$BATS_TMPDIR/update-egress"
+  [[ "$output" == "tunnel ubox on"*"exec --user root -e HTTPS_PROXY=http://127.0.0.1:3128 "*"ubox npm update"* ]]
+}
+
+@test "_cbox_maybe_update: without the proxy a safe container skips the update instead of hanging" {
+  MODE=safe READY=0
+  run _update
+  [[ "$output" == *"Skipped the claude update"* ]]
+  run grep -c "npm update" "$BATS_TMPDIR/update-egress"
+  [ "$output" = "0" ]
+  [ -z "$(ls "$BATS_TMPDIR/update-tmp")" ]   # tried again next session
+}
+
+@test "_cbox_maybe_update: normal mode needs no proxy" {
+  MODE=normal READY=0
+  run _update
+  run cat "$BATS_TMPDIR/update-egress"
+  [ "$output" = "exec --user root ubox npm update -g --no-fund @anthropic-ai/claude-code" ]
+}
+
+@test "_cbox_enter: a safe container from an older cbox gets a reset hint naming what it lacks" {
+  MODE=safe EGRESS="" LOGIN=""
+  run _enter_safe
+  [[ "$output" == *"created by an older cbox"*"whole internet"*"log in again"*"cbox reset"* ]]
+  MODE=safe EGRESS=allowlist LOGIN=""
+  run _enter_safe
+  [[ "$output" == *"log in again"* ]]
+  [[ "$output" != *"whole internet"* ]]
+}
+
+@test "_cbox_enter: safe sessions refresh their Claude folder and send no telemetry" {
+  MODE=safe EGRESS=allowlist LOGIN=shared
+  run _enter_safe
+  run cat "$BATS_TMPDIR/enter-egress"
+  [[ "$output" == *"safe-claude ebox"* ]]
+  [[ "$output" == *"-e CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 "* ]]
+}
+
+@test "_cbox_enter: normal sessions get no proxy" {
+  MODE=normal EGRESS="" LOGIN=""
+  run _enter_safe
+  run cat "$BATS_TMPDIR/enter-egress"
+  [[ "$output" != *"HTTPS_PROXY"* ]]
+  [[ "$output" != *"tunnel ebox on"* ]]
+}
+
+_egress_py() {  # runs python with the warden functions loaded
+  python3 -c "$(_cbox_warden_py | sed '/^if __name__/,$d')
+$1" "${@:2}"
+}
+
+@test "egress: the allow list matches hosts, *.domain and ports; bad entries are skipped" {
+  run _egress_py '
+rules = egress_rules("example.com:8443 *.corp.test 10.0.0.5:22 bad:po:rt")
+for host, port in [("api.anthropic.com", 443), ("api.anthropic.com", 8443), ("API.anthropic.com.", 443),
+                   ("example.com", 8443), ("example.com", 443), ("a.b.corp.test", 443), ("corp.test", 443),
+                   ("x.githubusercontent.com", 443), ("evilgithubusercontent.com", 443), ("10.0.0.5", 22)]:
+    h, _ = split_hostport(host)
+    print(host, port, egress_allowed(rules, h, port))
+'
+  output=$(sed -E 's/^[0-9-]+ [0-9:]+ //' <<<"$output")  # say() puts a time first
+  [ "$output" = "$(cat <<'EOF'
+egress: CBOX_EGRESS_ALLOW entry ignored — bad host in 'bad:po:rt'
+api.anthropic.com 443 True
+api.anthropic.com 8443 False
+API.anthropic.com. 443 True
+example.com 8443 True
+example.com 443 False
+a.b.corp.test 443 True
+corp.test 443 False
+x.githubusercontent.com 443 True
+evilgithubusercontent.com 443 False
+10.0.0.5 22 True
+EOF
+)" ] || { echo "$output"; false; }
+}
+
+@test "egress: through the tunnel, allowed hosts pass, others get 403 with a hint" {
+  TT="$BATS_TMPDIR/egress"; rm -rf "$TT"; mkdir -p "$TT"
+  mkdir -p "$CBOX_WARDEN_DIR"
+  read -r up_port proxy_port < <(python3 -c '
+import socket
+s = [socket.socket() for _ in range(2)]
+[x.bind(("127.0.0.1", 0)) for x in s]
+print(*[x.getsockname()[1] for x in s])')
+  # Upstream: answers each request with its request line.
+  python3 -c '
+import socket, sys, threading
+def one(c):
+    head = b""
+    while b"\r\n\r\n" not in head:
+        b = c.recv(4096)
+        if not b: return c.close()
+        head += b
+    line = head.split(b"\r\n")[0]
+    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(line) + line)
+    c.close()
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", int(sys.argv[1]))); srv.listen(16)
+while True: threading.Thread(target=one, args=(srv.accept()[0],), daemon=True).start()
+' "$up_port" </dev/null >/dev/null 2>&1 &
+  up_pid=$!
+  printf '#!/bin/sh\nshift 3\nexec "$@"\n' > "$TT/rt"; chmod +x "$TT/rt"
+  _cbox_tunnel_py > "$TT/cbox-tunnel"; chmod +x "$TT/cbox-tunnel"
+  CBOX_EGRESS_ALLOW="127.0.0.1:$up_port localhost:$up_port"
+  _cbox_warden_env
+  env "${_CBOX_WARDEN_ENV[@]}" CBOX_TUNNEL_DIR="$TT/sock" CBOX_EGRESS_PORT="$proxy_port" \
+    python3 -c "$(_cbox_warden_py)" tunnel \
+    "$CBOX_WARDEN_DIR" "$TT/rt" ebox "$TT/cbox-tunnel" "$TT/tunnel.pid" "" on </dev/null >"$TT/tunnel.log" 2>&1 &
+  run python3 -c '
+import socket, sys, time
+proxy, up = int(sys.argv[1]), int(sys.argv[2])
+def ask(req, then=b""):
+    c = socket.create_connection(("127.0.0.1", proxy), timeout=10)
+    c.sendall(req)
+    got = b""
+    while (b := c.recv(65536)):
+        got += b
+        if then and got.endswith(b"\r\n\r\n"):
+            c.sendall(then); then = b""
+    return got.decode()
+for _ in range(100):
+    try:
+        socket.create_connection(("127.0.0.1", proxy), timeout=1).close(); break
+    except OSError:
+        time.sleep(0.1)
+r = ask(f"CONNECT 127.0.0.1:{up} HTTP/1.1\r\n\r\n".encode(), b"GET /inside HTTP/1.1\r\nHost: x\r\n\r\n")
+print("connect", r.startswith("HTTP/1.1 200 Connection established") and r.endswith("GET /inside HTTP/1.1"))
+r = ask(f"GET http://127.0.0.1:{up}/plain?q=1 HTTP/1.1\r\nHost: x\r\nProxy-Connection: keep-alive\r\n\r\n".encode())
+print("plain", r.endswith("GET /plain?q=1 HTTP/1.1"))
+r = ask(b"CONNECT example.invalid:443 HTTP/1.1\r\n\r\n")
+print("unlisted", r.startswith("HTTP/1.1 403") and "add example.invalid to CBOX_EGRESS_ALLOW" in r)
+r = ask(f"CONNECT 127.0.0.1:{up + 1 if up < 65535 else up - 1} HTTP/1.1\r\n\r\n".encode())
+print("other port", r.startswith("HTTP/1.1 403"))
+r = ask(f"CONNECT localhost:{up} HTTP/1.1\r\n\r\n".encode())
+print("name to this host", r.startswith("HTTP/1.1 403") and "address of this host" in r)
+' "$proxy_port" "$up_port"
+  result="$output"
+  kill -TERM -- "-$(cat "$TT/tunnel.pid")" 2>/dev/null || true
+  kill "$up_pid" 2>/dev/null || true
+  [ "$result" = "connect True
+plain True
+unlisted True
+other port True
+name to this host True" ] || { echo "$result"; cat "$TT/tunnel.log"; false; }
+  grep -q "egress: blocked example.invalid:443" "$TT/tunnel.log"
+}
+
+# ---------------------------------------------------------------------------
+# safe mode's Claude folder
+# ---------------------------------------------------------------------------
+
+_safe_setup() {
+  rm -rf "$CBOX_CLAUDE_DIR" "$CBOX_DATA_DIR/safe-claude"
+  mkdir -p "$CBOX_CLAUDE_DIR/skills" "$CBOX_CLAUDE_DIR/.git"
+  echo '{}' > "$CBOX_CLAUDE_DIR/settings.json"
+  echo 'old' > "$CBOX_CLAUDE_DIR/.credentials.json"
+  SD="$CBOX_DATA_DIR/safe-claude/sbox"
+}
+
+@test "_cbox_safe_claude_dir: entries link to the read-only shared folder; the login is the shared file" {
+  _safe_setup
+  _cbox_safe_claude_dir sbox
+  [ "$(readlink "$SD/settings.json")" = "/home/claude/.cbox-claude/settings.json" ]
+  [ "$(readlink "$SD/skills")" = "/home/claude/.cbox-claude/skills" ]
+  [ ! -e "$SD/.git" ]
+  [ ! -L "$SD/.git" ]
+  [ "$SD/.credentials.json" -ef "$CBOX_CLAUDE_DIR/.credentials.json" ]
+  # Claude Code refreshes in place: the other side sees it.
+  echo 'refreshed' > "$SD/.credentials.json"
+  [ "$(cat "$CBOX_CLAUDE_DIR/.credentials.json")" = "refreshed" ]
+}
+
+@test "_cbox_safe_claude_dir: follows the shared folder at every run" {
+  _safe_setup
+  _cbox_safe_claude_dir sbox
+  rm -rf "$CBOX_CLAUDE_DIR/skills"
+  mkdir -p "$CBOX_CLAUDE_DIR/agents"
+  rm -f "$SD/settings.json"; echo '{"hooks": "planted"}' > "$SD/settings.json"
+  touch "$SD/own-file"
+  _cbox_safe_claude_dir sbox
+  [ ! -L "$SD/skills" ]
+  [ ! -e "$SD/skills" ]
+  [ "$(readlink "$SD/agents")" = "/home/claude/.cbox-claude/agents" ]
+  [ "$(readlink "$SD/settings.json")" = "/home/claude/.cbox-claude/settings.json" ]
+  [ -f "$SD/own-file" ]
+}
+
+@test "_cbox_safe_claude_dir: a login made in safe mode since replaces the shared one" {
+  _safe_setup
+  _cbox_safe_claude_dir sbox
+  # /logout + /login in the container: a new file, newer than the shared one.
+  rm -f "$SD/.credentials.json"; echo 'new login' > "$SD/.credentials.json"
+  touch -d '2000-01-01' "$CBOX_CLAUDE_DIR/.credentials.json"
+  _cbox_safe_claude_dir sbox
+  [ "$SD/.credentials.json" -ef "$CBOX_CLAUDE_DIR/.credentials.json" ]
+  [ "$(cat "$CBOX_CLAUDE_DIR/.credentials.json")" = "new login" ]
+}
+
+@test "_cbox_safe_claude_dir: a newer login in the shared folder replaces the safe one" {
+  _safe_setup
+  mkdir -p "$SD"; echo 'stale' > "$SD/.credentials.json"; touch -d '2000-01-01' "$SD/.credentials.json"
+  _cbox_safe_claude_dir sbox
+  [ "$SD/.credentials.json" -ef "$CBOX_CLAUDE_DIR/.credentials.json" ]
+  [ "$(cat "$SD/.credentials.json")" = "old" ]
+}
+
+@test "_cbox_safe_claude_dir: the first login, made in safe mode, becomes the shared one" {
+  _safe_setup
+  rm -f "$CBOX_CLAUDE_DIR/.credentials.json"
+  mkdir -p "$SD"; echo 'first' > "$SD/.credentials.json"
+  _cbox_safe_claude_dir sbox
+  [ "$SD/.credentials.json" -ef "$CBOX_CLAUDE_DIR/.credentials.json" ]
+}
+
+@test "_cbox_create: safe mode mounts the shared Claude folder read-only and its own ~/.claude" {
+  local capture="$BATS_TMPDIR/create-safe-claude"
+  _safe_setup
+  cd "$BATS_TMPDIR"
+  _CBOX_RUNTIME=docker
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  rm -f "$capture"; _cbox_create "sbox" "safe"
+  run cat "$capture"
+  [[ "$output" == *"$CBOX_CLAUDE_DIR:/home/claude/.cbox-claude:ro"* ]]
+  [[ "$output" == *"$CBOX_DATA_DIR/safe-claude/sbox:/home/claude/.claude"* ]]
+  [[ "$output" == *"cbox.safe-login=shared"* ]]
+  [[ "$output" != *"$CBOX_CLAUDE_DIR:/home/claude/.claude"* ]]
+  [ "$CBOX_DATA_DIR/safe-claude/sbox/.credentials.json" -ef "$CBOX_CLAUDE_DIR/.credentials.json" ]
+}
+
+# ---------------------------------------------------------------------------
+# cbox shell
+# ---------------------------------------------------------------------------
+
+@test "_cbox_ensure existing: joins a container in its own mode, creates a normal one otherwise" {
+  _CBOX_RUNTIME=docker
+  _cbox_running() { return 0; }
+  _cbox_create() { echo "create $*"; }
+  _cbox_exists() { return 0; }
+  _cbox_mode() { echo safe; }
+  run _cbox_ensure box existing
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  _cbox_exists() { return 1; }
+  run _cbox_ensure box existing
+  [ "$output" = "create box normal" ]
+}
+
+@test "cbox shell: opens zsh in an existing safe container" {
+  cd "$BATS_TMPDIR"
+  _cbox_ensure() { echo "ensure $*"; }
+  _cbox_enter() { echo "enter $*"; }
+  run cbox shell
+  [[ "$output" == *"ensure "*" existing"*"enter "*" zsh"* ]]
+}

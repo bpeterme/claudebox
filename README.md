@@ -92,7 +92,7 @@ cbox oc safe   # opencode in safe mode
 
 ### Safe mode (`cbox safe`, `cbox oc safe`)
 - All Linux capabilities dropped (`--cap-drop=ALL`)
-- No privilege escalation (`--security-opt no-new-privileges`; Docker only — Apple's runtime has no such option, so `sudo` works inside its containers)
+- No privilege escalation: `sudo` cannot switch to root without capabilities (Docker also sets `--security-opt no-new-privileges`)
 - 4 GB memory limit, 2 CPU cores, 512 max PIDs (PID limit: Docker only)
 - Agent config read-only, except the login: safe and normal containers share one login, and a refresh in either keeps it valid for both. Each safe container has its own `~/.claude` (in `$CBOX_DATA_DIR/safe-claude/<name>`) whose entries link to the shared folder; its `.credentials.json` is the shared file itself (a hard link). A safe container can therefore change the shared login, but not your settings, hooks or skills
 - Claude Code's telemetry and error reports are off (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`)
@@ -113,7 +113,7 @@ Add more in `cbox.env`; they apply from the next session:
 CBOX_EGRESS_ALLOW="openrouter.ai *.example.com registry.example.com:8443"
 ```
 
-An entry without a port allows ports 443 and 80. `*.example.com` allows every subdomain, but not `example.com` itself. A blocked request gets `403` with a note naming the host and the setting; blocked hosts are also logged in `~/.local/share/claudebox/.tunnel-<name>.log`.
+An entry without a port allows ports 443 and 80. `*.example.com` allows every subdomain, but not `example.com` itself. A blocked request gets `403`; for plain http it carries a note naming the host and the setting, while https clients only report it, e.g. curl's `CONNECT tunnel failed, response 403`. Blocked hosts are also logged in `~/.local/share/claudebox/.tunnel-<name>.log`.
 
 Limits:
 

@@ -22,6 +22,7 @@ setup() {
 }
 
 teardown() {
+  _cbox_tunnel_stop "$TEST_NAME" 2>/dev/null || true
   docker rm -f "$TEST_NAME" 2>/dev/null || true
   # $BATS_TMPDIR/claude is shared with unit.bats: drop the symlinks the
   # tests above create there, or later runs trip over them.
@@ -168,4 +169,42 @@ _mounts_rw() {
   _cbox_generate_claude_json "$TEST_NAME"
   run python3 -c "import json,sys; d=json.load(open('$f')); sys.exit(0 if d.get('oauthToken')=='tok_abc' else 1)"
   [ "$status" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# safe mode — outbound traffic
+# ---------------------------------------------------------------------------
+
+# Fetches a URL in the container with Python (the tunnel needs python3 anyway)
+# and prints the HTTP status, or the error.
+_fetch() {
+  docker exec "${@:2}" "$TEST_NAME" python3 -c '
+import sys, urllib.request, urllib.error
+try:
+    print(urllib.request.urlopen(sys.argv[1], timeout=20).status)
+except urllib.error.HTTPError as e:
+    print(e.code)
+except Exception as e:
+    print(type(e).__name__, e)
+' "$1"
+}
+
+@test "safe container reaches only allowed hosts, and only through the egress proxy" {
+  export CBOX_IMAGE="python:3.12-alpine"
+  _cbox_create "$TEST_NAME" "safe"
+  # No network of its own.
+  run _fetch "https://pypi.org/simple/"
+  [[ "$output" != "200" ]]
+  _cbox_tunnel_start "$TEST_NAME" on
+  local proxy="http://127.0.0.1:$_CBOX_EGRESS_PORT"
+  for _ in $(seq 50); do
+    docker exec "$TEST_NAME" python3 -c "import socket; socket.create_connection(('127.0.0.1', $_CBOX_EGRESS_PORT), 1)" \
+      2>/dev/null && break
+    sleep 0.2
+  done
+  run _fetch "https://pypi.org/simple/" -e "HTTPS_PROXY=$proxy"
+  [ "$output" = "200" ]
+  run _fetch "https://example.com/" -e "HTTPS_PROXY=$proxy"
+  [[ "$output" == *"403"* ]]
+  grep -q "egress: blocked example.com:443" "$CBOX_DATA_DIR/.tunnel-$TEST_NAME.log"
 }

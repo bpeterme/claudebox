@@ -114,6 +114,9 @@ _CBOX_MCP_HINT_SECONDS=25
 # the warden python has the same folder as TUNNEL_DIR.
 _CBOX_TUNNEL="/home/claude/.local/bin/cbox-tunnel"
 _CBOX_TUNNEL_DIR="/tmp/cbox-tunnel"
+# Safe mode's proxy port on the container's 127.0.0.1, served through the
+# tunnel; the warden python has the same port as EGRESS_PORT.
+_CBOX_EGRESS_PORT=3128
 # Extra opencode config cbox writes in the container (OPENCODE_CONFIG): host MCP
 # servers and warden routes, merged over the user's own opencode.json.
 _CBOX_OPENCODE_CONFIG="/home/claude/.cache/cbox/opencode.json"
@@ -295,8 +298,23 @@ _cbox_force_update() {
     npm update -g --no-fund "$agent_pkg"
 }
 
-_cbox_create_network() {
-  $_CBOX_CMD network create cbox-bridge >/dev/null 2>&1 || true
+# Prints the network for safe containers, which have no way out of their own:
+# Docker gives them none, Apple's runtime (a VM needs one) a host-only one.
+# They reach the internet only through the tunnel's egress proxy. Without a
+# host-only network safe mode does not start, rather than start unfiltered.
+_cbox_safe_network() {
+  if [[ "$_CBOX_RUNTIME" != "apple" ]]; then
+    echo "none"
+    return 0
+  fi
+  if ! $_CBOX_CMD network inspect cbox-safe >/dev/null 2>&1 &&
+     ! $_CBOX_CMD network create --internal cbox-safe >/dev/null 2>&1; then
+    echo "✖ Safe mode needs a host-only network, and this version of Apple's container" >&2
+    echo "  tool cannot create one (container network create --internal)." >&2
+    echo "  Update it from https://github.com/apple/container/releases, then try again." >&2
+    return 1
+  fi
+  echo "cbox-safe"
 }
 
 # Resolves a path through symlink chain (up to 10 levels), returning the real path.
@@ -1243,8 +1261,10 @@ _cbox_mcp_status() {
 #                   (in container)                      │ one `container exec -i`,
 #                                                       │ every connection multiplexed
 #   host: tunnel (warden python) ◀──────────────────────┘
-#         ├─ ssh:   filter ─▶ warden's own ssh-agent (list + sign granted keys only)
-#         └─ pulse: PulseAudio's private unix socket
+#         ├─ ssh:    filter ─▶ warden's own ssh-agent (list + sign granted keys only)
+#         ├─ pulse:  PulseAudio's private unix socket
+#         └─ egress: safe mode's http(s) proxy ─▶ allowed hosts only
+#                    (in the container: 127.0.0.1:3128, its only way out)
 #
 # Starting an exec costs about a second, so one is kept open per container and
 # connections share it. The host decides per connection: a channel the
@@ -1434,9 +1454,10 @@ _cbox_tunnel_py() {
   echo '# cbox-tunnel — installed by cbox at session start; local edits are overwritten.'
   echo '#   serve NAME=SOCKET ...  run by the host over `container exec -i`: clients of'
   echo '#                          SOCKET reach the host service NAME through this exec'
+  echo '#                          (SOCKET is a unix socket path, or tcp:ADDR:PORT)'
   _cbox_tunnel_mux_py
   cat <<'PYEOF'
-import sys
+import sys, time
 
 
 def accept_loop(mux, srv, name):
@@ -1448,11 +1469,33 @@ def accept_loop(mux, srv, name):
         mux.add(conn, channel=name)
 
 
+def listen_tcp(addr):
+    """Listens on host:port. A tunnel being replaced may still hold the port
+    for a moment, so binding is retried briefly."""
+    host, port = addr.rsplit(":", 1)
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    for attempt in range(25):
+        try:
+            srv.bind((host, int(port)))
+            break
+        except OSError:
+            if attempt == 24:
+                raise
+            time.sleep(0.2)
+    srv.listen(64)
+    return srv
+
+
 def serve(specs):
     mux = Mux(0, 1)
     bound = []
     for spec in specs:
         name, path = spec.split("=", 1)
+        if path.startswith("tcp:"):
+            srv = listen_tcp(path[4:])
+            threading.Thread(target=accept_loop, args=(mux, srv, name), daemon=True).start()
+            continue
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         try:
             os.unlink(path)  # left by an earlier tunnel
@@ -1495,20 +1538,22 @@ _cbox_tunnel_pid() {
 }
 
 # Identifies the code at both ends: a tunnel started by another cbox version is
-# replaced, so host and container always speak the same frames.
+# replaced, so host and container always speak the same frames. A changed
+# egress allow list replaces it too.
 _cbox_tunnel_id() {
-  { _cbox_warden_py; _cbox_tunnel_py; } | cksum | cut -d' ' -f1
+  { _cbox_warden_py; _cbox_tunnel_py; echo "$1:${CBOX_EGRESS_ALLOW:-}"; } | cksum | cut -d' ' -f1
 }
 
 # Installs the container side and starts the host side for the container,
 # unless it already runs. Failures are reported, never fatal.
+# egress=on: also serve safe mode's proxy (see "egress" in the warden python).
 _cbox_tunnel_start() {
-  local name="$1"
+  local name="$1" egress="${2:-}"
   local pidfile="$CBOX_DATA_DIR/.tunnel-$name.pid"
   local idfile="$CBOX_DATA_DIR/.tunnel-$name.id"
   local logfile="$CBOX_DATA_DIR/.tunnel-$name.log"
   local id _i
-  id=$(_cbox_tunnel_id)
+  id=$(_cbox_tunnel_id "$egress")
   if _cbox_tunnel_pid "$name" >/dev/null; then
     [[ "$(cat "$idfile" 2>/dev/null)" == "$id" ]] && return 0
     _cbox_tunnel_stop "$name"
@@ -1519,7 +1564,7 @@ _cbox_tunnel_start() {
   if ! _cbox_tunnel_py | $_CBOX_CMD exec -i "$name" sh -c \
       'mkdir -p "${1%/*}" && cat > "$1.tmp" && chmod 755 "$1.tmp" && mv "$1.tmp" "$1"' \
       sh "$_CBOX_TUNNEL" >/dev/null 2>&1; then
-    echo "⚠  Could not install the tunnel in '$name' — ssh agent and audio unavailable this session"
+    echo "⚠  Could not install the tunnel in '$name' — ssh agent, audio and safe mode's internet access unavailable this session"
     return 0
   fi
 
@@ -1529,7 +1574,7 @@ _cbox_tunnel_start() {
   # Subshell: no job-control noise; the tunnel detaches into its own session.
   ( env "${_CBOX_WARDEN_ENV[@]}" python3 -c "$(_cbox_warden_py)" tunnel \
       "$CBOX_WARDEN_DIR" "$_CBOX_CMD" "$name" "$_CBOX_TUNNEL" "$pidfile" "$(_cbox_audio_socket)" \
-      </dev/null >"$logfile" 2>&1 & )
+      "$egress" </dev/null >"$logfile" 2>&1 & )
   for ((_i = 0; _i < 50; _i++)); do
     [[ -f "$pidfile" ]] && break
     sleep 0.2
@@ -1577,7 +1622,7 @@ _cbox_tunnel_stop() {
 _cbox_warden_py() {
   _cbox_tunnel_mux_py
   cat <<'PYEOF'
-import base64, configparser, datetime, hashlib, hmac, http.client, http.server, json, os, re, secrets, shutil, signal, socket, socketserver, struct, subprocess, sys, threading, time
+import base64, configparser, datetime, hashlib, hmac, http.client, http.server, ipaddress, json, os, re, secrets, shutil, signal, socket, socketserver, struct, subprocess, sys, threading, time
 from fnmatch import fnmatchcase
 from urllib.parse import urlsplit, unquote, parse_qsl, quote, urlencode
 
@@ -1592,6 +1637,7 @@ PREFIX_RE = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$")
 PROJECT_KEYS = {"prefix"}  # settings a project's .warden may add to a resource; approval covers them
 AWS_CONFIG = "/home/claude/.aws/warden-config"  # container path; written by cbox at session start
 TUNNEL_DIR = os.environ.get("CBOX_TUNNEL_DIR", "/tmp/cbox-tunnel")  # container path; = _CBOX_TUNNEL_DIR
+EGRESS_PORT = int(os.environ.get("CBOX_EGRESS_PORT", "3128"))  # on the container's 127.0.0.1; = _CBOX_EGRESS_PORT
 HOST_RE = re.compile(r"^[A-Za-z0-9*?][A-Za-z0-9*?.-]{0,252}$")
 IPV6_RE = re.compile(r"^[0-9A-Fa-f:]+$")
 SSH_FAILURE, SSH_LIST, SSH_LIST_ANSWER, SSH_SIGN, SSH_EXTENSION = 5, 11, 12, 13, 27
@@ -2591,8 +2637,191 @@ def say(text):
     print(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} {text}", flush=True)
 
 
-def tunnel_opener(d, box, pulse):
+# --- egress: safe mode's only way out -------------------------------------------
+#
+# A safe container has no network of its own. Its HTTP(S)_PROXY is the tunnel's
+# egress channel, served here: https (CONNECT) and plain http requests go out
+# only to hosts on the allow list — the defaults below plus CBOX_EGRESS_ALLOW.
+# The list lives on the host, so nothing in the container can widen it.
+
+EGRESS_DEFAULT = (
+    # the agents and their sign-in
+    "api.anthropic.com statsig.anthropic.com claude.ai console.anthropic.com platform.claude.com"
+    " opencode.ai models.dev"
+    # packages, and git over https
+    " registry.npmjs.org pypi.org files.pythonhosted.org"
+    " github.com api.github.com codeload.github.com *.githubusercontent.com"
+)
+EGRESS_HEAD_MAX = 64 * 1024
+EGRESS_REASONS = {400: "Bad Request", 403: "Forbidden", 502: "Bad Gateway"}
+
+
+class EgressRefused(Exception):
+    pass
+
+
+def split_hostport(s, default=None):
+    """'host', 'host:port' or '[v6]:port' → (lowercase host, port or default)."""
+    if s.startswith("["):
+        host, _, rest = s[1:].partition("]")
+        port = rest[1:] if rest.startswith(":") else ""
+    elif s.count(":") == 1:
+        host, port = s.split(":")
+    else:
+        host, port = s, ""
+    if port and not port.isdigit():
+        raise ValueError(f"bad port in {s!r}")
+    host = host.lower().rstrip(".")
+    if not host or not (HOST_RE.match(host) or IPV6_RE.match(host)):
+        raise ValueError(f"bad host in {s!r}")
+    return host, int(port) if port else default
+
+
+def is_ip(host):
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def egress_rules(extra):
+    """(host or *.domain, port) pairs; port None means 80 and 443."""
+    rules = []
+    for entry in f"{EGRESS_DEFAULT} {extra or ''}".split():
+        try:
+            rules.append(split_hostport(entry))
+        except ValueError as e:
+            say(f"egress: CBOX_EGRESS_ALLOW entry ignored — {e}")
+    return rules
+
+
+def egress_allowed(rules, host, port):
+    for pattern, p in rules:
+        if (port in (80, 443) if p is None else port == p) and (
+                host == pattern or (pattern.startswith("*.") and host.endswith(pattern[1:]))):
+            return True
+    return False
+
+
+def egress_connect(host, port):
+    """Connects to host:port. A name must not lead back to this host or a
+    link-local address (its own services, cloud metadata); an IP listed as
+    such may."""
+    refused = None
+    for fam, typ, proto, _, addr in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+        ip = ipaddress.ip_address(addr[0].split("%")[0])
+        if not is_ip(host) and (ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast):
+            refused = EgressRefused(f"{host} leads to {ip}, an address of this host or its link")
+            continue
+        s = socket.socket(fam, typ, proto)
+        s.settimeout(15)
+        try:
+            s.connect(addr)
+        except OSError as e:
+            s.close()
+            refused = refused or e
+            continue
+        s.settimeout(None)
+        return s
+    raise refused or OSError("no address")
+
+
+def egress_answer(client, code, text):
+    body = f"cbox safe mode: {text}\n".encode()
+    client.sendall(f"HTTP/1.1 {code} {EGRESS_REASONS[code]}\r\nContent-Type: text/plain\r\n"
+                   f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
+
+
+def egress_splice(a, b):
+    """Copies both ways until both sides are done."""
+    def pump(src, dst):
+        try:
+            while True:
+                data = src.recv(CHUNK)
+                if not data:
+                    break
+                dst.sendall(data)
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            for s in (a, b):
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+    t = threading.Thread(target=pump, args=(b, a), daemon=True)
+    t.start()
+    pump(a, b)
+    t.join()
+
+
+def egress_serve(client, rules):
+    """Serves one proxy connection from the container."""
+    up = None
+    try:
+        head = b""
+        while b"\r\n\r\n" not in head:
+            data = client.recv(CHUNK)
+            if not data:
+                return
+            head += data
+            if len(head) > EGRESS_HEAD_MAX:
+                return egress_answer(client, 400, "request head too large")
+        head, rest = head.split(b"\r\n\r\n", 1)
+        lines = head.decode("latin-1").split("\r\n")
+        try:
+            method, target, version = lines[0].split(" ")
+            if method == "CONNECT":
+                host, port = split_hostport(target)
+                if port is None:
+                    raise ValueError("CONNECT needs host:port")
+            else:
+                u = urlsplit(target)
+                if u.scheme != "http" or not u.hostname:
+                    raise ValueError("only CONNECT and http:// URLs go through this proxy")
+                host, port = split_hostport(u.hostname, u.port or 80)
+            if "*" in host or "?" in host:
+                raise ValueError(f"bad host {host!r}")
+        except ValueError as e:
+            return egress_answer(client, 400, str(e))
+        if not egress_allowed(rules, host, port):
+            say(f"egress: blocked {host}:{port}")
+            shown = host if port in (80, 443) else f"{host}:{port}"
+            return egress_answer(client, 403, f"{host}:{port} is not on the allow list. To allow it, add "
+                                 f"{shown} to CBOX_EGRESS_ALLOW in cbox.env on the host; it applies "
+                                 "from the next cbox session.")
+        try:
+            up = egress_connect(host, port)
+        except EgressRefused as e:
+            say(f"egress: refused {host}:{port} — {e}")
+            return egress_answer(client, 403, str(e))
+        except OSError as e:
+            return egress_answer(client, 502, f"cannot reach {host}:{port}: {e}")
+        if method == "CONNECT":
+            client.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        else:
+            path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+            kept = [line for line in lines[1:] if line.split(":", 1)[0].strip().lower()
+                    not in ("connection", "proxy-connection", "keep-alive", "proxy-authorization")]
+            up.sendall("\r\n".join([f"{method} {path} {version}", *kept, "Connection: close", "", ""])
+                       .encode("latin-1"))
+        if rest:
+            up.sendall(rest)
+        egress_splice(client, up)
+    except OSError:
+        pass
+    finally:
+        for s in (client, up):
+            if s:
+                s.close()
+
+
+def tunnel_opener(d, box, pulse, egress=None):
     def opener(name):
+        if name == "egress" and egress is not None:
+            ours, theirs = socket.socketpair()
+            threading.Thread(target=egress_serve, args=(theirs, egress), daemon=True).start()
+            return ours
         if name == "pulse" and pulse and os.path.exists(pulse):
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.connect(pulse)
@@ -2615,7 +2844,7 @@ def tunnel_opener(d, box, pulse):
     return opener
 
 
-def cmd_tunnel(d, runtime, box, script, pidfile, pulse=""):
+def cmd_tunnel(d, runtime, box, script, pidfile, pulse="", egress=""):
     try:
         os.setsid()  # own process group, so stop can kill every child at once
     except OSError:
@@ -2636,6 +2865,10 @@ def cmd_tunnel(d, runtime, box, script, pidfile, pulse=""):
         f.write(me)
     say(f"tunnel for '{box}' started (pid {os.getpid()})")
     specs = [f"ssh={TUNNEL_DIR}/ssh-agent.sock", f"pulse={TUNNEL_DIR}/pulse.sock"]
+    rules = None
+    if egress == "on":
+        rules = egress_rules(os.environ.get("CBOX_EGRESS_ALLOW", ""))
+        specs.append(f"egress=tcp:127.0.0.1:{EGRESS_PORT}")
     fails = 0
     while True:
         try:
@@ -2645,7 +2878,7 @@ def cmd_tunnel(d, runtime, box, script, pidfile, pulse=""):
             say(f"cannot run {runtime}: {e}")
             time.sleep(30)
             continue
-        mux = Mux(ex.stdout.fileno(), ex.stdin.fileno(), opener=tunnel_opener(d, box, pulse))
+        mux = Mux(ex.stdout.fileno(), ex.stdin.fileno(), opener=tunnel_opener(d, box, pulse, rules))
         mux.run()
         for f in (ex.stdin, ex.stdout):
             try:
@@ -2838,6 +3071,7 @@ _cbox_warden_env() {
     "CBOX_CLAUDE_DIR=$CBOX_CLAUDE_DIR" "CBOX_HOST_CONFIG_DIR=$CBOX_HOST_CONFIG_DIR"
     "CBOX_SHARE_DIR=$CBOX_SHARE_DIR" "CBOX_PLAYWRIGHT_DIR=$CBOX_PLAYWRIGHT_DIR"
     "CBOX_SSH_DIR=${CBOX_SSH_DIR:-}" "CBOX_ZSHRC=${CBOX_ZSHRC:-}"
+    "CBOX_EGRESS_ALLOW=${CBOX_EGRESS_ALLOW:-}"
     "CBOX_SHARED_CONFIG_PATHS=$(_cbox_shared_config_names | sed "s|^|${XDG_CONFIG_HOME:-$HOME/.config}/|")"
   )
 }
@@ -3280,9 +3514,11 @@ _cbox_create() {
   fi
 
   if [[ "$mode" == "safe" ]]; then
-    _cbox_create_network
+    local _net
+    _net=$(_cbox_safe_network) || return 1
     args+=(
-      --network cbox-bridge
+      --network "$_net"
+      --label "cbox.egress=allowlist"
       --cap-drop=ALL
       --cpus=2
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude:ro"
@@ -3685,7 +3921,20 @@ _cbox_enter() {
     _run="mkdir -p -m 700 $_CBOX_TUNNEL_DIR && print -l 'enable-shm = no' 'enable-memfd = no' >| $_CBOX_TUNNEL_DIR/pulse-client.conf; $_run"
   fi
   while IFS= read -r _g; do _exec_args+=(-e "$_g"); done < <(_cbox_git_identity)
-  if [[ "$mode" != "safe" ]]; then
+  local _egress=""
+  if [[ "$mode" == "safe" ]]; then
+    # The container's only way out: the tunnel's proxy, which lets through
+    # allowed hosts only (CBOX_EGRESS_ALLOW).
+    _egress=on _tunnel=1
+    local _proxy="http://127.0.0.1:$_CBOX_EGRESS_PORT" _p
+    for _p in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy; do _exec_args+=(-e "$_p=$_proxy"); done
+    _exec_args+=(-e "NO_PROXY=localhost,127.0.0.1,::1" -e "no_proxy=localhost,127.0.0.1,::1"
+                 -e "NODE_USE_ENV_PROXY=1")
+    if [[ "$(_cbox_rt_label "$name" cbox.egress)" != "allowlist" ]]; then
+      echo "⚠  This safe container was created before cbox limited its outbound traffic:"
+      echo "   it can still reach the whole internet. Recreate it: cbox reset"
+    fi
+  else
     local _w_env
     while IFS= read -r _w_env; do
       case "$_w_env" in
@@ -3720,7 +3969,7 @@ _cbox_enter() {
     fi
   fi
 
-  (( _tunnel )) && _cbox_tunnel_start "$name"
+  (( _tunnel )) && _cbox_tunnel_start "$name" "$_egress"
 
   _cbox_flux_install "$name"
 

@@ -2,7 +2,7 @@
 
 A shell utility that runs AI coding agents ([Claude Code](https://github.com/anthropics/claude-code) or [opencode](https://github.com/opencode-ai/opencode)) inside an isolated container, scoped to your current project directory. Uses [Apple Container](https://github.com/apple/container) on macOS and Docker on Linux.
 
-Each project gets its own container, named after the directory. Two modes are available: **normal** (full access to your config and SSH keys) and **safe** (sandboxed with dropped capabilities, memory/CPU limits, and an isolated network).
+Each project gets its own container, named after the directory. Two modes are available: **normal** (full access to your config and SSH keys) and **safe** (sandboxed with dropped capabilities, memory/CPU limits, and internet access only to hosts you allow).
 
 ## Prerequisites
 
@@ -92,10 +92,34 @@ cbox oc safe   # opencode in safe mode
 
 ### Safe mode (`cbox safe`, `cbox oc safe`)
 - All Linux capabilities dropped (`--cap-drop=ALL`)
-- No privilege escalation (`--security-opt no-new-privileges`)
-- 4 GB memory limit, 2 CPU cores, 512 max PIDs
-- Isolated network bridge (`cbox-bridge`)
+- No privilege escalation (`--security-opt no-new-privileges`; Docker only — Apple's runtime has no such option, so `sudo` works inside its containers)
+- 4 GB memory limit, 2 CPU cores, 512 max PIDs (PID limit: Docker only)
 - Agent config mounted read-only
+- Internet access only to allowed hosts (see below)
+
+#### Outbound traffic in safe mode
+
+A safe container has no network of its own: Docker gives it none, and Apple's runtime puts it on a host-only network (`cbox-safe`). Its only way out is a proxy on your Mac, reached through the tunnel (not the network) at `127.0.0.1:3128` inside the container. The session sets `HTTPS_PROXY` and `HTTP_PROXY` to it. The proxy lets through only the hosts on its allow list, so code that a prompt talked the agent into running cannot send your project anywhere else. The list lives on your Mac, so nothing in the container can change it.
+
+Allowed by default:
+
+- the agents and their sign-in: `api.anthropic.com`, `statsig.anthropic.com`, `claude.ai`, `console.anthropic.com`, `platform.claude.com`, `opencode.ai`, `models.dev`
+- packages and git over https: `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`, `github.com`, `api.github.com`, `codeload.github.com`, `*.githubusercontent.com`
+
+Add more in `cbox.env`; they apply from the next session:
+
+```bash
+CBOX_EGRESS_ALLOW="openrouter.ai *.example.com registry.example.com:8443"
+```
+
+An entry without a port allows ports 443 and 80. `*.example.com` allows every subdomain, but not `example.com` itself. A blocked request gets `403` with a note naming the host and the setting; blocked hosts are also logged in `~/.local/share/claudebox/.tunnel-<name>.log`.
+
+Limits:
+
+- Only programs that use the proxy settings get out: curl, git over https, npm, pip, uv, Claude Code, opencode. git over ssh does not work in safe mode.
+- A host name never leads to your Mac itself or a link-local address. To reach a server on your local network, list its IP address.
+- On Apple's runtime the host-only network still reaches services on your Mac that listen on all interfaces.
+- Safe containers created before this filtering existed can still reach everything; cbox says so at session start. Recreate one with `cbox reset`.
 
 ### Git safety (both modes)
 
@@ -130,6 +154,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_WARDEN_DIR` | `$CBOX_DATA_DIR/warden` | warden resources, approvals and session tokens — host only, never mounted |
 | `CBOX_WARDEN_PORT` | `47100` | Port of the warden broker, bound only to the container-facing host address |
 | `CBOX_MEMORY` | `4g` | Memory of each container (both modes). Applies to newly created containers: `cbox reset` |
+| `CBOX_EGRESS_ALLOW` | *(unset)* | Hosts a safe container may reach besides the defaults, e.g. `"openrouter.ai *.example.com host:8443"` (see [Outbound traffic in safe mode](#outbound-traffic-in-safe-mode)). Applies from the next session |
 | `CBOX_PROTECT_GIT` | `1` | Mount the project's `.git/config` and `.git/hooks` read-only (see [Git safety](#git-safety-both-modes)); `0` = writable. Applies to newly created containers: `cbox reset` |
 | `CBOX_WARDEN_HOST` | `192.168.64.1` (Apple) / `docker0` IP | Host address containers reach the broker on |
 | `CBOX_WARDEN_SECRET_CMD` | *(unset)* | Hosts without the macOS Keychain: command that prints the secret for an item name |
@@ -438,7 +463,7 @@ If `pactl` cannot connect, check on the host that PulseAudio runs (`pulseaudio -
 - `cbox keepalive` leaves the container running for 10 minutes (useful for follow-up `exec` calls)
 - Log in once inside a container (`/login`); the login is kept in `CBOX_CLAUDE_DIR` and shared by all containers
 - If [claudedot](https://github.com/bpeterme/claudedot) is installed, Claude config and history sync runs automatically at session start and exit (Claude sessions only)
-- Host services the container needs as sockets — warden's ssh agent and PulseAudio — reach it through one long-lived `exec` per container (a tunnel; log: `~/.local/share/claudebox/.tunnel-<name>.log`). Neither side opens a network port for them
+- Host services the container needs as sockets — warden's ssh agent, PulseAudio and safe mode's proxy — reach it through one long-lived `exec` per container (a tunnel; log: `~/.local/share/claudebox/.tunnel-<name>.log`). Neither side opens a network port for them
 - If [flux](https://github.com/bpeterme/flux) is installed, the container runs the host's flux version, and flux projects reach their storage through warden: `dvc pull` and a plain `git push` (flux's pre-push hook uploads the data first) work inside the container
 
 ## Companion Tools

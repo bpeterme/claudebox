@@ -3124,8 +3124,8 @@ _wa_text() {
   [[ "$members" == *"Robots Lab: 4 members"* ]]
   [ "$(grep -c '\[u_' <<<"$members")" = "4" ]
   [[ "$members" == *"$bob"*"$carol"*"Erin Contact [u_"*"unknown [u_"* ]]
-  # No long digit runs anywhere (the link's own number aside).
-  [ "$(sed 's|https://example.com/p/123456789||' <<<"$out" | grep -cE '[0-9]{8,}')" = "0" ]
+  # No long digit runs anywhere (the link's own number and the random hex pseudonyms aside).
+  [ "$(sed -e 's|https://example.com/p/123456789||' -e 's/u_[0-9a-f]\{10\}//g' <<<"$out" | grep -cE '[0-9]{8,}')" = "0" ]
   # Another resource (another secret): other IDs for the same people.
   cp "$WA/list.json" "$WA/other.json"
   other=$(_wa_serve "$WA/other.json" '{"name":"list_members","arguments":{"chat":"Robots Lab"}}' | _wa_text 2)
@@ -3141,7 +3141,7 @@ _wa_text() {
   out=$(_wa_serve "$WA/list.json" '{"name":"list_chats"}' '{"name":"read_chat","arguments":{"chat":"alice"}}')
   [[ "$(_wa_text 2 <<<"$out")" == *"Alice [u_"*"(chat, 0 members, 1 messages"*"Call [phone number] (group"* ]]
   [[ "$(_wa_text 3 <<<"$out")" == *"Alice [u_"*"]: alice private"* ]]
-  [ "$(grep -cE '[0-9]{8,}' <<<"$out")" = "0" ]
+  [ "$(sed 's/u_[0-9a-f]\{10\}//g' <<<"$out" | grep -cE '[0-9]{8,}')" = "0" ]
 }
 
 @test "warden whatsapp: no chosen chats, nothing to read; a missing database is a clear error" {

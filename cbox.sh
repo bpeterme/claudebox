@@ -2456,7 +2456,12 @@ def wa_pick_numbers(answer, count):
 
 def cmd_whatsapp_pick(d, name, everything=""):
     if not NAME_RE.match(name):
-        err("Usage: cbox warden whatsapp pick <resource> [--all]   (a-z, 0-9, '.', '_' and '-')")
+        err(f"✖ '{wa_clean(name)}' cannot be a resource name: only a-z, 0-9, '.', '_' and '-', "
+            "starting with a letter or digit")
+        hint = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:64].rstrip("-")
+        if hint:
+            err(f"  Try: cbox warden whatsapp pick {hint}")
+        err("  The name is only a label: Claude still sees the chats' own names.")
         sys.exit(1)
     r = load_resources(d, warn=err).get(name)
     if r is None:

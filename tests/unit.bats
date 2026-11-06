@@ -3129,6 +3129,17 @@ _wa_text() {
   [[ "$output" == *"Usage: cbox warden whatsapp pick <resource> [--all]"* ]]
 }
 
+@test "cbox warden whatsapp pick: an invalid name gets a valid one suggested" {
+  rm -rf "$CBOX_WARDEN_DIR"; mkdir -p "$CBOX_WARDEN_DIR"
+  run _cbox_warden_cmd whatsapp pick 'Fake Group_(FG)'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"'Fake Group_(FG)' cannot be a resource name"* ]]
+  [[ "$output" == *"Try: cbox warden whatsapp pick fake-group-fg"* ]]
+  [ ! -e "$CBOX_WARDEN_DIR/resources" ]
+  run _cbox_warden_cmd whatsapp pick '(())'
+  [[ "$output" != *"Try:"* ]]
+}
+
 @test "warden whatsapp: a granted resource gets a relayed MCP server; ending the session removes it" {
   _wa_fixture
   _warden_setup

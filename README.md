@@ -435,9 +435,16 @@ too: `@Anna [u_3f9a1c07be]`); your own messages as `me`. The pseudonym is the
 same for a person in every chat of the resource — whether WhatsApp knows them
 by phone number or account ID — but another resource gives the same person
 another one, so two projects cannot join what they know about someone. It is
-derived with a secret that stays on the host (`$CBOX_WARDEN_DIR/whatsapp/<resource>.key`;
-deleting it changes all pseudonyms). The name is what the person calls
-themselves on WhatsApp, else your address book name, else `unknown`.
+derived with a secret that stays on the host (`$CBOX_WARDEN_DIR/whatsapp/<resource>.key`):
+back it up and never replace it, since a new one changes every pseudonym. The
+name is what the person calls themselves on WhatsApp, else your address book
+name, else `unknown`. When someone changed their number, both accounts keep
+their own pseudonym; `list_members` shows the link as `(previously u_…)`.
+
+**For scripts:** inside the container, `cbox-whatsapp export --out <folder>`
+writes the same chats as JSON files for the project's own code (format and
+exit codes: [docs/whatsapp-export.md](docs/whatsapp-export.md)). The folder
+gets a `.gitignore`, so the messages stay out of git.
 
 **Good to know:**
 

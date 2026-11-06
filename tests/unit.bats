@@ -2986,7 +2986,7 @@ con.executescript("""
 CREATE TABLE ZWACHATSESSION (Z_PK INTEGER PRIMARY KEY, ZSESSIONTYPE INTEGER, ZREMOVED INTEGER,
   ZLASTMESSAGEDATE TIMESTAMP, ZCONTACTJID VARCHAR, ZPARTNERNAME VARCHAR, ZSAVEDINPUT VARCHAR);
 CREATE TABLE ZWAGROUPMEMBER (Z_PK INTEGER PRIMARY KEY, ZISACTIVE INTEGER, ZCHATSESSION INTEGER,
-  ZCONTACTNAME VARCHAR, ZFIRSTNAME VARCHAR, ZMEMBERJID VARCHAR);
+  ZCONTACTNAME VARCHAR, ZFIRSTNAME VARCHAR, ZMEMBERJID VARCHAR, ZISADMIN INTEGER);
 CREATE TABLE ZWAPROFILEPUSHNAME (Z_PK INTEGER PRIMARY KEY, ZJID VARCHAR, ZPUSHNAME VARCHAR);
 CREATE TABLE ZWAMEDIAITEM (Z_PK INTEGER PRIMARY KEY, ZTITLE VARCHAR, ZMEDIALOCALPATH VARCHAR,
   ZMEDIAKEY BLOB, ZLATITUDE FLOAT, ZMETADATA BLOB);
@@ -3002,7 +3002,7 @@ con.executemany("INSERT INTO ZWACHATSESSION VALUES (?, ?, 0, ?, ?, ?, ?)", [
   (5, 1, 815000010, "300@g.us", "Evil\x1b[31mRed‮Group", None),
   (6, 1, 815000090, "600@g.us", "Robots Two", None)])
 profile = "+" + base64.b64encode(pb((1, b"Head of Secret Stuff"), (2, 5))).decode()
-con.executemany("INSERT INTO ZWAGROUPMEMBER VALUES (?, 1, ?, ?, ?, ?)", [
+con.executemany("INSERT INTO ZWAGROUPMEMBER VALUES (?, 1, ?, ?, ?, ?, 0)", [
   (1, 2, "", "+IAE=", "111111@lid"),                       # Bob: push name only
   (2, 2, "", None, "4322222222@s.whatsapp.net"),           # Carol by phone; LID.sqlite links her account
   (3, 3, "Dave", None, "333333@lid"),                      # in the chat that is not shared
@@ -3010,8 +3010,11 @@ con.executemany("INSERT INTO ZWAGROUPMEMBER VALUES (?, 1, ?, ?, ?, ?)", [
   (5, 2, "", None, "555555@lid"),                          # nobody knows a name
   (6, 6, "", None, "222222@lid"),                          # Carol again, by account ID
   (7, 2, "", None, "777777@lid"),                          # Frank, removed later (see below)
-  (8, 2, "", None, "888888@lid")])                         # you (WhatsApp's preferences say so)
+  (8, 2, "", None, "888888@lid"),                          # you (WhatsApp's preferences say so)
+  (9, 6, "", None, "232323@lid")])                         # Carol's account before she changed her number
+con.execute("UPDATE ZWAGROUPMEMBER SET ZISACTIVE = 0 WHERE Z_PK = 9")
 con.execute("UPDATE ZWAGROUPMEMBER SET ZISACTIVE = 0 WHERE Z_PK = 7")
+con.execute("UPDATE ZWAGROUPMEMBER SET ZISADMIN = 1 WHERE Z_PK = 1")  # Bob
 con.execute("INSERT INTO ZWAPROFILEPUSHNAME VALUES (9, '777777@lid', 'Frank')")
 con.executemany("INSERT INTO ZWAPROFILEPUSHNAME VALUES (?, ?, ?)", [(1, "111111@lid", "Bob"), (2, "333333@lid", "Dave"),
   (3, "444444@lid", "IAA="), (4, "555555@lid", "+1\u2219\u2219\u2219\u2219\u2219\u2219\u2219\u221919")])  # a short blob; a hidden number
@@ -3035,6 +3038,8 @@ con.executemany("INSERT INTO ZWAMESSAGE VALUES (?, 2, ?, NULL, 0, 6, ?, NULL, ?,
   (40, 7, 815000085, "111111@lid", "S40", 7),               # Frank was removed by Bob
   (41, 7, 815000084, None, "S41", 15),                      # Frank joined using the link
   (42, None, 815000086, None, "S42", 99)])                  # an event nobody has named yet
+con.execute("INSERT INTO ZWAMESSAGE VALUES (43, 6, 9, NULL, 0, 6, 815000087, NULL, '222222@lid', 'S43', 9)")  # number change
+con.execute("INSERT INTO ZWAMESSAGE VALUES (44, 2, 1, NULL, 0, 10, 815000088, NULL, NULL, 'S44', NULL)")  # not shown
 con.commit()
 import os, plistlib
 os.makedirs(d + "/Library/Preferences")
@@ -3202,6 +3207,20 @@ _wa_text() {
   [ "$(tr ' ' '\n' <<<"$seen" | grep . | sort -u | wc -l | tr -d ' ')" = "10" ]
 }
 
+@test "warden whatsapp: a number change is labelled and linked, never merged" {
+  _wa_fixture
+  echo '{"chats": {"600@g.us": "Robots Two"}}' > "$WA/list.json"
+  out=$(_wa_serve "$WA/list.json" '{"name":"read_chat","arguments":{"chat":"Robots Two"}}' \
+    '{"name":"list_members","arguments":{"chat":"Robots Two"}}')
+  read=$(_wa_text 2 <<<"$out")
+  members=$(_wa_text 3 <<<"$out")
+  old=$(grep '^\[43\] ' <<<"$read" | grep -o 'u_[0-9a-f]*' | head -1)
+  carol=$(grep -o 'Carol \[u_[0-9a-f]*\]' <<<"$read" | head -1 | grep -o 'u_[0-9a-f]*')
+  [ -n "$old" ] && [ -n "$carol" ] && [ "$old" != "$carol" ]
+  [[ "$read" == *"unknown [$old]: [system] changed their number to Carol [$carol]"* ]]
+  [[ "$members" == *"Carol [$carol] (previously $old)"*"Former members (1"*"unknown [$old]"* ]]
+}
+
 @test "cbox warden whatsapp pick: creates the resource, saves the chosen chats privately, cleans names" {
   _wa_fixture
   rm -rf "$CBOX_WARDEN_DIR"; mkdir -p "$CBOX_WARDEN_DIR"
@@ -3266,6 +3285,7 @@ _wa_text() {
   _cbox_warden_python end "$CBOX_WARDEN_DIR" wbox || true
   _warden_teardown
   [ "$mcp" = '{"fake": null}' ]
+  [[ "$output" == *"WARDEN_WHATSAPP=fake"* ]]
   [[ "$relay" == *'"python3"'*'"-I"'*"$CBOX_WARDEN_DIR/whatsapp/server.py"*"$CBOX_WARDEN_DIR/whatsapp/fake.json"* ]]
   [ -s "$CBOX_WARDEN_DIR/whatsapp/server.py" ]
   [[ "$listing" == *"✔ fake"*"WhatsApp, 1 chats, read-only  [this project (approved)]"* ]]
@@ -3314,4 +3334,108 @@ _wa_text() {
   _relay_teardown
   rm -f "$CBOX_WARDEN_DIR/sessions/rbox.mcp"
   [ "$output" = "hi" ]
+}
+
+# The export end to end: project code in the container runs cbox-whatsapp, which
+# reaches the host's WhatsApp server through the MCP relay.
+_wa_export_setup() {
+  _wa_fixture
+  _cbox_whatsapp_server_py > "$WA/server.py"
+  echo '{"chats": {"100@g.us": "Robots Lab", "600@g.us": "Robots Two", "4300000000@s.whatsapp.net": "Alice"}}' > "$WA/wa.json"
+  mkdir -p "$CBOX_WARDEN_DIR/sessions"
+  printf '{"mcpServers": {"wa": {"command": "python3", "args": ["-I", "%s", "%s"]}}}\n' "$WA/server.py" "$WA/wa.json" \
+    > "$CBOX_WARDEN_DIR/sessions/rbox.mcp"
+  _relay_setup
+  CLI="${_CBOX_MCP_RELAY%/*}/cbox-whatsapp"
+}
+
+_wa_export_teardown() {
+  _relay_teardown
+  rm -f "$CBOX_WARDEN_DIR/sessions/rbox.mcp"
+}
+
+@test "cbox-whatsapp export: writes chats, members, messages and identities; twice gives the same bytes" {
+  _wa_export_setup
+  run env WARDEN_WHATSAPP=wa python3 "$CLI" export --out "$WA/out"
+  first="$output"; first_status=$status
+  sums=$(cd "$WA/out" && find . -type f | sort | xargs cksum)
+  second=$(WARDEN_WHATSAPP=wa python3 "$CLI" export --out "$WA/out")
+  again=$(cd "$WA/out" && find . -type f | sort | xargs cksum)
+  # A chat no longer shared: its files go.
+  echo '{"chats": {"100@g.us": "Robots Lab", "4300000000@s.whatsapp.net": "Alice"}}' > "$WA/wa.json"
+  cp -r "$WA/out" "$WA/stale"
+  WARDEN_WHATSAPP=wa python3 "$CLI" export --out "$WA/stale" >/dev/null
+  _wa_export_teardown
+  echo "$first"
+  [ "$first_status" -eq 0 ]
+  [[ "$first" == *"3 chats, "*" messages in $WA/out"* ]]
+  [[ "$second" == *"(0 file(s) changed)"* ]]
+  [ "$sums" = "$again" ]
+  [ "$(cat "$WA/out/.gitignore" | grep -c '^\*$')" = "1" ]
+  [ "$(ls "$WA/out/members" | wc -l | tr -d ' ')" = "3" ]
+  [ "$(ls "$WA/stale/messages" | wc -l | tr -d ' ')" = "2" ]
+  python3 - "$WA/out" <<'PY'
+import json, os, re, sys
+out = sys.argv[1]
+manifest = json.load(open(f"{out}/manifest.json"))
+assert manifest["schema_version"] == 1 and manifest["resource"] == "wa", manifest
+chats = {c["name"]: c for c in json.load(open(f"{out}/chats.json"))}
+lab, alice = chats["Robots Lab"], chats["Alice"]
+assert lab["kind"] == "group" and alice["kind"] == "direct" and lab["community_id"] is None, chats
+assert re.fullmatch(r"c_[0-9a-f]{10}", lab["chat_id"]) and lab["member_count"] == 5, lab
+for c in chats.values():
+    lines = open(f"{out}/messages/{c['chat_id']}.jsonl").read().splitlines()
+    assert len(lines) == c["message_count"], c
+msgs = {m["id"]: m for m in map(json.loads, open(f"{out}/messages/{lab['chat_id']}.jsonl"))}
+assert 44 not in msgs, "type 10 is left out"
+assert list(msgs) == sorted(msgs, key=lambda i: (msgs[i]["ts"], i)), "date order"
+m10 = msgs[10]
+assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d", m10["ts"]), m10["ts"]
+assert m10["sender"]["name"] == "Bob" and m10["type"] == "text", m10
+assert [p["name"] for p in m10["mentions"]] == ["Carol"] and m10["links"] == ["https://example.com/p/123456789"], m10
+assert msgs[11]["sender"] == {"id": "me", "name": "me"} and msgs[11]["reply_to"] == 10, msgs[11]
+assert msgs[13]["type"] == "image" and msgs[13]["attachment"] == {"caption": "a robot photo"}, msgs[13]
+assert msgs[16]["type"] == "deleted" and msgs[16]["text"] is None, msgs[16]
+bob, frank = m10["sender"]["id"], msgs[41]["sender"]["id"]
+assert msgs[40]["system"] == {"kind": "removed", "actor_id": bob, "target_ids": [frank]}, msgs[40]
+assert msgs[41]["system"]["kind"] == "joined_via_link", msgs[41]
+members = {m["name"]: m for m in json.load(open(f"{out}/members/{lab['chat_id']}.json"))}
+assert members["me"]["id"] == "me" and members["me"]["status"] == "current", members
+assert members["Bob"]["is_admin"] is True and members["Carol"]["is_admin"] is False, members
+assert members["Frank"]["status"] == "former" and "left_at" in members["Frank"] and "joined_at" in members["Frank"], members
+ids = json.load(open(f"{out}/identities.json"))
+carol = [p for p, v in ids.items() if v["name"] == "Carol"]
+assert len(carol) == 1 and len(ids[carol[0]]["previous_ids"]) == 1, ids
+assert "me" not in ids
+# Nothing that looks like a phone number or WhatsApp ID, anywhere.
+text = "".join(open(os.path.join(d, f)).read() for d, _, fs in os.walk(out) for f in fs)
+for gone in ("@lid", "whatsapp.net", "\u2219", "IAA=", "Secret Stuff", "unsent draft", "secret.jpg"):
+    assert gone not in text, gone
+rest = re.sub(r"[uc]_[0-9a-f]{10}|https?://\S+|\d{4}-\d\d-\d\dT[\d:+-]+", "", text)
+assert not re.search(r"\d{8,}", rest), re.search(r"\d{8,}", rest)
+PY
+}
+
+@test "cbox-whatsapp export: --since keeps chats and members, only newer messages" {
+  _wa_export_setup
+  run env WARDEN_WHATSAPP=wa python3 "$CLI" export --out "$WA/out" --since 2026-11-01
+  _wa_export_teardown
+  [ "$status" -eq 0 ]
+  [ "$(cat "$WA"/out/messages/*.jsonl | wc -l | tr -d ' ')" = "0" ]
+  grep -q '"since": "2026-11-01"' "$WA/out/manifest.json"
+  [ "$(ls "$WA/out/members" | wc -l | tr -d ' ')" = "3" ]
+}
+
+@test "cbox-whatsapp export: clear errors — nothing shared (1), WhatsApp not readable (2)" {
+  _wa_export_setup
+  run env -u WARDEN_WHATSAPP python3 "$CLI" export --out "$WA/out"
+  none_status=$status; none="$output"
+  rm "$CBOX_WHATSAPP_DB"
+  run env WARDEN_WHATSAPP=wa python3 "$CLI" export --out "$WA/out"
+  _wa_export_teardown
+  [ "$none_status" -eq 1 ]
+  [[ "$none" == *"no WhatsApp chats are shared with this project"* ]]
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"WhatsApp's chat database was not found"* ]]
+  [ ! -e "$WA/out" ]
 }

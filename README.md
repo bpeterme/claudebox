@@ -425,8 +425,19 @@ chat. Needs macOS with WhatsApp Desktop signed in.
    line `[work-chats]`. The next `cbox` start there asks you to approve it.
 
 In that container, Claude gets an MCP server named after the resource, with
-three tools: `list_chats` (names, members, message counts), `read_chat` (one
-chat, oldest first, paging back with `before_id`) and `search`.
+four tools: `list_chats` (names, member and message counts), `list_members`,
+`read_chat` (one chat, oldest first, paging back with `before_id`) and
+`search`. Each message shows its id, the id of the message it replies to, its
+type (text, image, link, poll, system, deleted, …) and its sender.
+
+People appear as a name plus a pseudonym, e.g. `Anna [u_3f9a1c07be]` (mentions
+too: `@Anna [u_3f9a1c07be]`); your own messages as `me`. The pseudonym is the
+same for a person in every chat of the resource — whether WhatsApp knows them
+by phone number or account ID — but another resource gives the same person
+another one, so two projects cannot join what they know about someone. It is
+derived with a secret that stays on the host (`$CBOX_WARDEN_DIR/whatsapp/<resource>.key`;
+deleting it changes all pseudonyms). The name is what the person calls
+themselves on WhatsApp, else your address book name, else `unknown`.
 
 **Good to know:**
 
@@ -440,9 +451,11 @@ chat, oldest first, paging back with `before_id`) and `search`.
   in a terminal asks about each one (default: no). WhatsApp does not record on
   the Mac which groups belong to a community, so choose a community's groups
   yourself; the community's own entry is its announcements chat.
-- **Never passed on:** media files and their keys, unsent drafts, locations
-  and phone numbers. The chat list stays on the host in
-  `$CBOX_WARDEN_DIR/whatsapp/`, never in the project.
+- **Never passed on:** media files and their keys, unsent drafts, locations,
+  profile texts, phone numbers and WhatsApp IDs. Phone numbers written in a
+  message (also `wa.me/…` links) show as `[phone number]`; that can also catch
+  another number of 8–15 digits written the same way. The chat list stays on
+  the host in `$CBOX_WARDEN_DIR/whatsapp/`, never in the project.
 - **Messages are written by other people.** Claude is told to treat them as
   data, not instructions — still, share only chats you would let it read.
 - Not available in safe mode.

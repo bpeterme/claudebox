@@ -1,4 +1,4 @@
-# WhatsApp export format (schema version 1)
+# WhatsApp export format (schema version 2)
 
 `cbox-whatsapp export` writes the WhatsApp chats shared with a project as
 files, for the project's own code. It runs inside a claudebox container during
@@ -38,7 +38,7 @@ no longer shared are removed (only files the previous `manifest.json` listed).
 ### manifest.json
 
 ```json
-{"files": ["chats.json", "identities.json", "members/c_…json", "…"], "resource": "tai", "schema_version": 1, "since": null}
+{"files": ["chats.json", "identities.json", "members/c_…json", "…"], "resource": "tai", "schema_version": 2, "since": null}
 ```
 
 ### chats.json
@@ -71,22 +71,35 @@ One message per line, in date order:
 | `id` | WhatsApp's number for the message (unique on this Mac, not in date order) |
 | `chat_id`, `ts` | `ts`: ISO 8601 with offset, e.g. `2026-10-30T07:03:12+09:00` |
 | `sender` | `{"id", "name"}`; `{"id": "me", "name": "me"}` for you; `{"id": null, "name": "unknown"}` when WhatsApp names nobody |
-| `type` | `text`, `link`, `image`, `video`, `audio`, `document`, `sticker`, `poll`, `contact`, `location`, `system`, `deleted`, `other` |
+| `type` | `text`, `link`, `image`, `video`, `audio`, `document`, `sticker`, `album`, `poll`, `contact`, `location`, `system`, `deleted`, `other` |
 | `text` | The text or caption, or `null`. Mentions read `@Name [u_…]`; phone numbers `[phone number]` |
 | `reply_to` | The `id` of the message it replies to, or `null` |
 | `mentions` | `[{"id", "name"}]`, in order of appearance |
 | `links` | URLs in the text, sorted |
-| `attachment` | `{"caption"}` for images, videos, audio, documents and stickers with a caption. Never the media itself |
+| `forwarded` | `true` when WhatsApp shows "Forwarded" |
+| `link_preview` | For `type: link`: `{"url", "title", "description"}` as WhatsApp shows the preview, or `null`. Written by the linked website |
+| `attachment` | For images, videos, audio, documents, stickers and albums: `{"caption", "mime", "file_name", "size", "duration"}`, each `null` when unknown. `file_name`: documents only, a name without folders; `size` in bytes; `duration` in seconds (audio, video). Never the media itself |
 | `system` | For `type: system`: `{"kind", "actor_id", "target_ids"}` |
 
 `system.kind`: `added` (actor added the targets), `removed` (actor, an admin,
 removed the target), `joined_via_link`, `joined_from_community`,
-`changed_number` (actor's old account, target: the new one), or `event_<n>`
-for events nobody has identified yet.
+`changed_number` (actor's old account, target: the new one), `history_shared`
+(actor, an admin, sent the target the group's earlier messages), or
+`event_<n>` for events nobody has identified yet.
+
+An `album` is several pictures or videos sent together: its text is their
+caption, and they follow it as `image` / `video` messages.
 
 Rows WhatsApp shows no message for (its type 10, probably reactions) are left
-out. Not in version 1 yet: poll questions and votes, link previews, file
-names and types of attachments, `edited`, `forwarded`.
+out. Not exported, because WhatsApp on the Mac does not record them in a way
+that can be read reliably: whether a message was edited (an edited message's
+`ts` is the time of the edit), and poll questions and votes.
+
+### Changes from version 1
+
+New: `forwarded`, `link_preview` and the `album` type on every message;
+`attachment` now on every attached message (also without a caption), with
+`mime`, `file_name`, `size` and `duration`; the `history_shared` event.
 
 ### identities.json
 

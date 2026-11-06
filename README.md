@@ -428,7 +428,10 @@ In that container, Claude gets an MCP server named after the resource, with
 four tools: `list_chats` (names, member and message counts), `list_members`,
 `read_chat` (one chat, oldest first, paging back with `before_id`) and
 `search`. Each message shows its id, the id of the message it replies to, its
-type (text, image, link, poll, system, deleted, …) and its sender.
+type (text, image, link, album, poll, system, deleted, …), its sender, whether
+it was forwarded, a document's file name and a link's preview. Never the
+media itself, and not whether a message was edited (WhatsApp on the Mac does
+not record that readably).
 
 People appear as a name plus a pseudonym, e.g. `Anna [u_3f9a1c07be]` (mentions
 too: `@Anna [u_3f9a1c07be]`); your own messages as `me`. The pseudonym is the

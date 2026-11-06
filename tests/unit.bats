@@ -3040,6 +3040,29 @@ con.executemany("INSERT INTO ZWAMESSAGE VALUES (?, 2, ?, NULL, 0, 6, ?, NULL, ?,
   (42, None, 815000086, None, "S42", 99)])                  # an event nobody has named yet
 con.execute("INSERT INTO ZWAMESSAGE VALUES (43, 6, 9, NULL, 0, 6, 815000087, NULL, '222222@lid', 'S43', 9)")  # number change
 con.execute("INSERT INTO ZWAMESSAGE VALUES (44, 2, 1, NULL, 0, 10, 815000088, NULL, NULL, 'S44', NULL)")  # not shown
+# Attachments, link previews, forwards, albums, shared history: in Robots Two, all sent by Carol.
+con.executescript("""
+ALTER TABLE ZWAMESSAGE ADD COLUMN ZFLAGS INTEGER;
+ALTER TABLE ZWAMEDIAITEM ADD COLUMN ZVCARDSTRING VARCHAR;
+ALTER TABLE ZWAMEDIAITEM ADD COLUMN ZAUTHORNAME VARCHAR;
+ALTER TABLE ZWAMEDIAITEM ADD COLUMN ZFILESIZE INTEGER;
+ALTER TABLE ZWAMEDIAITEM ADD COLUMN ZMOVIEDURATION INTEGER;
+ALTER TABLE ZWAMEDIAITEM ADD COLUMN ZMEDIAURL VARCHAR;
+""")
+con.executemany("INSERT INTO ZWAMEDIAITEM VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)", [
+  (3, None, "/Users/someone/Media/plan.pdf", None, "application/pdf", "../../etc/Plan for +43 664 1234567.pdf", 123456, 7, None),
+  (4, "Robot\x1b[31m Expo", None, pb((1, b"https://expo.example.org/2026"), (3, b"The big robot expo, call +43 664 1234567"),
+                                      (4, b"/v/t62/x.enc?oh=SIGNEDTOKEN&oe=1")), None, None, 0, 0, "https://mmg.example/SIGNEDTOKEN"),
+  (5, "album caption", None, None, None, None, 0, 0, None),
+  (6, None, None, pb((15, pb((1, b"111111@lid"), (2, 5)))), None, None, 0, 0, None),  # the history went to Bob
+  (7, None, None, None, "video/mp4", None, 2048, 12, "https://mmg.example/SIGNEDTOKEN")])
+forwarded = 1 << 24 | 1 << 26 | 1 << 7 | 1 << 8
+con.executemany("INSERT INTO ZWAMESSAGE VALUES (?, 6, 6, ?, 0, ?, ?, NULL, ?, ?, ?, ?)", [
+  (70, 3, 8, 815000091, "the plan", "S70", None, forwarded),
+  (71, 4, 7, 815000092, "look https://expo.example.org/2026", "S71", None, 1 << 24 | 1 << 15),
+  (72, 5, 66, 815000093, None, "S72", None, 1 << 24),
+  (73, 6, 75, 815000094, None, "S73", 2, 1 << 24),
+  (74, 7, 2, 815000095, None, "S74", None, 1 << 24 | 1 << 26)])
 con.commit()
 import os, plistlib
 os.makedirs(d + "/Library/Preferences")
@@ -3205,6 +3228,23 @@ _wa_text() {
   done
   [ "$(tr ' ' '\n' <<<"$seen" | grep -c .)" = "10" ]
   [ "$(tr ' ' '\n' <<<"$seen" | grep . | sort -u | wc -l | tr -d ' ')" = "10" ]
+}
+
+@test "warden whatsapp: read_chat shows forwards, file names, link previews, albums and shared history" {
+  _wa_fixture
+  echo '{"chats": {"600@g.us": "Robots Two"}}' > "$WA/list.json"
+  out=$(_wa_serve "$WA/list.json" '{"name":"read_chat","arguments":{"chat":"Robots Two"}}')
+  read=$(_wa_text 2 <<<"$out")
+  echo "$read"
+  carol=$(grep -o 'Carol \[u_[0-9a-f]*\]' <<<"$read" | head -1)
+  [[ "$read" == *"[70] "*" $carol: [forwarded] [document: Plan for [phone number].pdf] the plan"* ]]
+  [[ "$read" == *"[71] "*" $carol: [link] look https://expo.example.org/2026"$'\n'"    ↳ preview: Robot [31m Expo — The big robot expo, call [phone number]"* ]]
+  [[ "$read" == *"[72] "*" $carol: [album] album caption"* ]]
+  [[ "$read" == *"[73] "*" $carol: [system] shared the message history with Bob [u_"* ]]
+  [[ "$read" == *"[74] "*" $carol: [video]"* ]]
+  for leak in SIGNEDTOKEN "../" "etc/" "plan.pdf" "@lid" $'\x1b'; do
+    [[ "$out" != *"$leak"* ]] || { echo "leaked: $leak"; false; }
+  done
 }
 
 @test "warden whatsapp: a number change is labelled and linked, never merged" {
@@ -3378,7 +3418,7 @@ _wa_export_teardown() {
 import json, os, re, sys
 out = sys.argv[1]
 manifest = json.load(open(f"{out}/manifest.json"))
-assert manifest["schema_version"] == 1 and manifest["resource"] == "wa", manifest
+assert manifest["schema_version"] == 2 and manifest["resource"] == "wa", manifest
 chats = {c["name"]: c for c in json.load(open(f"{out}/chats.json"))}
 lab, alice = chats["Robots Lab"], chats["Alice"]
 assert lab["kind"] == "group" and alice["kind"] == "direct" and lab["community_id"] is None, chats
@@ -3394,7 +3434,9 @@ assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d", m10["ts"]), 
 assert m10["sender"]["name"] == "Bob" and m10["type"] == "text", m10
 assert [p["name"] for p in m10["mentions"]] == ["Carol"] and m10["links"] == ["https://example.com/p/123456789"], m10
 assert msgs[11]["sender"] == {"id": "me", "name": "me"} and msgs[11]["reply_to"] == 10, msgs[11]
-assert msgs[13]["type"] == "image" and msgs[13]["attachment"] == {"caption": "a robot photo"}, msgs[13]
+assert msgs[13]["type"] == "image" and msgs[13]["attachment"] == {
+    "caption": "a robot photo", "mime": None, "file_name": None, "size": None, "duration": None}, msgs[13]
+assert m10["forwarded"] is False and m10["link_preview"] is None and "attachment" not in m10, m10
 assert msgs[16]["type"] == "deleted" and msgs[16]["text"] is None, msgs[16]
 bob, frank = m10["sender"]["id"], msgs[41]["sender"]["id"]
 assert msgs[40]["system"] == {"kind": "removed", "actor_id": bob, "target_ids": [frank]}, msgs[40]
@@ -3403,13 +3445,26 @@ members = {m["name"]: m for m in json.load(open(f"{out}/members/{lab['chat_id']}
 assert members["me"]["id"] == "me" and members["me"]["status"] == "current", members
 assert members["Bob"]["is_admin"] is True and members["Carol"]["is_admin"] is False, members
 assert members["Frank"]["status"] == "former" and "left_at" in members["Frank"] and "joined_at" in members["Frank"], members
+two = {m["id"]: m for m in map(json.loads, open(f"{out}/messages/{chats['Robots Two']['chat_id']}.jsonl"))}
+carol_id = two[70]["sender"]["id"]
+assert two[70]["forwarded"] is True and two[70]["attachment"] == {"caption": "the plan", "mime": "application/pdf",
+    "file_name": "Plan for [phone number].pdf", "size": 123456, "duration": None}, two[70]
+assert two[71]["forwarded"] is False and "attachment" not in two[71] and two[71]["link_preview"] == {
+    "url": "https://expo.example.org/2026", "title": "Robot [31m Expo",
+    "description": "The big robot expo, call [phone number]"}, two[71]
+assert two[72]["type"] == "album" and two[72]["attachment"]["caption"] == "album caption", two[72]
+assert two[73]["type"] == "system" and two[73]["system"] == {
+    "kind": "history_shared", "actor_id": carol_id, "target_ids": [bob]}, two[73]
+assert two[74]["attachment"] == {"caption": None, "mime": "video/mp4", "file_name": None, "size": 2048,
+                                 "duration": 12}, two[74]
 ids = json.load(open(f"{out}/identities.json"))
 carol = [p for p, v in ids.items() if v["name"] == "Carol"]
 assert len(carol) == 1 and len(ids[carol[0]]["previous_ids"]) == 1, ids
 assert "me" not in ids
 # Nothing that looks like a phone number or WhatsApp ID, anywhere.
 text = "".join(open(os.path.join(d, f)).read() for d, _, fs in os.walk(out) for f in fs)
-for gone in ("@lid", "whatsapp.net", "\u2219", "IAA=", "Secret Stuff", "unsent draft", "secret.jpg"):
+for gone in ("@lid", "whatsapp.net", "\u2219", "IAA=", "Secret Stuff", "unsent draft", "secret.jpg",
+             "SIGNEDTOKEN", "plan.pdf", "../", "\x1b"):
     assert gone not in text, gone
 rest = re.sub(r"[uc]_[0-9a-f]{10}|https?://\S+|\d{4}-\d\d-\d\dT[\d:+-]+", "", text)
 assert not re.search(r"\d{8,}", rest), re.search(r"\d{8,}", rest)

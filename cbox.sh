@@ -1684,13 +1684,20 @@ _cbox_tunnel_stop() {
 # on the list, because no other chat is in the copy. People appear in it only
 # as a name plus a pseudonym ("u_" + HMAC of their WhatsApp ID, keyed per
 # resource), never with a phone number or WhatsApp ID. Never copied: media
-# keys, local file paths, unsent drafts, locations, profile texts.
+# keys, media and thumbnail URLs (signed download links), local file paths,
+# unsent drafts, locations, profile texts, contact cards.
 #
 # WhatsApp's schema is undocumented; this follows what the Mac app writes:
 #   ChatStorage  ZWAMESSAGE.ZGROUPMEMBER → ZWAGROUPMEMBER.ZMEMBERJID (sender),
 #                ZWAMESSAGE.ZPUSHNAME: the sender's push name, or a protobuf
 #                (base64) whose field 3 is the sender's ID,
-#                ZWAMEDIAITEM.ZMETADATA field 5: the quoted message's stanza id,
+#                ZWAMEDIAITEM.ZMETADATA field 5: the quoted message's stanza id;
+#                of a link (type 7): field 1 the preview's URL, 3 its description,
+#                ZTITLE its title; of shared history (type 75): a field whose
+#                field 1 is the person's ID,
+#                ZWAMEDIAITEM.ZVCARDSTRING: an attachment's MIME type,
+#                ZAUTHORNAME: a document's file name,
+#                ZWAMESSAGE.ZFLAGS bits 7 and 8: forwarded,
 #                ZWAPROFILEPUSHNAME: push names
 #   LID.sqlite   ZWAZACCOUNT: account ID (@lid) ↔ phone number, display name
 #   ContactsV2   ZWAADDRESSBOOKCONTACT: ID (@lid) ↔ phone ID, address book name
@@ -1708,11 +1715,14 @@ WA_DB = os.environ.get("CBOX_WHATSAPP_DB") or os.path.expanduser(
 WA_EPOCH = 978307200  # WhatsApp dates are seconds since 2001-01-01
 WA_KINDS = {0: "chat", 1: "group", 4: "community"}  # ZSESSIONTYPE
 WA_TYPES = {0: "text", 1: "image", 2: "video", 3: "audio", 4: "contact", 5: "location", 6: "system", 7: "link",
-            8: "document", 11: "video", 14: "deleted", 15: "sticker", 46: "poll"}  # ZMESSAGETYPE; else "other"
-WA_ATTACHED = {"image", "video", "audio", "document", "sticker"}  # their text is a caption
+            8: "document", 11: "video", 14: "deleted", 15: "sticker", 46: "poll", 66: "album",
+            75: "system"}  # ZMESSAGETYPE; else "other"
+WA_ATTACHED = {"image", "video", "audio", "document", "sticker", "album"}  # their text is a caption
 WA_UNSHOWN = {10}  # rows WhatsApp shows no message for (reactions, probably): left out
-WA_SCHEMA = 1  # of cbox-whatsapp export; see docs/whatsapp-export.md
+WA_SCHEMA = 2  # of cbox-whatsapp export; see docs/whatsapp-export.md
 WA_SYSTEM, WA_DELETED = 6, 14  # group events (joins, renames); deleted messages
+WA_HISTORY = 75  # "<admin> sent <person> message history"
+WA_FORWARDED = 1 << 7 | 1 << 8  # ZFLAGS bits WhatsApp shows as "Forwarded"
 # ZGROUPEVENTTYPE of a group event: (kind, as WhatsApp shows it). The sender is
 # the message's member row; {who}: the person in ZTEXT. Only events confirmed in
 # WhatsApp itself and by who is who; others show their number.
@@ -1733,6 +1743,7 @@ WA_WAME = re.compile(r"(wa\.me/)\+?\d+", re.I)
 WA_PHONE = re.compile(r"(?<![\w/=.+-])\+?\d(?:[ ()-]?\d){7,14}(?![\w/])")
 WA_DATE = re.compile(r"\d{4}-\d\d-\d\d|\d\d-\d\d-\d{4}")
 WA_B64 = re.compile(r"^\+?[A-Za-z0-9+/]{2,}={0,2}$")
+WA_MIME = re.compile(r"[a-z]+/[a-z0-9.+-]{1,100}")
 WA_HIDDEN = re.compile(r"\d[\d\s]*[\u2219\u2022\u00b7*]{2,}")  # WhatsApp's partly hidden numbers: +1∙∙∙∙19
 WA_COPY = """
 CREATE TABLE chats (id INTEGER PRIMARY KEY, cid TEXT, name TEXT, kind TEXT, person TEXT);
@@ -1828,6 +1839,37 @@ def wa_pb_text(b, field, top=128):
             except UnicodeDecodeError:
                 return None
     return None
+
+
+def wa_pb_jid(b):
+    """The ID in field 1 of a top-level protobuf field (shared history names its person so), or None."""
+    for _, wire, v in (wa_pb(b) or []) if isinstance(b, bytes) else []:
+        jid = wa_pb_text(v, 1) if wire == 2 else None
+        if jid and WA_JID.fullmatch(jid):
+            return jid
+    return None
+
+
+def wa_attachment(kind, mime, name, size, seconds, people):
+    """An attachment's MIME type, file name (documents), size and duration — never the file."""
+    def number(v):
+        return int(v) if isinstance(v, (int, float)) and v > 0 else None
+    if kind == "document" and isinstance(name, str):
+        name = people.text(wa_clean(re.split(r"[/\\]", name)[-1]))[:200].strip()  # a name, never a path
+    return {"mime": mime.lower() if isinstance(mime, str) and WA_MIME.fullmatch(mime.lower()) else None,
+            "file_name": name if kind == "document" and name not in (None, "", ".", "..") else None,
+            "size": number(size), "duration": number(seconds) if kind in ("audio", "video") else None}
+
+
+def wa_preview(title, meta, people):
+    """A link's preview as WhatsApp shows it: URL, title, description; None if it has none.
+    Written by the linked website: cleaned and masked like message text."""
+    def clip(s, top):
+        return people.text(wa_clean(s))[:top].strip() or None if isinstance(s, str) else None
+    url = clip(wa_pb_text(meta, 1, 2048), 2048)
+    out = {"url": url if url and WA_URL.fullmatch(url) else None, "title": clip(title, 300),
+           "description": clip(wa_pb_text(meta, 3, 4096), 1000)}
+    return out if any(out.values()) else None
 
 
 def wa_b64(s):
@@ -2038,12 +2080,13 @@ def wa_copy(jids, key):
         marks = ",".join("?" * len(ids))
         rows = src.execute(
             "SELECT m.Z_PK, m.ZCHATSESSION, m.ZMESSAGEDATE, m.ZISFROMME, m.ZMESSAGETYPE, m.ZTEXT, i.ZTITLE, "
-            "g.ZMEMBERJID, m.ZPUSHNAME, m.ZSTANZAID, i.ZMETADATA, m.ZGROUPEVENTTYPE "
+            "g.ZMEMBERJID, m.ZPUSHNAME, m.ZSTANZAID, i.ZMETADATA, m.ZGROUPEVENTTYPE, m.ZFLAGS, "
+            "i.ZVCARDSTRING, i.ZAUTHORNAME, i.ZFILESIZE, i.ZMOVIEDURATION "
             "FROM ZWAMESSAGE m LEFT JOIN ZWAGROUPMEMBER g ON g.Z_PK = m.ZGROUPMEMBER "
             "LEFT JOIN ZWAMEDIAITEM i ON i.Z_PK = m.ZMEDIAITEM "
             f"WHERE m.ZCHATSESSION IN ({marks}) ORDER BY m.ZMESSAGEDATE, m.Z_PK", ids).fetchall()
         stanzas, senders = {}, {}
-        for pk, chat, _, me, _, _, _, member, push, stanza, _, _ in rows:
+        for pk, chat, _, me, _, _, _, member, push, stanza, *_ in rows:
             if stanza:
                 stanzas[(chat, stanza)] = pk
             if me:
@@ -2056,7 +2099,7 @@ def wa_copy(jids, key):
             elif jid and push and not blob and wa_phoneish(push):
                 people.hidden.add(people.canon(jid))
         out, previous = [], set()
-        for pk, chat, date, me, mtype, text, title, _, _, _, meta, event in rows:
+        for pk, chat, date, me, mtype, text, title, _, _, _, meta, event, flags, mime, author, size, secs in rows:
             if mtype in WA_UNSHOWN:
                 continue
             kind = WA_TYPES.get(mtype or 0, "other")
@@ -2065,9 +2108,15 @@ def wa_copy(jids, key):
             body = "" if kind == "deleted" else people.text(raw, mentions)
             sender = ("me", "me") if me else people.person(senders[pk]) if senders.get(pk) else (None, "unknown")
             if kind == "system":
-                # The person an event is about, if its text is one ID; never kept as text.
-                who = people.person(raw) if WA_JID.fullmatch(raw) else None
-                code, what = WA_EVENTS.get(event, (f"event_{event}", "group event" + (f" {event}" if event is not None else "")))
+                if mtype == WA_HISTORY:
+                    jid = wa_pb_jid(meta)
+                    who = people.person(jid) if jid else None
+                    code, what = "history_shared", "shared the message history with {who}"
+                else:
+                    # The person an event is about, if its text is one ID; never kept as text.
+                    who = people.person(raw) if WA_JID.fullmatch(raw) else None
+                    code, what = WA_EVENTS.get(event, (f"event_{event}",
+                                                       "group event" + (f" {event}" if event is not None else "")))
                 actor, targets = (who, [sender]) if code == "removed" else (sender, [who] if who else [])
                 extra["system"] = {"kind": code, "actor_id": actor[0] if actor else None,
                                    "target_ids": [t[0] for t in targets if t and t[0]]}
@@ -2079,6 +2128,14 @@ def wa_copy(jids, key):
                     previous.add((who[0], sender[0]))  # the new account, the old one
             elif kind == "other":
                 extra["code"] = mtype
+            elif kind in WA_ATTACHED and kind != "album":
+                extra["attachment"] = wa_attachment(kind, mime, author, size, secs, people)
+            elif kind == "link":
+                preview = wa_preview(title, meta, people)
+                if preview:
+                    extra["link_preview"] = preview
+            if isinstance(flags, int) and flags & WA_FORWARDED:
+                extra["forwarded"] = True
             if kind == "text" and not body:
                 continue
             if mentions:
@@ -2120,8 +2177,8 @@ WA_TOOLS = [
          "chat": {"type": "string", "description": "The chat's name, or a unique part of it"}}}},
     {"name": "read_chat",
      "description": "Messages of one shared WhatsApp chat, oldest first, as "
-                    "'[id ↩replied-to id] date sender: [type] text' (no type: text). "
-                    "Older ones: pass before_id. " + WA_PEOPLE,
+                    "'[id ↩replied-to id] date sender: [forwarded] [type] text' (no type: text), "
+                    "a link's preview on the next line. Older ones: pass before_id. " + WA_PEOPLE,
      "inputSchema": {"type": "object", "required": ["chat"], "properties": {
          "chat": {"type": "string", "description": "The chat's name, or a unique part of it"},
          "limit": {"type": "integer", "description": "Number of messages (default 50, at most 500)"},
@@ -2162,8 +2219,15 @@ def wa_who(pid, name):
 
 def wa_line(row, chat=None):
     mid, date, sid, sname, kind, text, reply, extra = row
-    tag = {"text": "", "deleted": "[deleted message]", "other": f"[message type {json.loads(extra).get('code')}] "}
-    what = tag.get(kind, f"[{kind}] ") + text.replace("\n", "\n    ")
+    extra = json.loads(extra)
+    name = extra.get("attachment", {}).get("file_name")
+    tag = {"text": "", "deleted": "[deleted message]", "other": f"[message type {extra.get('code')}] "}
+    what = ("[forwarded] " if extra.get("forwarded") else "") + \
+        tag.get(kind, f"[{kind}: {name}] " if name else f"[{kind}] ") + text.replace("\n", "\n    ")
+    preview = extra.get("link_preview") or {}
+    shown = [v for v in (preview.get("title"), preview.get("description")) if v]
+    if shown:
+        what += "\n    ↳ preview: " + " — ".join(shown)[:300]
     head = f"[{mid}" + (f" ↩{reply}" if reply else "") + f"] {wa_when(date)} "
     return head + (f"({chat}) " if chat else "") + f"{wa_who(sid, sname)}: {what}".rstrip()
 
@@ -2299,9 +2363,11 @@ def wa_export(mem, resource, since=None):
                 continue
             msg = {"id": mid, "chat_id": chat_id, "ts": wa_iso(date), "sender": {"id": sid, "name": sname},
                    "type": mkind, "text": text or None, "reply_to": reply, "mentions": extra.get("mentions", []),
-                   "links": sorted(set(u.rstrip(".,;:!?)]}'\"") for u in WA_URL.findall(text or "")))}
-            if mkind in WA_ATTACHED and text:
-                msg["attachment"] = {"caption": text}
+                   "links": sorted(set(u.rstrip(".,;:!?)]}'\"") for u in WA_URL.findall(text or ""))),
+                   "forwarded": bool(extra.get("forwarded")), "link_preview": extra.get("link_preview")}
+            if mkind in WA_ATTACHED:
+                msg["attachment"] = dict({"caption": text or None, "mime": None, "file_name": None,
+                                          "size": None, "duration": None}, **extra.get("attachment", {}))
             if "system" in extra:
                 msg["system"] = extra["system"]
             lines.append(json.dumps(msg, ensure_ascii=False, sort_keys=True))

@@ -215,6 +215,7 @@ Each connection starts a fresh server process, just like a local stdio server.
 | Works on files or repositories (filesystem, git, …) | Inside the container: the project's `.mcp.json` or `claude mcp add` — a host server would see host paths, not `/Workspace` |
 | Remote (`https://…`) without a token | `mcp.json` (passed through as-is) or inside the container |
 | Remote with an API key or token | A warden resource with `type = mcp` (see [Credentials](#credentials-warden)) — the token stays on the host |
+| WhatsApp chats | A warden resource with `type = whatsapp` (see [WhatsApp chats](#whatsapp-chats)) — only the chats you choose, per project |
 
 A remote entry in `mcp.json` is copied into the container as-is, `headers`
 included — anything in them is readable there, and cbox warns about it.
@@ -276,6 +277,7 @@ credential on the way out. Inside the container, requests go to
 | S3-compatible storage keys (R2, S3, MinIO) | `type = http`, `auth = sigv4` | An AWS profile with dummy keys |
 | An SSH key (GitHub, GitLab, servers) | `type = ssh` | An ssh agent that signs only for the hosts you list |
 | A remote MCP server's token | `type = mcp` | The server in Claude's and opencode's MCP list |
+| WhatsApp chats you choose (WhatsApp Desktop on this Mac) | `type = whatsapp` | A read-only MCP server that knows only those chats (see [WhatsApp chats](#whatsapp-chats)) |
 
 ```sh
 cbox warden secret set openrouter   # paste the key; stored in the Keychain
@@ -368,28 +370,6 @@ secret = cbox.warden.linear      # cbox warden secret set linear
 and opencode both get these servers. Servers that only offer an OAuth login (no
 API key) are not supported through warden.
 
-**WhatsApp chats** (`type = whatsapp`, macOS with WhatsApp Desktop): Claude
-reads the chats you choose, and nothing else. It cannot send. There is no
-WhatsApp login involved: a host-side MCP server reads WhatsApp Desktop's own
-database read-only, copies only the chosen chats into memory and answers from
-that copy, so no question can reach another chat. Media files and keys, drafts,
-locations and phone numbers are never copied.
-
-```sh
-cbox warden whatsapp pick whatsapp    # choose chats by number; creates the resource
-cbox warden test whatsapp             # check the database is readable
-```
-
-The resource is `availability = project` unless you change it: a project gets
-the chats with a `.warden` line `[whatsapp]` and your approval. The chat list
-stays in `$CBOX_WARDEN_DIR/whatsapp/`, never in the project. Use one resource
-per set of chats (e.g. `[work-chats]`, `[family]`) to give projects different
-chats. When you join a new group, the next `cbox` start in a terminal asks
-whether to share it (default: no). Changes to the list reach running sessions
-within a minute. Messages are written by other people, so Claude is told to
-treat them as data, not as instructions. The first time, macOS may ask whether
-the terminal may access data from other apps: allow it.
-
 **opencode providers.** `opencode = <provider id>` on an http resource points
 that opencode provider at warden (base URL and a dummy key), so the API key can
 leave `opencode.json` — which a container can read when it is shared:
@@ -423,6 +403,49 @@ reaches a container at its next session start (exit its sessions, start
 `cbox` again); a changed `allow` on an existing one applies at once.
 
 Not available in safe mode.
+
+### WhatsApp chats
+
+Claude can read WhatsApp chats you choose — and only those. It cannot send,
+react or mark anything as read. No WhatsApp login is involved: a server on the
+Mac reads WhatsApp Desktop's own database read-only, copies just the chosen
+chats into memory and answers from that copy, so no question can reach another
+chat. Needs macOS with WhatsApp Desktop signed in.
+
+**Set up (once):**
+
+1. `cbox warden whatsapp pick work-chats` — answer `y` to create the resource
+   (any name: lowercase letters, digits, `.`, `_`, `-`). It lists your groups
+   and communities, numbered; type the numbers to share, e.g. `1 4 7-9`.
+   `--all` lists 1:1 chats too.
+2. `cbox warden test work-chats` — checks the database is readable. The first
+   time, macOS may ask whether your terminal may access data from other apps:
+   allow it.
+3. In each project that should see the chats, add a `.warden` file with the
+   line `[work-chats]`. The next `cbox` start there asks you to approve it.
+
+In that container, Claude gets an MCP server named after the resource, with
+three tools: `list_chats` (names, members, message counts), `read_chat` (one
+chat, oldest first, paging back with `before_id`) and `search`.
+
+**Good to know:**
+
+- **Per project, by default.** The resource is `availability = project`; change
+  it to `global` in `cbox warden edit` to give every container the chats. Use
+  one resource per set of chats (e.g. `[work-chats]`, `[family]`) to give
+  projects different chats.
+- **Change the choice any time** with `pick` again (Enter keeps the current
+  one, `none` shares nothing). Running sessions see the change within a minute.
+- **New groups** you join are not shared automatically: the next `cbox` start
+  in a terminal asks about each one (default: no). WhatsApp does not record on
+  the Mac which groups belong to a community, so choose a community's groups
+  yourself; the community's own entry is its announcements chat.
+- **Never passed on:** media files and their keys, unsent drafts, locations
+  and phone numbers. The chat list stays on the host in
+  `$CBOX_WARDEN_DIR/whatsapp/`, never in the project.
+- **Messages are written by other people.** Claude is told to treat them as
+  data, not instructions — still, share only chats you would let it read.
+- Not available in safe mode.
 
 ## macOS: Screenshot Script
 

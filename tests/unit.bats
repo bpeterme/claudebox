@@ -3,6 +3,20 @@
 CBOX_SH="$(cd "$BATS_TEST_DIRNAME/.." && pwd)/cbox.sh"
 
 setup() {
+  # On macOS the temp dir (/var/folders/…) is itself behind a symlink
+  # (/var → /private/var); cbox resolves paths, so compare against the real one.
+  BATS_TMPDIR=$(cd "$BATS_TMPDIR" && pwd -P)
+  # macOS has no `timeout`; the relay tests use it to bound a hanging client.
+  if ! command -v timeout >/dev/null 2>&1; then
+    mkdir -p "$BATS_TMPDIR/bin"
+    cat > "$BATS_TMPDIR/bin/timeout" <<'PL'
+#!/usr/bin/perl
+# timeout SECONDS COMMAND...: the alarm survives exec and ends COMMAND.
+my $s = shift; alarm $s; exec @ARGV or die "timeout: $ARGV[0]: $!\n";
+PL
+    chmod +x "$BATS_TMPDIR/bin/timeout"
+    PATH="$BATS_TMPDIR/bin:$PATH"
+  fi
   export HOME="$BATS_TMPDIR/home"
   # CI runners set these to the real home; cbox's defaults must follow $HOME here.
   unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME
@@ -20,6 +34,30 @@ setup() {
   export CBOX_MASK=""
   # shellcheck source=/dev/null
   source "$CBOX_SH"
+}
+
+# Runs even when a test failed before its own inline cleanup. A server left
+# running would hold bats' output open (bats then never exits) and keep ports
+# and sockets the following tests need.
+teardown() {
+  if [[ -n "${UP_PID:-}" ]]; then
+    # A failed warden test: the broker's own log says why.
+    [[ -n "${BATS_TEST_COMPLETED:-}" ]] || {
+      echo "--- broker.log"; cat "$CBOX_WARDEN_DIR/broker.log" 2>/dev/null; echo "---"
+    } >&2
+    _warden_teardown
+  fi
+  if [[ -n "${RELAY_TMP:-}" && -d "$RELAY_TMP" ]]; then _relay_teardown; fi
+  if [[ -f "${TT:-/nonexistent}/tunnel.pid" ]]; then
+    kill -TERM -- "-$(cat "$TT/tunnel.pid")" 2>/dev/null || true
+    rm -f "$TT/tunnel.pid"
+  fi
+  return 0
+}
+
+# The runtime command cbox calls on this host.
+_runtime_bin() {
+  if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then echo container; else echo docker; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1956,17 +1994,23 @@ _run_cbox_script_with_fake_docker() {
   local bin="$BATS_TMPDIR/fake-bin" proj="$BATS_TMPDIR/exitpath"
   mkdir -p "$bin" "$proj" "$BATS_TMPDIR/exitpath-tmp"
   rm -f "$BATS_TMPDIR/exitpath-tmp"/.cbox-active-*
+  # One fake for both runtimes: cbox calls `container` on macOS, `docker` elsewhere.
   cat > "$bin/docker" <<'SH'
 #!/bin/bash
-echo "docker $*" >> "$FAKE_LOG"
+rt=${0##*/}
+echo "$rt $*" >> "$FAKE_LOG"
 case "$1" in
   ps) echo "exitpath running" ;;
-  inspect) echo '[{"Config":{"Labels":{"cbox.mode":"normal"}}}]' ;;
+  ls) echo '[{"configuration":{"id":"exitpath","labels":{"cbox.project":"true","cbox.mode":"normal"}},"status":{"state":"running"}}]' ;;
+  inspect)
+    if [[ "$rt" == container ]]; then echo '[{"configuration":{"labels":{"cbox.mode":"normal"}}}]'
+    else echo '[{"Config":{"Labels":{"cbox.mode":"normal"}}}]'; fi ;;
   exec) [[ " $* " == *" -it "* ]] && exit "${FAKE_EXEC_RC:-0}" ;;
 esac
 exit 0
 SH
   chmod +x "$bin/docker"
+  ln -sf docker "$bin/container"
   : > "$BATS_TMPDIR/exitpath.log"
   cd "$proj"
   FAKE_LOG="$BATS_TMPDIR/exitpath.log" TMPDIR="$BATS_TMPDIR/exitpath-tmp" \
@@ -1976,13 +2020,13 @@ SH
 @test "exit path: container is stopped even when the agent exits non-zero" {
   FAKE_EXEC_RC=130 run _run_cbox_script_with_fake_docker
   [ "$status" -eq 0 ]
-  grep -qx "docker stop exitpath" "$BATS_TMPDIR/exitpath.log"
+  grep -qx "$(_runtime_bin) stop exitpath" "$BATS_TMPDIR/exitpath.log"
 }
 
 @test "exit path: container is stopped when the agent exits cleanly" {
   FAKE_EXEC_RC=0 run _run_cbox_script_with_fake_docker
   [ "$status" -eq 0 ]
-  grep -qx "docker stop exitpath" "$BATS_TMPDIR/exitpath.log"
+  grep -qx "$(_runtime_bin) stop exitpath" "$BATS_TMPDIR/exitpath.log"
 }
 
 # ---------------------------------------------------------------------------
@@ -2623,7 +2667,8 @@ INI
 
 @test "warden opencode: a resource with opencode = <provider> routes that provider through warden" {
   _warden_setup
-  sed -i 's|^env          = OPENAI_BASE_URL={url} OPENAI_API_KEY=warden|&\nopencode     = openrouter|' "$CBOX_WARDEN_DIR/resources"
+  # perl, not sed: BSD sed writes no newline for \n in a replacement.
+  perl -pi -e 's|^env          = OPENAI_BASE_URL=\{url\} OPENAI_API_KEY=warden$|$&\nopencode     = openrouter|' "$CBOX_WARDEN_DIR/resources"
   printf '[s3x]\nupstream = http://127.0.0.1:1\nauth = sigv4\nkey-id = a\nsecret = b\nopencode = x\n' >> "$CBOX_WARDEN_DIR/resources"
   run _warden_env
   base=$(sed -n 's/^WARDEN_URL=//p' <<<"$output")
@@ -2637,7 +2682,7 @@ INI
   _ssh_setup
   _ssh_stubs
   _known_hosts github.com 203.0.113.5 "[198.51.100.7]:2200" "[2001:db8::1]:2222"
-  sed -i 's|^hosts = github.com$|hosts = github.com 203.0.113.5 198.51.100.7:2200 [2001:db8::1]:2222 example.org:22|' "$CBOX_WARDEN_DIR/resources"
+  sed -i.bak 's|^hosts = github.com$|hosts = github.com 203.0.113.5 198.51.100.7:2200 [2001:db8::1]:2222 example.org:22|' "$CBOX_WARDEN_DIR/resources"
   printf '[bad]\ntype = ssh\nkey = %s\nhosts = 10.0.0.1:99999\n' "$TT/keys/two" >> "$CBOX_WARDEN_DIR/resources"
   echo "example.org ssh-ed25519 $(_fake_host_key example.org)" >> "$CBOX_WARDEN_DIR/ssh/known_hosts"
   : > "$TT/loaded"
@@ -2650,7 +2695,7 @@ INI
 @test "warden ssh: a new server's key is confirmed once, from the claudebox known_hosts" {
   _ssh_setup
   _ssh_stubs
-  sed -i 's|^hosts = github.com$|hosts = github.com 198.51.100.7:2200|' "$CBOX_WARDEN_DIR/resources"
+  sed -i.bak 's|^hosts = github.com$|hosts = github.com 198.51.100.7:2200|' "$CBOX_WARDEN_DIR/resources"
   echo "[198.51.100.7]:2200 ssh-ed25519 $(_fake_host_key vm)" > "$TT/keys/known_hosts"
   : > "$TT/loaded"
   # Declined: the server stays off, the key still unlocks for github.com.
@@ -2673,7 +2718,7 @@ INI
 @test "warden ssh: without an entry warden asks the server itself, and never reads ~/.ssh/known_hosts" {
   _ssh_setup
   _ssh_stubs
-  sed -i 's|^hosts = github.com$|hosts = 198.51.100.7:2200|' "$CBOX_WARDEN_DIR/resources"
+  sed -i.bak 's|^hosts = github.com$|hosts = 198.51.100.7:2200|' "$CBOX_WARDEN_DIR/resources"
   mkdir -p "$HOME/.ssh"
   echo "[198.51.100.7]:2200 ssh-ed25519 $(_fake_host_key personal)" > "$HOME/.ssh/known_hosts"
   echo "[198.51.100.7]:2200 ssh-ed25519 $(_fake_host_key scanned)" > "$TT/keyscan"
@@ -2715,7 +2760,7 @@ INI
   once=$(cat "$TT/ssh-add.args")
   # A host added later: the key is added again with the new list.
   _known_hosts github.com gitlab.com example.org
-  sed -i 's|^hosts = gitlab.com$|hosts = gitlab.com example.org|' "$CBOX_WARDEN_DIR/resources"
+  sed -i.bak 's|^hosts = gitlab.com$|hosts = gitlab.com example.org|' "$CBOX_WARDEN_DIR/resources"
   _ssh_py 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1]), True)' "$CBOX_WARDEN_DIR" 2>/dev/null
   again=$(sed -n 2p "$TT/ssh-add.args")
   _warden_env >/dev/null   # wbox: only the global 'gh' is granted
@@ -3096,7 +3141,7 @@ _safe_setup() {
   _cbox_safe_claude_dir sbox
   # /logout + /login in the container: a new file, newer than the shared one.
   rm -f "$SD/.credentials.json"; echo 'new login' > "$SD/.credentials.json"
-  touch -d '2000-01-01' "$CBOX_CLAUDE_DIR/.credentials.json"
+  touch -t 200001010000 "$CBOX_CLAUDE_DIR/.credentials.json"
   _cbox_safe_claude_dir sbox
   [ "$SD/.credentials.json" -ef "$CBOX_CLAUDE_DIR/.credentials.json" ]
   [ "$(cat "$CBOX_CLAUDE_DIR/.credentials.json")" = "new login" ]
@@ -3104,7 +3149,7 @@ _safe_setup() {
 
 @test "_cbox_safe_claude_dir: a newer login in the shared folder replaces the safe one" {
   _safe_setup
-  mkdir -p "$SD"; echo 'stale' > "$SD/.credentials.json"; touch -d '2000-01-01' "$SD/.credentials.json"
+  mkdir -p "$SD"; echo 'stale' > "$SD/.credentials.json"; touch -t 200001010000 "$SD/.credentials.json"
   _cbox_safe_claude_dir sbox
   [ "$SD/.credentials.json" -ef "$CBOX_CLAUDE_DIR/.credentials.json" ]
   [ "$(cat "$SD/.credentials.json")" = "old" ]

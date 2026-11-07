@@ -42,7 +42,7 @@ Container Management:
   cbox list                           List cbox containers
   cbox stop [name]                    Stop current (or named) container
   cbox reset                          Remove current project container
-  cbox prune                          Remove stopped cbox containers
+  cbox prune                          Remove stopped cbox containers, reclaim disk space
   cbox rebuild                        Rebuild container image
 
 MCP servers on the host (~/.config/claudebox/mcp.json):
@@ -4749,8 +4749,13 @@ _cbox_create() {
       # the intended trade-off for this mode.
       -v "$CBOX_PLAYWRIGHT_DIR:/opt/ms-playwright:ro"
     )
-    # --security-opt and --pids-limit are not supported by Apple's container CLI
-    if [[ "$_CBOX_RUNTIME" != "apple" ]]; then
+    # Apple's container CLI has neither --security-opt nor --pids-limit. Each
+    # of its containers runs its own kernel, so a process limit there caps the
+    # container like --pids-limit does; with all capabilities dropped, root
+    # cannot exceed it either. no-new-privileges has no equivalent.
+    if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
+      args+=(--ulimit nproc=512)
+    else
       args+=(
         --security-opt no-new-privileges
         --pids-limit 512
@@ -4822,6 +4827,38 @@ PYEOF
 # True for a container created by an older cbox, whose PID 1 is `tail`.
 _cbox_old_init() {
   $_CBOX_CMD inspect "$1" 2>/dev/null | grep -Eq '"(/usr/bin/)?tail"'
+}
+
+# Apple's runtime only: a container's filesystem is a disk image that grows
+# but never shrinks, so deleted npm caches and browsers still take space on
+# the Mac. `container clean` gives it back, for running containers only.
+# Docker frees that space by itself.
+_cbox_clean_running() {
+  [[ "$_CBOX_RUNTIME" == "apple" ]] || return 0
+  if ! container clean --help >/dev/null 2>&1; then
+    echo "ℹ  Disk space of running containers not reclaimed: needs a newer Apple container"
+    echo "   (https://github.com/apple/container/releases)."
+    return 0
+  fi
+
+  local running cname
+  running=$(
+    _cbox_rt_list | while read -r cname cstate; do
+      [[ "$cstate" == "running" ]] || continue
+      # Explicit if: see the prune loop (a trailing false test aborts under set -e).
+      if [[ "$(_cbox_rt_label "$cname" "cbox.project")" == "true" ]]; then
+        echo "$cname"
+      fi
+    done
+  )
+  [[ -n "$running" ]] || return 0
+
+  echo "Reclaiming unused disk space in running cbox containers..."
+  while IFS= read -r cname; do
+    container clean "$cname" >/dev/null 2>&1 \
+      && echo "✔ $cname" \
+      || echo "⚠  Could not reclaim disk space in '$cname'"
+  done <<<"$running"
 }
 
 # ---------------------------------------------------------
@@ -5567,6 +5604,8 @@ cbox() {
       else
         echo "Nothing to prune."
       fi
+
+      _cbox_clean_running
       ;;
 
     "")

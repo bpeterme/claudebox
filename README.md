@@ -66,7 +66,7 @@ cbox oc safe   # opencode in safe mode
 | `cbox reset [<name>]` | Remove the current project's container (or a named container) |
 | `cbox rebuild` | Rebuild the container image |
 | `cbox list` | List all cbox containers |
-| `cbox prune` | Remove all stopped cbox containers |
+| `cbox prune` | Remove all stopped cbox containers; on macOS also reclaim unused disk space in running ones |
 
 **Maintenance**
 
@@ -94,7 +94,7 @@ cbox oc safe   # opencode in safe mode
 ### Safe mode (`cbox safe`, `cbox oc safe`)
 - All Linux capabilities dropped (`--cap-drop=ALL`)
 - No privilege escalation: `sudo` cannot switch to root without capabilities (Docker also sets `--security-opt no-new-privileges`)
-- 4 GB memory limit, 2 CPU cores, 512 max PIDs (PID limit: Docker only)
+- 4 GB memory limit, 2 CPU cores, 512 max processes
 - Agent config read-only, except the login: safe and normal containers share one login, and a refresh in either keeps it valid for both. Each safe container has its own `~/.claude` (in `$CBOX_DATA_DIR/safe-claude/<name>`) whose entries link to the shared folder; its `.credentials.json` is the shared file itself (a hard link). A safe container can therefore change the shared login, but not your settings, hooks or skills
 - Claude Code's telemetry and error reports are off (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`)
 - Internet access only to allowed hosts (see below)

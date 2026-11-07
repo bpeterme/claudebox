@@ -1441,6 +1441,83 @@ _prune_collect() {
 }
 
 # ---------------------------------------------------------------------------
+# _cbox_clean_running (cbox prune, Apple runtime)
+# ---------------------------------------------------------------------------
+
+# Stubs `container`: logs every call; `clean --help` succeeds unless
+# CLEAN_MISSING=1, `clean NAME` fails for the container named in CLEAN_FAIL.
+_clean_stubs() {
+  _CBOX_RUNTIME=apple
+  CLEAN_LOG="$BATS_TMPDIR/clean-calls"
+  rm -f "$CLEAN_LOG"
+  container() {
+    echo "$*" >> "$CLEAN_LOG"
+    [[ "$1" == "clean" ]] || return 0
+    [[ "$2" == "--help" ]] && { [[ "${CLEAN_MISSING:-0}" == "1" ]] && return 64; return 0; }
+    [[ "$2" == "${CLEAN_FAIL:-}" ]] && return 1
+    return 0
+  }
+  _cbox_rt_list() {
+    printf '%s\n' "proj-a running" "proj-b stopped" "proj-c running" "buildkit running"
+  }
+  _cbox_rt_label() { [[ "$1" == "buildkit" ]] && echo "" || echo "true"; }
+}
+
+@test "_cbox_clean_running: cleans only running cbox containers" {
+  _clean_stubs
+  run _cbox_clean_running
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"✔ proj-a"* ]]
+  [[ "$output" == *"✔ proj-c"* ]]
+  run grep -E '^clean [^-]' "$CLEAN_LOG"
+  [ "${lines[0]}" = "clean proj-a" ]
+  [ "${lines[1]}" = "clean proj-c" ]
+  [ "${#lines[@]}" -eq 2 ]
+}
+
+@test "_cbox_clean_running: a failing container is reported, the others still cleaned" {
+  _clean_stubs
+  CLEAN_FAIL=proj-a run _cbox_clean_running
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Could not reclaim disk space in 'proj-a'"* ]]
+  [[ "$output" == *"✔ proj-c"* ]]
+}
+
+@test "_cbox_clean_running: an older Apple runtime without clean is skipped with a hint" {
+  _clean_stubs
+  CLEAN_MISSING=1 run _cbox_clean_running
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"needs a newer Apple container"* ]]
+  run grep -cE '^clean [^-]' "$CLEAN_LOG"
+  [ "$output" = "0" ]
+}
+
+@test "_cbox_clean_running: does nothing on Docker" {
+  _clean_stubs
+  _CBOX_RUNTIME=docker
+  run _cbox_clean_running
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ ! -f "$CLEAN_LOG" ]
+}
+
+@test "_cbox_clean_running: no running cbox container, no output" {
+  _clean_stubs
+  _cbox_rt_list() { printf '%s\n' "proj-b stopped" "buildkit running"; }
+  run _cbox_clean_running
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "_cbox_clean_running: survives set -euo pipefail when the last container is skipped" {
+  _clean_stubs
+  run bash -c 'set -euo pipefail; source "$1"; '"$(declare -f _clean_stubs)"'
+    BATS_TMPDIR="$2"; _clean_stubs; _cbox_clean_running; echo DONE' _ "$CBOX_SH" "$BATS_TMPDIR"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"DONE"* ]]
+}
+
+# ---------------------------------------------------------------------------
 # _cbox_agent_bin / _cbox_agent_pkg
 # ---------------------------------------------------------------------------
 
@@ -1659,6 +1736,34 @@ _prune_collect() {
   [ "$normal" -eq 1 ]
   [ "$safe" -eq 1 ]
   [ "$custom" -eq 1 ]
+}
+
+@test "_cbox_create: safe mode limits processes on both runtimes, normal mode does not" {
+  local capture="$BATS_TMPDIR/create-nproc-args"
+  cd "$BATS_TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+
+  _CBOX_RUNTIME=apple
+  rm -f "$capture"; _cbox_create "cbox-unit-nproc" "safe"
+  run cat "$capture"
+  [[ "$output" == *$'--ulimit\nnproc=512'* ]]
+  [[ "$output" != *"--pids-limit"* ]]
+  [[ "$output" != *"--security-opt"* ]]
+
+  _CBOX_RUNTIME=docker
+  rm -f "$capture"; _cbox_create "cbox-unit-nproc" "safe"
+  run cat "$capture"
+  [[ "$output" == *$'--pids-limit\n512'* ]]
+  [[ "$output" == *$'--security-opt\nno-new-privileges'* ]]
+  [[ "$output" != *"--ulimit"* ]]
+
+  for _CBOX_RUNTIME in apple docker; do
+    rm -f "$capture"; _cbox_create "cbox-unit-nproc" "normal"
+    run cat "$capture"
+    [[ "$output" != *"--ulimit"* ]]
+    [[ "$output" != *"--pids-limit"* ]]
+  done
 }
 
 @test "_cbox_create: mounts the playwright cache read-only in safe mode" {

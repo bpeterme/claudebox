@@ -3716,3 +3716,179 @@ PY
   [[ "$output" == *"host MCP servers: /opt/cbox/servers.json"* ]]
   [[ "$output" == *"data and logs (CBOX_DATA_DIR): $CBOX_DATA_DIR"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# Apple's container system not running
+# ---------------------------------------------------------------------------
+
+# Stubs `container`: `system status` fails until `system start` ran; every
+# call is logged, and any other command fails like the real one does then.
+_system_down_stubs() {
+  _CBOX_RUNTIME=apple
+  _CBOX_CMD=container
+  SYS_LOG="$BATS_TMPDIR/system-calls"
+  SYS_UP="$BATS_TMPDIR/system-up"
+  rm -f "$SYS_LOG" "$SYS_UP"
+  clear() { :; }
+  container() {
+    echo "$*" >> "$SYS_LOG"
+    case "$1 ${2:-}" in
+      "system status") [[ -f "$SYS_UP" ]] ;;
+      "system start")  touch "$SYS_UP" ;;
+      *) [[ -f "$SYS_UP" ]] || { echo "Error: XPC connection error" >&2; return 1; } ;;
+    esac
+  }
+}
+
+@test "cbox list: clean error when the container system is not running" {
+  _system_down_stubs
+  run cbox list
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Apple's container system is not running, so cbox cannot list containers."* ]]
+  [[ "$output" == *"container system start"* ]]
+  [[ "$output" != *"XPC"* ]]
+  run grep -c 'system start' "$SYS_LOG"
+  [ "$output" = "0" ]
+}
+
+@test "cbox stop: nothing to stop when the container system is not running" {
+  _system_down_stubs
+  run cbox stop
+  [ "$status" -eq 0 ]
+  [ "$output" = "Nothing to stop: Apple's container system is not running." ]
+}
+
+@test "cbox reset/prune/rebuild/update: start the container system first" {
+  _system_down_stubs
+  _cbox_rt_list() { :; }
+  for cmd in reset prune rebuild update; do
+    rm -f "$SYS_LOG" "$SYS_UP"
+    run cbox "$cmd"
+    [[ "$output" != *"XPC"* ]] || { echo "$cmd: $output"; false; }
+    [ "$(head -2 "$SYS_LOG" | tail -1)" = "system start" ] || { echo "$cmd:"; cat "$SYS_LOG"; false; }
+  done
+}
+
+@test "doctor: image not checked while the container system is not running" {
+  _system_down_stubs
+  run _cbox_doctor_inline
+  [[ "$output" == *"image '$CBOX_IMAGE' not checked: the container system is not running"* ]]
+  [[ "$output" != *"XPC"* ]]
+}
+
+@test "docker runtime: never considered down" {
+  _system_down_stubs
+  _CBOX_RUNTIME=docker
+  run _cbox_system_down
+  [ "$status" -ne 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# Tab completion: one list (cbox _complete) behind every completion script
+# ---------------------------------------------------------------------------
+
+@test "_cbox_complete: offers every command the dispatcher handles" {
+  run _cbox_complete
+  [ "$status" -eq 0 ]
+  local cmd
+  # Commands in cbox()'s case, without internal (_*) and hidden companion ones.
+  for cmd in $(awk '/^cbox\(\) \{/{f=1} f && /^    [a-z|-]+\)$/{gsub(/[ )]/,""); gsub(/\|/," "); print} f && /^}/{exit}' "$CBOX_SH"); do
+    [[ "$cmd" == cdot || "$cmd" == flux || "$cmd" == --help || "$cmd" == -h ]] && continue
+    [[ $'\n'"$output"$'\n' == *$'\n'"$cmd"$'\n'* ]] || { echo "missing: $cmd"; false; }
+  done
+}
+
+@test "_cbox_complete: subcommands, ignoring -v and oc in front" {
+  [ "$(_cbox_complete mcp | tr '\n' ' ')" = "list import " ]
+  [ "$(_cbox_complete -v oc warden | tr '\n' ' ')" = "list edit secret approve test whatsapp log " ]
+  [ "$(_cbox_complete warden secret)" = "set" ]
+  [ "$(_cbox_complete warden whatsapp)" = "pick" ]
+  [ "$(_cbox_complete warden whatsapp pick chats)" = "--all" ]
+  [ -z "$(_cbox_complete warden whatsapp pick chats --all)" ]
+  [ -z "$(_cbox_complete nonsense)" ]
+}
+
+@test "_cbox_complete: container names for stop and reset, none while the system is down" {
+  _cbox_rt_list() { printf '%s\n' "proj-a running" "proj-b stopped"; }
+  _cbox_system_down() { return 1; }
+  [ "$(_cbox_complete stop | tr '\n' ' ')" = "proj-a proj-b " ]
+  [ "$(_cbox_complete reset | tr '\n' ' ')" = "proj-a proj-b " ]
+  _cbox_system_down() { return 0; }
+  [ -z "$(_cbox_complete stop)" ]
+}
+
+@test "_cbox_complete: warden resource names, only whatsapp ones for pick" {
+  mkdir -p "$CBOX_WARDEN_DIR"
+  printf '[llm]\nupstream = https://api.example.com\nauth = bearer\nsecret = cbox.warden.llm\nallow = GET /x\n[chats]\ntype = whatsapp\n' \
+    > "$CBOX_WARDEN_DIR/resources"
+  [ "$(_cbox_complete warden test | tr '\n' ' ')" = "chats llm " ]
+  [ "$(_cbox_complete warden secret set | tr '\n' ' ')" = "chats llm " ]
+  [ "$(_cbox_complete warden whatsapp pick)" = "chats" ]
+  rm -f "$CBOX_WARDEN_DIR/resources"
+}
+
+# A `cbox` executable on PATH, as Homebrew installs it, with this cbox.sh.
+_cbox_bin() {
+  mkdir -p "$BATS_TMPDIR/bin"
+  printf '#!/usr/bin/env bash\nexec bash %q "$@"\n' "$CBOX_SH" > "$BATS_TMPDIR/bin/cbox"
+  chmod +x "$BATS_TMPDIR/bin/cbox"
+}
+
+@test "zsh completion (Homebrew file): asks cbox and offers its candidates" {
+  command -v zsh >/dev/null || skip "zsh not installed"
+  _cbox_bin
+  run env PATH="$BATS_TMPDIR/bin:$PATH" zsh -f -c '
+    compadd() { [[ $1 == -a ]] && print -l -- "${(@P)2}"; }
+    source "$1" >/dev/null 2>&1
+    words=(cbox warden ""); CURRENT=3; _cbox; print SEP
+    words=(cbox ""); CURRENT=2; _cbox' _ "$(dirname "$CBOX_SH")/completions/_cbox"
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "list" ]
+  [ "${lines[6]}" = "log" ]
+  [ "${lines[7]}" = "SEP" ]
+  [[ "$output" == *$'\nkeepalive\n'* ]]
+}
+
+@test "zsh completion (sourced cbox.sh): same candidates" {
+  command -v zsh >/dev/null || skip "zsh not installed"
+  run zsh -f -c '
+    compadd() { [[ $1 == -a ]] && print -l -- "${(@P)2}"; }
+    source "$1" >/dev/null 2>&1
+    words=(cbox mcp ""); CURRENT=3; _cbox_zsh_complete' _ "$CBOX_SH"
+  [ "$status" -eq 0 ]
+  [ "$output" = $'list\nimport' ]
+}
+
+@test "bash completion (sourced cbox.sh): several words, inherited newline IFS" {
+  run bash -c 'source "$1" >/dev/null 2>&1
+    COMP_WORDS=(cbox warden secret ""); COMP_CWORD=3; _cbox_bash_complete; printf "%s\n" "${COMPREPLY[@]}"' _ "$CBOX_SH"
+  [ "$status" -eq 0 ]
+  [ "$output" = "set" ]
+}
+
+@test "bash completion (sourced cbox.sh): filters candidates by the typed prefix" {
+  run bash -c 'source "$1" >/dev/null 2>&1
+    COMP_WORDS=(cbox warden s); COMP_CWORD=2; _cbox_bash_complete; printf "%s\n" "${COMPREPLY[@]}"' _ "$CBOX_SH"
+  [ "$status" -eq 0 ]
+  [ "$output" = "secret" ]
+}
+
+# ---------------------------------------------------------------------------
+# Sourced install: only `cbox` and its completion land in the shell
+# ---------------------------------------------------------------------------
+
+@test "sourced in an interactive shell: no config or internals leak, cbox still works" {
+  local sh xdg="$BATS_TMPDIR/src-xdg"
+  mkdir -p "$xdg/claudebox"
+  printf 'LEAKME=1\n' > "$xdg/claudebox/cbox.env"
+  for sh in bash zsh; do
+    command -v "$sh" >/dev/null || continue
+    run env XDG_CONFIG_HOME="$xdg" "$sh" -i -c 'source "$1" 2>/dev/null
+      echo "LEAKME=${LEAKME-unset} IMAGE=${CBOX_IMAGE-unset}"
+      typeset -f _cbox_help >/dev/null 2>&1 && echo "internals leaked"
+      cbox _complete mcp' _ "$CBOX_SH"
+    [[ "$output" == *"LEAKME=unset IMAGE=unset"* ]] || { echo "$sh: $output"; false; }
+    [[ "$output" != *"internals leaked"* ]] || { echo "$sh: $output"; false; }
+    [[ "$output" == *$'list\nimport'* ]] || { echo "$sh: $output"; false; }
+  done
+}

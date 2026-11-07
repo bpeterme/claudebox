@@ -9,6 +9,46 @@
 #
 # Configure by creating ~/.config/claudebox/cbox.env (see cbox.env.example)
 
+# ---------------------------------------------------------
+# shell completion and the sourced install
+# ---------------------------------------------------------
+
+# Completion asks `cbox _complete` (see _cbox_complete), so it needs nothing
+# else from this file.
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+  # zsh code: $words and $CURRENT are set by the completion system; the
+  # unquoted $(…) splits at newlines (IFS) and drops empty lines; compadd -a
+  # reads the array by name.
+  # shellcheck disable=SC2034,SC2154,SC2207
+  _cbox_zsh_complete() {
+    local IFS=$'\n'
+    local -a candidates
+    candidates=($(cbox _complete "${words[@]:1:$((CURRENT - 2))}" 2>/dev/null))
+    compadd -a candidates
+  }
+  (( ${+functions[compdef]} )) && compdef _cbox_zsh_complete cbox
+elif [[ -n "${BASH_VERSION:-}" ]]; then
+  # COMPREPLY=( $(compgen …) ) is bash's completion idiom (macOS's bash 3.2 has
+  # no mapfile); IFS splits the candidates at newlines only.
+  # shellcheck disable=SC2207
+  _cbox_bash_complete() {
+    local IFS=$'\n'
+    COMPREPLY=( $(compgen -W "$(cbox _complete "${COMP_WORDS[@]:1:COMP_CWORD-1}" 2>/dev/null)" \
+      -- "${COMP_WORDS[COMP_CWORD]}") )
+  }
+  complete -F _cbox_bash_complete cbox
+fi
+
+# Sourced into an interactive shell (`source cbox.sh` in ~/.zshrc or
+# ~/.bashrc): define only `cbox`, which runs this file as a program — as the
+# Homebrew install does — and the completion above. Nothing from the config
+# file or cbox's internals lands in the shell. ($0 is the sourced file in zsh.)
+if [[ $- == *i* ]] && { [[ "${ZSH_EVAL_CONTEXT:-}" == *:file* ]] ||
+    [[ -n "${BASH_VERSION:-}" && "${BASH_SOURCE[0]}" != "$0" ]]; }; then
+  eval "cbox() { bash $(printf %q "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")") \"\$@\"; }"
+  return 0
+fi
+
 # =========================================================
 # cbox - Claude Container Runtime
 # =========================================================
@@ -251,6 +291,28 @@ _cbox_system_running() {
   container system status >/dev/null 2>&1
 }
 
+# True when the runtime is Apple's and its container system is not running:
+# then no container command works.
+_cbox_system_down() {
+  [[ "$_CBOX_RUNTIME" == "apple" ]] && ! _cbox_system_running
+}
+
+# Starts Apple's container system unless it runs (sessions, and commands that
+# change containers or images, need it).
+_cbox_system_start() {
+  _cbox_system_down || return 0
+  echo "Starting container system..."
+  if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+    container system start
+  else
+    container system start >/dev/null 2>&1
+  fi
+}
+
+_cbox_system_down_hint() {
+  echo "  It starts with your next cbox session, or now with: container system start"
+}
+
 # Writes the per-project ~/.claude.json the container mounts. Host MCP servers
 # come from $CBOX_MCP_CONFIG only — never from a host Claude installation, which
 # may not exist. See the "MCP relay" section for how they reach the container.
@@ -319,6 +381,7 @@ _cbox_force_update() {
   local name="$1"
   clear
 
+  _cbox_system_start
   if ! _cbox_exists "$name"; then
     echo "No container found for '$name'."
     return 0
@@ -4213,6 +4276,13 @@ def cmd_exposed(d, path):
     sys.exit(1)
 
 
+def cmd_names(d, kind=""):
+    """Resource names, one per line (for tab completion); only of type KIND if given."""
+    for name, r in sorted(load_resources(d).items()):
+        if not kind or r.get("type") == kind:
+            print(name)
+
+
 COMMANDS = {
     "tunnel": lambda a: cmd_tunnel(*a),
     "ssh-stop": lambda a: cmd_ssh_stop(*a),
@@ -4226,6 +4296,7 @@ COMMANDS = {
     "test": lambda a: cmd_test(*a),
     "template": lambda a: cmd_template(*a),
     "whatsapp-pick": lambda a: cmd_whatsapp_pick(*a),
+    "names": lambda a: cmd_names(*a),
 }
 
 if __name__ == "__main__":
@@ -4884,14 +4955,7 @@ _cbox_ensure() {
   local name="$1"
   local requested_mode="$2"
 
-  if [[ "$_CBOX_RUNTIME" == "apple" ]] && ! _cbox_system_running; then
-    echo "Starting container system..."
-    if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-      container system start
-    else
-      container system start >/dev/null 2>&1
-    fi
-  fi
+  _cbox_system_start
 
   # "existing": whatever mode the container has; a new one is normal.
   if ! _cbox_exists "$name"; then
@@ -5416,9 +5480,13 @@ _cbox_doctor_inline() {
     fi
   fi
 
-  _cbox_rt_image_list | grep -q "^$CBOX_IMAGE " \
-    && echo "✔ image '$CBOX_IMAGE' exists" \
-    || echo "✘ image '$CBOX_IMAGE' missing"
+  if _cbox_system_down; then
+    echo "ℹ image '$CBOX_IMAGE' not checked: the container system is not running"
+  else
+    _cbox_rt_image_list | grep -q "^$CBOX_IMAGE " \
+      && echo "✔ image '$CBOX_IMAGE' exists" \
+      || echo "✘ image '$CBOX_IMAGE' missing"
+  fi
 
   echo "Active agent: $(_cbox_agent_bin) (CBOX_AGENT=${CBOX_AGENT:-claude})"
 
@@ -5583,6 +5651,10 @@ cbox() {
 
     stop)
       local stop_target="${2:-$name}"
+      if _cbox_system_down; then
+        echo "Nothing to stop: Apple's container system is not running."
+        return 0
+      fi
       if ! _cbox_exists "$stop_target"; then
         echo "No container found for '$stop_target'."
         return 0
@@ -5596,6 +5668,7 @@ cbox() {
 
     reset)
       local reset_target="${2:-$name}"
+      _cbox_system_start
       if ! _cbox_exists "$reset_target"; then
         echo "No container found for '$reset_target'."
         return 0
@@ -5609,6 +5682,7 @@ cbox() {
 
     rebuild)
       clear
+      _cbox_system_start
       echo "Rebuilding image '$CBOX_IMAGE'..."
       $_CBOX_CMD build \
         --build-arg HOST_UID="$(id -u)" \
@@ -5645,8 +5719,18 @@ cbox() {
       _cbox_doctor_inline
       ;;
 
+    _complete)
+      shift
+      _cbox_complete "$@"
+      ;;
+
     list)
       clear
+      if _cbox_system_down; then
+        echo "✘ Apple's container system is not running, so cbox cannot list containers."
+        _cbox_system_down_hint
+        return 1
+      fi
       if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
         container ls --all
       else
@@ -5655,6 +5739,7 @@ cbox() {
       ;;
 
     prune)
+      _cbox_system_start
       echo "Removing stopped cbox containers..."
 
       local stopped
@@ -5739,51 +5824,39 @@ cbox() {
 }
 
 # ---------------------------------------------------------
-# shell completions (sourced case)
+# shell completions
 # ---------------------------------------------------------
 
 _cbox_list_names() {
   _cbox_rt_list 2>/dev/null | awk '{print $1}'
 }
 
-if [[ -n "${ZSH_VERSION:-}" ]]; then
-  # zsh code: $words is set by the completion system, and $(…) in an array
-  # assignment is zsh's way to split lines (no mapfile).
-  # shellcheck disable=SC2154,SC2207
-  _cbox_zsh_complete() {
-    case $CURRENT in
-      2)
-        compadd -v --verbose list stop reset prune rebuild update doctor mcp warden safe shell keepalive oc opencode version help
-        ;;
-      3)
-        if [[ "${words[2]}" == "reset" || "${words[2]}" == "stop" ]]; then
-          local -a containers
-          containers=($(_cbox_list_names))
-          (( ${#containers[@]} )) && compadd -a containers
-        fi
-        ;;
-    esac
-  }
-  (( ${+functions[compdef]} )) && compdef _cbox_zsh_complete cbox
-elif [[ -n "${BASH_VERSION:-}" ]]; then
-  # COMPREPLY=( $(compgen …) ) is bash's completion idiom; mapfile is not in
-  # macOS's bash 3.2, and completion words contain no spaces.
-  # shellcheck disable=SC2207
-  _cbox_bash_complete() {
-    local cur="${COMP_WORDS[COMP_CWORD]}"
-    local prev="${COMP_WORDS[COMP_CWORD-1]}"
-    COMPREPLY=()
+# `cbox _complete WORD...`: the candidates for the word after `cbox WORD...`,
+# one per line. Every completion script (completions/_cbox for Homebrew, and
+# the zsh and bash ones below for a sourced cbox.sh) asks this, so none can
+# drift from the commands, and values come from cbox's own configuration.
+_cbox_complete() {
+  local IFS=' '  # "$*" below joins with spaces, also when called with a newline IFS
+  while [[ "${1:-}" =~ ^(-v|--verbose|oc|opencode)$ ]]; do shift; done
+  case "$*" in
+    "")
+      printf '%s\n' -v --verbose safe shell keepalive oc opencode list stop reset \
+        prune rebuild update doctor mcp warden version help
+      ;;
+    stop|reset)                     _cbox_system_down || _cbox_list_names ;;
+    mcp)                            printf '%s\n' list import ;;
+    warden)                         printf '%s\n' list edit secret approve test whatsapp log ;;
+    "warden secret")                echo set ;;
+    "warden secret set"|"warden test") _cbox_warden_python names "$CBOX_WARDEN_DIR" 2>/dev/null ;;
+    "warden whatsapp")              echo pick ;;
+    "warden whatsapp pick")         _cbox_warden_python names "$CBOX_WARDEN_DIR" whatsapp 2>/dev/null ;;
+    "warden whatsapp pick "*)
+      if (( $# == 4 )); then echo --all; fi
+      ;;
+  esac
+  return 0
+}
 
-    if [[ $COMP_CWORD -eq 1 ]]; then
-      COMPREPLY=( $(compgen -W \
-        "-v --verbose list stop reset prune rebuild update doctor mcp warden safe shell keepalive oc opencode version help" \
-        -- "$cur") )
-    elif [[ $COMP_CWORD -eq 2 && ( "$prev" == "reset" || "$prev" == "stop" ) ]]; then
-      COMPREPLY=( $(compgen -W "$(_cbox_list_names)" -- "$cur") )
-    fi
-  }
-  complete -F _cbox_bash_complete cbox
-fi
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   set -euo pipefail

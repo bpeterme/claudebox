@@ -1,25 +1,12 @@
 #compdef cbox
 
+# The candidates come from cbox itself (`cbox _complete`), so they always
+# match its commands and its configuration.
 _cbox() {
-  local -a containers
-
-  case $CURRENT in
-    2)
-      compadd list stop reset prune rebuild update doctor mcp safe shell keepalive version help
-      ;;
-    3)
-      if [[ "${words[2]}" == "mcp" ]]; then
-        compadd list import
-      elif [[ "${words[2]}" == "reset" ]]; then
-        if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
-          containers=($(container ls --all 2>/dev/null | awk 'NR>1 {print $1}'))
-        else
-          containers=($(docker ps -a --format "{{.Names}}" 2>/dev/null))
-        fi
-        (( ${#containers[@]} )) && compadd -a containers
-      fi
-      ;;
-  esac
+  local IFS=$'\n'
+  local -a candidates
+  candidates=($(cbox _complete "${words[@]:1:$((CURRENT - 2))}" 2>/dev/null))
+  compadd -a candidates
 }
 
 _cbox "$@"

@@ -4167,3 +4167,36 @@ _mask_project() {
   run cbox warden
   [[ "$output" != *"docker is not installed"* ]]
 }
+
+# A docker command that fails like a daemon would, with stderr $1.
+_failing_docker() {
+  mkdir -p "$BATS_TMPDIR/faildocker"
+  printf '#!/bin/sh\necho "Client: fine"\necho "%s" >&2\nexit 1\n' "$1" > "$BATS_TMPDIR/faildocker/docker"
+  chmod +x "$BATS_TMPDIR/faildocker/docker"
+  _CBOX_CMD="$BATS_TMPDIR/faildocker/docker" _CBOX_RUNTIME=docker
+}
+
+@test "missing runtime: no permission on the Docker socket names the docker group" {
+  _failing_docker "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock"
+  _cbox_on_wsl() { return 0; }
+  run cbox shell
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"sudo usermod -aG docker"*"wsl --shutdown"* ]]
+  [[ "$output" != *"Creating"* ]]
+}
+
+@test "missing runtime: Docker Desktop's Windows docker without WSL integration" {
+  _failing_docker "Error response from daemon: The command 'docker' could not be found in this WSL 2 distro."
+  _cbox_on_wsl() { return 0; }
+  run cbox
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Settings → Resources → WSL integration"* ]]
+}
+
+@test "missing runtime: a stopped daemon says so, with its own first error line" {
+  _failing_docker "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+  _cbox_on_wsl() { return 1; }
+  run cbox list
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Docker is not running: Cannot connect to the Docker daemon"*"systemctl start docker"* ]]
+}

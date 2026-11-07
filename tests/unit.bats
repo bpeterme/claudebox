@@ -902,6 +902,20 @@ _warden_relocate() {
   [ "$took" -lt 10 ]
 }
 
+@test "warden: without docker0 (Docker Desktop on WSL) a failed start says to set CBOX_WARDEN_HOST" {
+  _warden_setup
+  unset CBOX_WARDEN_HOST
+  _CBOX_RUNTIME=docker
+  # No docker0 bridge, and the fallback address is not on this machine
+  # (192.0.2.1 is reserved for documentation; CI runners do have 172.17.0.1).
+  mkdir -p "$WT/bin"; printf '#!/bin/sh\nexit 1\n' > "$WT/bin/ip"; chmod +x "$WT/bin/ip"
+  _cbox_warden_host_ip() { echo 192.0.2.1; }
+  PATH="$WT/bin:$PATH" run _cbox_warden_broker_start
+  _warden_teardown
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no docker0 bridge"*"CBOX_WARDEN_HOST"* ]]
+}
+
 @test "cbox warden: lists resources and what this project gets" {
   _warden_setup
   printf '[proj]\n' > .warden
@@ -922,6 +936,39 @@ _warden_relocate() {
   run _cbox_warden_cmd secret set "Bad Name"
   [ "$status" -eq 1 ]
   [[ "$output" == *"Usage: cbox warden secret set"* ]]
+}
+
+# Fake secret-tool (Linux keyring): store reads the value from stdin into a
+# file per service; lookup prints it. Arguments are logged.
+_fake_secret_tool() {
+  mkdir -p "$BATS_TMPDIR/kr/bin" "$BATS_TMPDIR/kr/items"
+  cat > "$BATS_TMPDIR/kr/bin/secret-tool" <<'SH'
+#!/bin/sh
+d="$(dirname "$0")/../items"; echo "$*" >> "$d/../args"
+op=$1; shift; svc=""
+while [ $# -gt 0 ]; do [ "$1" = service ] && svc=$2; shift; done
+case "$op" in
+  store)  cat > "$d/$svc" ;;
+  lookup) cat "$d/$svc" 2>/dev/null ;;
+esac
+SH
+  chmod +x "$BATS_TMPDIR/kr/bin/secret-tool"
+  PATH="$BATS_TMPDIR/kr/bin:$PATH"
+}
+
+@test "warden on Linux: secret set stores in the keyring; the broker reads it from there" {
+  [[ "$(/usr/bin/uname)" != "Darwin" ]] || skip "macOS uses the Keychain"
+  _warden_setup
+  unset CBOX_WARDEN_SECRET_CMD
+  _fake_secret_tool
+  run bash -c "printf 'kr-secret-123' | { source '$CBOX_SH'; _cbox_warden_cmd secret set llm; }"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"stored in your keyring as cbox.warden.llm"* ]]
+  ! grep -q 'kr-secret-123' "$BATS_TMPDIR/kr/args"
+  url=$(_warden_url)
+  run curl -s "$url/llm/models"
+  _warden_teardown
+  [[ "$output" == *'"authorization": "Bearer kr-secret-123"'* ]]
 }
 
 @test "cbox warden: unknown command shows usage" {

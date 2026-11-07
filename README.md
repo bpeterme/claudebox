@@ -7,7 +7,34 @@ Each project gets its own container, named after the directory. Two modes are av
 ## Prerequisites
 
 - **macOS:** [Apple Container](https://github.com/apple/container) 1.0.0+ — requires macOS 26 and Apple Silicon (`cbox doctor` tells you when newer releases fix security issues)
-- **Linux:** Docker
+- **Linux (incl. WSL2):** Docker — see [Linux and WSL](#linux-and-wsl)
+
+### Linux and WSL
+
+claudebox uses Docker on Linux. On WSL2 that is either Docker Engine installed in
+the distro (behaves like any Linux) or Docker Desktop with WSL integration.
+
+warden keeps secrets in the desktop keyring through `secret-tool`, as flux does:
+
+```bash
+sudo apt install libsecret-tools        # Fedora: sudo dnf install libsecret
+```
+
+WSL2 and servers usually run no keyring; start one per session first:
+
+```bash
+sudo apt install gnome-keyring dbus-x11
+[ -n "$DBUS_SESSION_BUS_ADDRESS" ] || eval "$(dbus-launch --sh-syntax)"
+gnome-keyring-daemon --unlock --components=secrets   # type a keyring password, then Ctrl-D
+```
+
+The warden broker listens on the Docker bridge address (`docker0`). Docker
+Desktop on WSL has no `docker0` inside the distro: if `cbox` reports that the
+broker did not start, set `CBOX_WARDEN_HOST` to an address of the distro that
+containers can reach.
+
+Mac-only features (iMCP and other host MCP servers that need macOS apps,
+WhatsApp chats) are not available on Linux.
 
 ## Installation
 
@@ -78,7 +105,7 @@ cbox oc safe   # opencode in safe mode
 | `cbox mcp import` | Import MCP servers from Claude Desktop / Claude Code on the host |
 | `cbox warden` | List credential resources (APIs, storage, ssh keys, MCP servers, WhatsApp chats) and what this project gets (see [Credentials (warden)](#credentials-warden)) |
 | `cbox warden edit` | Define resources the container may use |
-| `cbox warden secret set <resource>` | Store a resource's secret in the macOS Keychain |
+| `cbox warden secret set <resource>` | Store a resource's secret in the macOS Keychain (Linux: keyring) |
 | `cbox warden approve` | Approve this project's `.warden` file |
 | `cbox warden test <resource>` | Check a resource from the host |
 | `cbox warden whatsapp pick <resource>` | Choose the WhatsApp chats Claude may read (read-only) |
@@ -184,7 +211,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_MASK` | *(safe mode: secret files)* | Files and folders in the project the container sees empty (see [Hidden secret files](#hidden-secret-files)). Unset: the default list in safe mode, nothing in normal mode; once set, it applies to both modes; `""` = nothing. Applies to newly created containers: `cbox reset` |
 | `CBOX_PROTECT_GIT` | `1` | Mount the project's `.git/config` and `.git/hooks` read-only (see [Git safety](#git-safety-both-modes)); `0` = writable. Applies to newly created containers: `cbox reset` |
 | `CBOX_WARDEN_HOST` | `192.168.64.1` (Apple) / `docker0` IP | Host address containers reach the broker on |
-| `CBOX_WARDEN_SECRET_CMD` | *(unset)* | Hosts without the macOS Keychain: command that prints the secret for an item name |
+| `CBOX_WARDEN_SECRET_CMD` | *(unset)* | Instead of the Keychain or keyring: command that prints the secret for an item name |
 
 > [!WARNING]
 > **Do not place `CBOX_CLAUDE_DIR` (default `~/.config/claudebox/.claude`) or your project directories on iCloud Drive, Dropbox Smart Sync, Google Drive Stream, or any on-demand cloud storage.** These services evict file contents to stubs when not recently accessed. A container mounting an evicted path will fail to read files that appear to exist on disk — a subtle failure that is hard to diagnose.
@@ -301,13 +328,13 @@ credential on the way out. Inside the container, requests go to
 | WhatsApp chats you choose (WhatsApp Desktop on this Mac) | `type = whatsapp` | A read-only MCP server that knows only those chats (see [WhatsApp chats](#whatsapp-chats)) |
 
 ```sh
-cbox warden secret set openrouter   # paste the key; stored in the Keychain
+cbox warden secret set openrouter   # paste the key; stored in the Keychain (Linux: keyring)
 cbox warden edit                    # define the resource (template included)
 cbox warden test openrouter         # check it from the host
 ```
 
 Resources live in `$CBOX_WARDEN_DIR/resources` (default `~/.local/share/claudebox/warden/resources`).
-The file holds no secrets — only Keychain item names and URLs — so it can be
+The file holds no secrets — only Keychain/keyring item names and URLs — so it can be
 kept in a dotfiles repo and symlinked there. Keep it out of anything a container
 mounts: if a container could edit it, it could point a resource at its own
 server. warden checks this and stays off, with a message, when the file or its

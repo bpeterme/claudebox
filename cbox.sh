@@ -92,7 +92,7 @@ MCP servers on the host ($(_cbox_shown "$CBOX_MCP_CONFIG")):
 Credentials without exposing them (warden):
   cbox warden                         List resources and what this project gets
   cbox warden edit                    Define resources (APIs, storage, ssh keys, MCP servers)
-  cbox warden secret set <resource>   Store a secret in the Keychain
+  cbox warden secret set <resource>   Store a secret in the Keychain (Linux: keyring)
   cbox warden approve                 Approve this project's .warden file
   cbox warden test <resource>         Check a resource from the host
   cbox warden whatsapp pick <name>    Choose WhatsApp chats Claude may read
@@ -3060,15 +3060,19 @@ def ssh_trust(d, h, interactive):
 
 
 def read_secret(r, field="secret"):
-    """Secret for resource r: macOS Keychain, or CBOX_WARDEN_SECRET_CMD <item>."""
+    """Secret for resource r: CBOX_WARDEN_SECRET_CMD <item>, else the macOS
+    Keychain, else the Linux keyring through secret-tool (as flux does)."""
     item = r[field]
+    account = r.get("secret-account") or os.environ.get("USER", "")
     cmd = os.environ.get("CBOX_WARDEN_SECRET_CMD")
     if cmd:
         argv = [cmd, item]
     elif sys.platform == "darwin":
-        argv = ["security", "find-generic-password", "-s", item, "-a", r.get("secret-account") or os.environ.get("USER", ""), "-w"]
+        argv = ["security", "find-generic-password", "-s", item, "-a", account, "-w"]
+    elif shutil.which("secret-tool"):
+        argv = ["secret-tool", "lookup", "service", item, "account", account]
     else:
-        raise LookupError("no secret store: set CBOX_WARDEN_SECRET_CMD (a command that prints the secret for an item name)")
+        raise LookupError("no secret store: install secret-tool (apt install libsecret-tools), or set CBOX_WARDEN_SECRET_CMD")
     p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
     value = p.stdout.decode().rstrip("\n")
     if p.returncode != 0 or not value:
@@ -4428,6 +4432,11 @@ _cbox_warden_broker_start() {
     sleep 0.2
   done
   echo "⚠  warden broker did not start — check $CBOX_WARDEN_DIR/broker.log" >&2
+  if [[ "$_CBOX_RUNTIME" == "docker" && -z "${CBOX_WARDEN_HOST:-}" ]] &&
+     ! ip -4 -o addr show docker0 2>/dev/null | grep -q .; then
+    echo "   This host has no docker0 bridge (Docker Desktop?): set CBOX_WARDEN_HOST to an" >&2
+    echo "   address of this machine that containers can reach — see README → Linux and WSL." >&2
+  fi
   return 1
 }
 
@@ -4490,13 +4499,23 @@ _cbox_warden_secret_set() {
     echo "Usage: cbox warden secret set <resource>   (a-z, 0-9, '.', '_' and '-')"
     return 1
   fi
-  if [[ "$(/usr/bin/uname)" != "Darwin" ]]; then
-    echo "Storing secrets needs the macOS Keychain. On other hosts, set CBOX_WARDEN_SECRET_CMD"
-    echo "to a command that prints the secret for an item name (e.g. a 'pass' or 'secret-tool' wrapper)."
-    return 1
+  if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
+    echo "Paste the secret for '$res' (input is hidden). It is stored in the Keychain as cbox.warden.$res."
+    security add-generic-password -U -s "cbox.warden.$res" -a "$USER" -l "cbox warden: $res" -w || return 1
+  else
+    # Linux: the desktop keyring (Secret Service), as flux uses. secret-tool
+    # asks for the value itself, hidden, and never takes it as an argument.
+    if ! command -v secret-tool >/dev/null 2>&1; then
+      echo "Storing secrets needs your keyring and secret-tool: sudo apt install libsecret-tools"
+      echo "(Fedora: libsecret). On WSL or a server, a keyring must be running — see README → Linux and WSL."
+      return 1
+    fi
+    echo "Paste the secret for '$res' (input is hidden). It is stored in your keyring as cbox.warden.$res."
+    secret-tool store --label="cbox warden: $res" service "cbox.warden.$res" account "$USER" || {
+      echo "Could not write to the keyring — is one running? See README → Linux and WSL."
+      return 1
+    }
   fi
-  echo "Paste the secret for '$res' (input is hidden). It is stored in the Keychain as cbox.warden.$res."
-  security add-generic-password -U -s "cbox.warden.$res" -a "$USER" -l "cbox warden: $res" -w || return 1
   echo "✔ Stored. Reference it in $CBOX_WARDEN_DIR/resources with:  secret = cbox.warden.$res"
 }
 

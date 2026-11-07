@@ -25,7 +25,8 @@ WSL2 and servers usually run no keyring; start one per session first:
 ```bash
 sudo apt install gnome-keyring dbus-x11
 [ -n "$DBUS_SESSION_BUS_ADDRESS" ] || eval "$(dbus-launch --sh-syntax)"
-gnome-keyring-daemon --unlock --components=secrets   # type a keyring password, then Ctrl-D
+read -rsp "Keyring password: " pw; echo   # the first unlock creates the keyring with it
+printf '%s' "$pw" | gnome-keyring-daemon --unlock --components=secrets >/dev/null; unset pw
 ```
 
 The warden broker listens on the Docker bridge address (`docker0`). Docker

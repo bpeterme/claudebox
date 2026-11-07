@@ -27,6 +27,53 @@ jobs:
       - name: Run unit tests
         run: bats tests/unit.bats
 
+  # The Homebrew `cbox` runs with #!/bin/bash, which on macOS is always the
+  # system bash 3.2, next to the BSD userland. The Ubuntu jobs cannot catch
+  # regressions there. Integration tests need Docker, which macOS runners lack.
+  unit-macos:
+    name: Unit tests (macOS)
+    runs-on: macos-latest
+    # Ubuntu takes about 3 minutes, macOS over 15 so far; a hang must not hold
+    # a runner for 6 hours.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install bats
+        run: brew install bats-core
+      # The runner image puts Homebrew's bash 5 first on PATH. Put the
+      # system bash 3.2 there instead, as on users' Macs.
+      - name: Use the system bash (3.2)
+        run: |
+          mkdir -p "$RUNNER_TEMP/system-bash"
+          ln -s /bin/bash "$RUNNER_TEMP/system-bash/bash"
+          echo "$RUNNER_TEMP/system-bash" >> "$GITHUB_PATH"
+      - name: Show bash version
+        run: bash --version | head -1
+      # A test that hangs fails after 60 s with its name; --timing shows which
+      # tests are slow on macOS. bats waits for every process still holding its
+      # output open, so a background process a test leaves behind stalls it
+      # after the last test: once all results are in, list such processes by
+      # the output file they hold, stop them, and fail.
+      - name: Run unit tests
+        run: |
+          tap="$RUNNER_TEMP/unit.tap"
+          total=$(bats --count tests/unit.bats)
+          : >"$tap"
+          tail -f "$tap" & tail_pid=$!    # results show in the log as they come
+          BATS_TEST_TIMEOUT=60 bats --timing tests/unit.bats </dev/null >"$tap" 2>&1 &
+          bats_pid=$!
+          while kill -0 "$bats_pid" 2>/dev/null &&
+                [ "$(grep -cE '^(not )?ok ' "$tap")" -lt "$total" ]; do sleep 5; done
+          for _ in 1 2 3 4 5 6; do kill -0 "$bats_pid" 2>/dev/null || break; sleep 5; done
+          sleep 1; kill "$tail_pid" 2>/dev/null || true
+          if kill -0 "$bats_pid" 2>/dev/null; then
+            echo "::error::bats did not exit: processes left behind by tests still hold its output"
+            lsof -t "$tap" | sort -u | while read -r p; do ps -o pid=,ppid=,etime=,command= -p "$p"; done
+            lsof -t "$tap" | xargs kill 2>/dev/null || true
+            exit 1
+          fi
+          wait "$bats_pid"
+
   integration:
     name: Integration tests
     runs-on: ubuntu-latest

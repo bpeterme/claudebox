@@ -58,7 +58,7 @@ fi
 # ---------------------------------------------------------
 
 _cbox_help() {
-    clear
+    clear 2>/dev/null || true  # no terminal (scripts, CI): nothing to clear
     cat <<EOF
 cbox - AI Coding Agent Container Runtime
 
@@ -92,7 +92,7 @@ MCP servers on the host ($(_cbox_shown "$CBOX_MCP_CONFIG")):
 Credentials without exposing them (warden):
   cbox warden                         List resources and what this project gets
   cbox warden edit                    Define resources (APIs, storage, ssh keys, MCP servers)
-  cbox warden secret set <resource>   Store a secret in the Keychain
+  cbox warden secret set <resource>   Store a secret in the Keychain (Linux: keyring)
   cbox warden approve                 Approve this project's .warden file
   cbox warden test <resource>         Check a resource from the host
   cbox warden whatsapp pick <name>    Choose WhatsApp chats Claude may read
@@ -339,6 +339,55 @@ _cbox_system_start() {
   fi
 }
 
+# True inside WSL (Windows Subsystem for Linux).
+_cbox_on_wsl() { grep -qi microsoft /proc/version 2>/dev/null; }
+
+# Stops with one message saying what to install when the runtime command is
+# missing, instead of letting every later runtime call fail on its own.
+_cbox_require_runtime() {
+  local _err
+  if ! command -v "$_CBOX_CMD" >/dev/null 2>&1; then
+    if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
+      echo "✘ Apple's container tool is not installed: https://github.com/apple/container/releases" >&2
+    elif _cbox_on_wsl; then
+      _cbox_wsl_integration_hint
+    else
+      echo "✘ docker is not installed: https://docs.docker.com/engine/install/" >&2
+    fi
+    return 1
+  fi
+  # Apple's runtime is started on demand (_cbox_system_start). Docker must
+  # answer now: an unreachable daemon would fail every later call.
+  [[ "$_CBOX_RUNTIME" == "docker" ]] || return 0
+  _err=$("$_CBOX_CMD" version --format '{{.Server.Version}}' 2>&1 >/dev/null) && return 0
+  case "$_err" in
+    *"permission denied"*)
+      echo "✘ Your user may not use Docker. Add it to the docker group:" >&2
+      echo "    sudo usermod -aG docker \$USER" >&2
+      if _cbox_on_wsl; then
+        echo "  then run 'wsl --shutdown' in Windows and open a new terminal." >&2
+      else
+        echo "  then log out and in again." >&2
+      fi ;;
+    *"WSL 2 distro"*|*"WSL integration"*)
+      # Docker Desktop's Windows docker, reached through Windows' PATH.
+      _cbox_wsl_integration_hint ;;
+    *)
+      echo "✘ Docker is not running: ${_err%%$'\n'*}" >&2
+      if _cbox_on_wsl; then
+        echo "  Start Docker Desktop, or the Docker service in this distro." >&2
+      else
+        echo "  Start it, e.g.: sudo systemctl start docker" >&2
+      fi ;;
+  esac
+  return 1
+}
+
+_cbox_wsl_integration_hint() {
+  echo "✘ docker is not available in this WSL distro. Start Docker Desktop and turn on" >&2
+  echo "  Settings → Resources → WSL integration for this distro, or install Docker Engine here." >&2
+}
+
 _cbox_system_down_hint() {
   echo "  It starts with your next cbox session, or now with: container system start"
 }
@@ -409,7 +458,7 @@ _cbox_maybe_update() {
 
 _cbox_force_update() {
   local name="$1"
-  clear
+  clear 2>/dev/null || true  # no terminal (scripts, CI): nothing to clear
 
   _cbox_system_start
   if ! _cbox_exists "$name"; then
@@ -3060,15 +3109,19 @@ def ssh_trust(d, h, interactive):
 
 
 def read_secret(r, field="secret"):
-    """Secret for resource r: macOS Keychain, or CBOX_WARDEN_SECRET_CMD <item>."""
+    """Secret for resource r: CBOX_WARDEN_SECRET_CMD <item>, else the macOS
+    Keychain, else the Linux keyring through secret-tool (as flux does)."""
     item = r[field]
+    account = r.get("secret-account") or os.environ.get("USER", "")
     cmd = os.environ.get("CBOX_WARDEN_SECRET_CMD")
     if cmd:
         argv = [cmd, item]
     elif sys.platform == "darwin":
-        argv = ["security", "find-generic-password", "-s", item, "-a", r.get("secret-account") or os.environ.get("USER", ""), "-w"]
+        argv = ["security", "find-generic-password", "-s", item, "-a", account, "-w"]
+    elif shutil.which("secret-tool"):
+        argv = ["secret-tool", "lookup", "service", item, "account", account]
     else:
-        raise LookupError("no secret store: set CBOX_WARDEN_SECRET_CMD (a command that prints the secret for an item name)")
+        raise LookupError("no secret store: install secret-tool (apt install libsecret-tools), or set CBOX_WARDEN_SECRET_CMD")
     p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
     value = p.stdout.decode().rstrip("\n")
     if p.returncode != 0 or not value:
@@ -3598,6 +3651,13 @@ class Broker(http.server.BaseHTTPRequestHandler):
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def server_bind(self):
+        # HTTPServer would look up the address's DNS name (socket.getfqdn),
+        # which on macOS can stall startup for many seconds when reverse DNS
+        # does not answer. Nothing here uses that name.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def cmd_serve(d, bind, port, pidfile):
@@ -4376,8 +4436,18 @@ _cbox_warden_host_ip() {
   elif [[ "$_CBOX_RUNTIME" == "apple" ]]; then
     echo "192.168.64.1"
   else
-    ip -4 -o addr show docker0 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}' | grep . || echo "172.17.0.1"
+    _cbox_if_ip docker0 && return 0
+    # Docker Desktop on WSL has no docker0 in the distro, but all WSL 2 distros
+    # (Docker Desktop's included) share one network: containers reach the
+    # distro on its eth0 address.
+    _cbox_on_wsl && _cbox_if_ip eth0 && return 0
+    echo "172.17.0.1"
   fi
+}
+
+# IPv4 address of network interface $1, if it has one.
+_cbox_if_ip() {
+  ip -4 -o addr show "$1" 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}' | grep .
 }
 
 _cbox_warden_broker_pid() {
@@ -4421,6 +4491,11 @@ _cbox_warden_broker_start() {
     sleep 0.2
   done
   echo "⚠  warden broker did not start — check $CBOX_WARDEN_DIR/broker.log" >&2
+  if [[ "$_CBOX_RUNTIME" == "docker" && -z "${CBOX_WARDEN_HOST:-}" ]] &&
+     ! ip -4 -o addr show docker0 2>/dev/null | grep -q .; then
+    echo "   This host has no docker0 bridge (Docker Desktop?): set CBOX_WARDEN_HOST to an" >&2
+    echo "   address of this machine that containers can reach — see README → Linux and WSL." >&2
+  fi
   return 1
 }
 
@@ -4483,13 +4558,23 @@ _cbox_warden_secret_set() {
     echo "Usage: cbox warden secret set <resource>   (a-z, 0-9, '.', '_' and '-')"
     return 1
   fi
-  if [[ "$(/usr/bin/uname)" != "Darwin" ]]; then
-    echo "Storing secrets needs the macOS Keychain. On other hosts, set CBOX_WARDEN_SECRET_CMD"
-    echo "to a command that prints the secret for an item name (e.g. a 'pass' or 'secret-tool' wrapper)."
-    return 1
+  if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
+    echo "Paste the secret for '$res' (input is hidden). It is stored in the Keychain as cbox.warden.$res."
+    security add-generic-password -U -s "cbox.warden.$res" -a "$USER" -l "cbox warden: $res" -w || return 1
+  else
+    # Linux: the desktop keyring (Secret Service), as flux uses. secret-tool
+    # asks for the value itself, hidden, and never takes it as an argument.
+    if ! command -v secret-tool >/dev/null 2>&1; then
+      echo "Storing secrets needs your keyring and secret-tool: sudo apt install libsecret-tools"
+      echo "(Fedora: libsecret). On WSL or a server, a keyring must be running — see README → Linux and WSL."
+      return 1
+    fi
+    echo "Paste the secret for '$res' (input is hidden). It is stored in your keyring as cbox.warden.$res."
+    secret-tool store --label="cbox warden: $res" service "cbox.warden.$res" account "$USER" || {
+      echo "Could not write to the keyring — is one running? See README → Linux and WSL."
+      return 1
+    }
   fi
-  echo "Paste the secret for '$res' (input is hidden). It is stored in the Keychain as cbox.warden.$res."
-  security add-generic-password -U -s "cbox.warden.$res" -a "$USER" -l "cbox warden: $res" -w || return 1
   echo "✔ Stored. Reference it in $CBOX_WARDEN_DIR/resources with:  secret = cbox.warden.$res"
 }
 
@@ -4843,6 +4928,25 @@ _cbox_mask_check() {
   echo "   Hide them: cbox reset"
 }
 
+# Builds cbox's image from the dockerfile (cbox rebuild, and on first use).
+_cbox_build_image() {
+  $_CBOX_CMD build \
+    --build-arg HOST_UID="$(id -u)" \
+    --build-arg BUILD_PLAYWRIGHT="${BUILD_PLAYWRIGHT:-0}" \
+    -t "$CBOX_IMAGE" "$_CBOX_BUILD_DIR"
+}
+
+# Docker would try to pull a missing image from Docker Hub, where cbox's is not
+# published: build it instead. Only for cbox's own image name — any other
+# CBOX_IMAGE is the user's and is pulled as usual. (On macOS, Homebrew's
+# install note says to run cbox rebuild.)
+_cbox_ensure_image() {
+  [[ "$_CBOX_RUNTIME" == "docker" && "$CBOX_IMAGE" == "claudebox" ]] || return 0
+  $_CBOX_CMD image inspect "$CBOX_IMAGE" >/dev/null 2>&1 && return 0
+  echo "Image '$CBOX_IMAGE' not found — building it once (about 5–10 minutes)..."
+  _cbox_build_image
+}
+
 _cbox_create() {
   local name="$1"
   local mode="$2"
@@ -4866,6 +4970,7 @@ _cbox_create() {
 
   local claude_json="$CBOX_DATA_DIR/.claude-$name.json"
 
+  _cbox_ensure_image || return 1
   echo "Creating $mode container '$name' ($agent_bin)..."
 
   local args=(
@@ -5395,7 +5500,9 @@ _cbox_enter() {
     _cbox_audio_start && _audio=1
   fi
 
-  local _exec_args=(-it -w "/Workspace/$name")
+  # CBOX_CONTAINER tells tools such as flux they run in a claudebox container
+  # rather than on a host, which on Linux they cannot tell from the OS alone.
+  local _exec_args=(-it -w "/Workspace/$name" -e "CBOX_CONTAINER=$name")
   local _run="$command" _g _tunnel=$_audio _warden_mcp="" _warden_oc=""
   if (( _audio )); then
     # Through the tunnel, PulseAudio sees a local client and would offer shared
@@ -5687,7 +5794,7 @@ _cbox_doctor_inline() {
 _cbox_doctor() {
   local name
   name=$(_cbox_name)
-  clear
+  clear 2>/dev/null || true  # no terminal (scripts, CI): nothing to clear
 
   echo "== cbox doctor =="
   echo "Version: $_CBOX_VERSION"
@@ -5768,6 +5875,11 @@ cbox() {
   name=$(_cbox_name)
 
   case "$subcommand" in
+    ""|oc|opencode|safe|shell|keepalive|stop|reset|rebuild|update|list|prune)
+      _cbox_require_runtime || return 1 ;;
+  esac
+
+  case "$subcommand" in
 
     oc|opencode)
       local CBOX_AGENT=opencode
@@ -5825,13 +5937,10 @@ cbox() {
       ;;
 
     rebuild)
-      clear
+      clear 2>/dev/null || true  # no terminal (scripts, CI): nothing to clear
       _cbox_system_start
       echo "Rebuilding image '$CBOX_IMAGE'..."
-      $_CBOX_CMD build \
-        --build-arg HOST_UID="$(id -u)" \
-        --build-arg BUILD_PLAYWRIGHT="${BUILD_PLAYWRIGHT:-0}" \
-        -t "$CBOX_IMAGE" "$_CBOX_BUILD_DIR"
+      _cbox_build_image
       ;;
 
     update)
@@ -5869,7 +5978,7 @@ cbox() {
       ;;
 
     list)
-      clear
+      clear 2>/dev/null || true  # no terminal (scripts, CI): nothing to clear
       if _cbox_system_down; then
         echo "✘ Apple's container system is not running, so cbox cannot list containers."
         _cbox_system_down_hint

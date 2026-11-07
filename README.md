@@ -1,17 +1,49 @@
 # claudebox
 
-A shell utility that runs AI coding agents ([Claude Code](https://github.com/anthropics/claude-code) or [opencode](https://github.com/opencode-ai/opencode)) inside an isolated container, scoped to your current project directory. Uses [Apple Container](https://github.com/apple/container) on macOS and Docker on Linux.
+A shell utility that runs AI coding agents ([Claude Code](https://github.com/anthropics/claude-code) or [opencode](https://github.com/opencode-ai/opencode)) inside an isolated container, scoped to your current project directory. Uses [Apple Container](https://github.com/apple/container) on macOS and Docker on Linux, including WSL2 on Windows.
 
 Each project gets its own container, named after the directory. Two modes are available: **normal** (full access to your config and SSH keys) and **safe** (sandboxed with dropped capabilities, memory/CPU limits, and internet access only to hosts you allow).
 
 ## Prerequisites
 
 - **macOS:** [Apple Container](https://github.com/apple/container) 1.0.0+ — requires macOS 26 and Apple Silicon (`cbox doctor` tells you when newer releases fix security issues)
-- **Linux:** Docker
+- **Linux (incl. WSL2):** Docker — see [Linux and WSL](#linux-and-wsl)
+
+### Linux and WSL
+
+claudebox uses Docker on Linux. On WSL2 that is either Docker Engine installed in
+the distro (behaves like any Linux) or Docker Desktop with WSL integration.
+
+warden keeps secrets in the desktop keyring through `secret-tool`, as flux does:
+
+```bash
+sudo apt install libsecret-tools        # Fedora: sudo dnf install libsecret
+```
+
+WSL2 and servers usually run no keyring; start one per session first:
+
+```bash
+sudo apt install gnome-keyring dbus-x11
+[ -n "$DBUS_SESSION_BUS_ADDRESS" ] || eval "$(dbus-launch --sh-syntax)"
+read -rsp "Keyring password: " pw; echo   # the first unlock creates the keyring with it
+printf '%s' "$pw" | gnome-keyring-daemon --unlock --components=secrets >/dev/null; unset pw
+```
+
+Docker Desktop: turn on Settings → Resources → WSL integration for your distro,
+and add yourself to the `docker` group (`sudo usermod -aG docker $USER`, then
+`wsl --shutdown`). `cbox` says which of these is missing.
+
+The warden broker listens on the Docker bridge address (`docker0`). Docker
+Desktop on WSL has none inside the distro; there `cbox` uses the distro's `eth0`
+address, which Docker Desktop's containers reach (WSL 2 distros share one
+network). Set `CBOX_WARDEN_HOST` to choose another address.
+
+Mac-only features (iMCP and other host MCP servers that need macOS apps,
+WhatsApp chats) are not available on Linux.
 
 ## Installation
 
-### Homebrew (recommended)
+### Homebrew (macOS)
 
 ```bash
 brew tap bpeterme/claudebox
@@ -19,10 +51,13 @@ brew install bpeterme/claudebox/claudebox
 cbox --help
 ```
 
-### Manual
+### Manual (Linux, WSL — or macOS)
+
+Homebrew on Linux is untested; use a clone:
 
 ```bash
 git clone https://github.com/bpeterme/claudebox.git ~/claudebox
+# update later: git -C ~/claudebox pull
 ```
 
 Add to your `~/.zshrc` or `~/.bashrc`:
@@ -38,6 +73,9 @@ cbox --help
 ```
 
 ## Quick Start
+
+The image is built once before the first session: on Linux the first `cbox`
+does it (about 5–10 minutes); on macOS run `cbox rebuild` once.
 
 ```bash
 cd ~/my-project
@@ -78,7 +116,7 @@ cbox oc safe   # opencode in safe mode
 | `cbox mcp import` | Import MCP servers from Claude Desktop / Claude Code on the host |
 | `cbox warden` | List credential resources (APIs, storage, ssh keys, MCP servers, WhatsApp chats) and what this project gets (see [Credentials (warden)](#credentials-warden)) |
 | `cbox warden edit` | Define resources the container may use |
-| `cbox warden secret set <resource>` | Store a resource's secret in the macOS Keychain |
+| `cbox warden secret set <resource>` | Store a resource's secret in the macOS Keychain (Linux: keyring) |
 | `cbox warden approve` | Approve this project's `.warden` file |
 | `cbox warden test <resource>` | Check a resource from the host |
 | `cbox warden whatsapp pick <resource>` | Choose the WhatsApp chats Claude may read (read-only) |
@@ -120,7 +158,7 @@ An entry without a port allows ports 443 and 80. `*.example.com` allows every su
 Limits:
 
 - Only programs that use the proxy settings get out: curl, git over https, npm, pip, uv, Claude Code, opencode. git over ssh does not work in safe mode.
-- A host name never leads to your Mac itself or a link-local address. To reach a server on your local network, list its IP address.
+- A host name never leads to this machine itself or a link-local address. To reach a server on your local network, list its IP address.
 - On Apple's runtime the host-only network still reaches services on your Mac that listen on all interfaces.
 - Safe containers created by an older cbox can still reach everything, or cannot keep the login fresh; cbox says so at session start. Recreate one with `cbox reset`.
 
@@ -149,11 +187,11 @@ Limits:
 
 ### Git safety (both modes)
 
-git on your Mac runs commands that a repository names: hooks in `.git/hooks`, and settings in `.git/config` such as `core.fsmonitor`, filters or `core.sshCommand`. Such a command runs with your Keychain and SSH keys, so code in the container must not be able to plant one.
+git on your host runs commands that a repository names: hooks in `.git/hooks`, and settings in `.git/config` such as `core.fsmonitor`, filters or `core.sshCommand`. Such a command runs with your Keychain (or keyring) and SSH keys, so code in the container must not be able to plant one.
 
-- **Read-only:** the project's `.git/config` and `.git/hooks` are mounted read-only. Git commands that write the config fail inside the container (`git remote add`, `git config`, the upstream part of `git push -u`); run them on the Mac. A config change made on the Mac may only show up in the container after its next start. `CBOX_PROTECT_GIT=0` turns this off.
+- **Read-only:** the project's `.git/config` and `.git/hooks` are mounted read-only. Git commands that write the config fail inside the container (`git remote add`, `git config`, the upstream part of `git push -u`); run them on the host. A config change made on the Mac may only show up in the container after its next start. `CBOX_PROTECT_GIT=0` turns this off.
 - **Check at the end:** when the last session of a container ends, cbox looks for git settings that run commands and were not there at the start: in nested repositories, submodules, worktrees, or a replaced `.git`. It names each one with its location and offers to put `.git/config` and `.git/hooks` back as they were (the changed files are kept in `$CBOX_DATA_DIR/git-guard/`). Repositories cloned in the container without such settings are not reported.
-- **Claude and config folders:** if the folder mounted as `~/.claude` or `~/.config` is a git repository (e.g. claudedot's sync repo), its whole `.git` is read-only in the container, because claudedot runs git there on the Mac.
+- **Claude and config folders:** if the folder mounted as `~/.claude` or `~/.config` is a git repository (e.g. claudedot's sync repo), its whole `.git` is read-only in the container, because claudedot runs git there on the host.
 
 ## Configuration
 
@@ -183,8 +221,8 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_EGRESS_ALLOW` | *(unset)* | Hosts a safe container may reach besides the defaults, e.g. `"openrouter.ai *.example.com host:8443"` (see [Outbound traffic in safe mode](#outbound-traffic-in-safe-mode)). Applies from the next session |
 | `CBOX_MASK` | *(safe mode: secret files)* | Files and folders in the project the container sees empty (see [Hidden secret files](#hidden-secret-files)). Unset: the default list in safe mode, nothing in normal mode; once set, it applies to both modes; `""` = nothing. Applies to newly created containers: `cbox reset` |
 | `CBOX_PROTECT_GIT` | `1` | Mount the project's `.git/config` and `.git/hooks` read-only (see [Git safety](#git-safety-both-modes)); `0` = writable. Applies to newly created containers: `cbox reset` |
-| `CBOX_WARDEN_HOST` | `192.168.64.1` (Apple) / `docker0` IP | Host address containers reach the broker on |
-| `CBOX_WARDEN_SECRET_CMD` | *(unset)* | Hosts without the macOS Keychain: command that prints the secret for an item name |
+| `CBOX_WARDEN_HOST` | `192.168.64.1` (Apple) / `docker0` IP (WSL without it: `eth0`) | Host address containers reach the broker on |
+| `CBOX_WARDEN_SECRET_CMD` | *(unset)* | Instead of the Keychain or keyring: command that prints the secret for an item name |
 
 > [!WARNING]
 > **Do not place `CBOX_CLAUDE_DIR` (default `~/.config/claudebox/.claude`) or your project directories on iCloud Drive, Dropbox Smart Sync, Google Drive Stream, or any on-demand cloud storage.** These services evict file contents to stubs when not recently accessed. A container mounting an evicted path will fail to read files that appear to exist on disk — a subtle failure that is hard to diagnose.
@@ -288,7 +326,7 @@ the project (or run `cbox stop`) and start `cbox` again.
 
 Code in the container can use API keys and other credentials **without the
 container ever holding them**. A broker on the host keeps the secret (macOS
-Keychain), checks each request against what you allowed, and adds the
+Keychain or Linux keyring), checks each request against what you allowed, and adds the
 credential on the way out. Inside the container, requests go to
 `$WARDEN_URL/<resource>/...` — the key a client sends is always replaced.
 
@@ -301,13 +339,13 @@ credential on the way out. Inside the container, requests go to
 | WhatsApp chats you choose (WhatsApp Desktop on this Mac) | `type = whatsapp` | A read-only MCP server that knows only those chats (see [WhatsApp chats](#whatsapp-chats)) |
 
 ```sh
-cbox warden secret set openrouter   # paste the key; stored in the Keychain
+cbox warden secret set openrouter   # paste the key; stored in the Keychain (Linux: keyring)
 cbox warden edit                    # define the resource (template included)
 cbox warden test openrouter         # check it from the host
 ```
 
 Resources live in `$CBOX_WARDEN_DIR/resources` (default `~/.local/share/claudebox/warden/resources`).
-The file holds no secrets — only Keychain item names and URLs — so it can be
+The file holds no secrets — only Keychain/keyring item names and URLs — so it can be
 kept in a dotfiles repo and symlinked there. Keep it out of anything a container
 mounts: if a container could edit it, it could point a resource at its own
 server. warden checks this and stays off, with a message, when the file or its
@@ -334,7 +372,7 @@ project in a bucket:
 prefix = my-project
 ```
 
-**SSH keys** (`type = ssh`) stay on the Mac. The container gets an ssh agent
+**SSH keys** (`type = ssh`) stay on the host. The container gets an ssh agent
 (`SSH_AUTH_SOCK`) instead of the key file, so `git push` and `ssh` work as
 usual, but nothing in the container can copy the key. Keys come only from
 `CBOX_SSH_DIR`, the claudebox ssh folder set in `cbox.env` — never from your own
@@ -355,14 +393,14 @@ refused; without `CBOX_SSH_DIR`, ssh resources stay off.
 
 - warden runs an agent of its own (not your usual one) and adds the key with
   `ssh-add -h <host>`, so the agent itself refuses to sign for any other host.
-  The first `cbox` session after a Mac restart unlocks it; on macOS, ssh-add
+  The first `cbox` session after a restart unlocks it; on macOS, ssh-add
   takes the passphrase from the Keychain, and asks once otherwise.
 - The agent recognises each server by its host key. warden keeps its own list
   of confirmed server keys (`$CBOX_WARDEN_DIR/ssh/known_hosts`, never mounted).
   For a new server, the next `cbox` session shows the key's fingerprint and asks
   once whether to trust it. The key comes from `$CBOX_SSH_DIR/known_hosts`
   if it lists the server, otherwise from the server itself (`ssh-keyscan` from
-  the Mac). It is never trusted from that file alone, because containers can
+  the host). It is never trusted from that file alone, because containers can
   write it. If a server's key changes, delete its line from warden's list.
   The container's ssh gets the confirmed keys of its granted servers as its
   system list (`/etc/ssh/ssh_known_hosts`), so it does not ask again.

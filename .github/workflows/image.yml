@@ -1,0 +1,43 @@
+name: Image
+
+# Builds the real image on x86-64 Linux, as cbox does there, and checks the
+# tools a session needs. Runs only when the image definition changes.
+on:
+  push:
+    branches: [dev, main]
+    paths: [dockerfile, .github/workflows/image.yml]
+  pull_request:
+    branches: [main]
+    paths: [dockerfile, .github/workflows/image.yml]
+
+jobs:
+  build:
+    name: Image build (Linux x86-64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build
+        run: docker build --build-arg HOST_UID="$(id -u)" -t cbox-ci -f dockerfile .
+      - name: Session tools are there
+        run: |
+          docker run --rm --user claude cbox-ci zsh -lc '
+            set -e
+            claude --version
+            flux version
+            dvc --version
+            uv --version
+            gh --version | head -1
+            id -u'
+      - name: Files written in the workspace belong to the host user
+        run: |
+          mkdir -p "$RUNNER_TEMP/ws"
+          docker run --rm --user claude -v "$RUNNER_TEMP/ws:/Workspace/ws" cbox-ci \
+            sh -c 'echo hi > /Workspace/ws/from-container'
+          [ "$(stat -c %u "$RUNNER_TEMP/ws/from-container")" = "$(id -u)" ]
+      # UID 1000 is the usual first user on Linux and WSL, and Ubuntu's image
+      # already has a user with it. The runner's own UID is 1001.
+      - name: Build for a host user with UID 1000
+        run: |
+          docker build --build-arg HOST_UID=1000 -t cbox-ci-1000 -f dockerfile .
+          [ "$(docker run --rm --user claude cbox-ci-1000 id -u)" = "1000" ]

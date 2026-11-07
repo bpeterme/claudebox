@@ -3,6 +3,20 @@
 CBOX_SH="$(cd "$BATS_TEST_DIRNAME/.." && pwd)/cbox.sh"
 
 setup() {
+  # On macOS the temp dir (/var/folders/…) is itself behind a symlink
+  # (/var → /private/var); cbox resolves paths, so compare against the real one.
+  BATS_TMPDIR=$(cd "$BATS_TMPDIR" && pwd -P)
+  # macOS has no `timeout`; the relay tests use it to bound a hanging client.
+  if ! command -v timeout >/dev/null 2>&1; then
+    mkdir -p "$BATS_TMPDIR/bin"
+    cat > "$BATS_TMPDIR/bin/timeout" <<'PL'
+#!/usr/bin/perl
+# timeout SECONDS COMMAND...: the alarm survives exec and ends COMMAND.
+my $s = shift; alarm $s; exec @ARGV or die "timeout: $ARGV[0]: $!\n";
+PL
+    chmod +x "$BATS_TMPDIR/bin/timeout"
+    PATH="$BATS_TMPDIR/bin:$PATH"
+  fi
   export HOME="$BATS_TMPDIR/home"
   # CI runners set these to the real home; cbox's defaults must follow $HOME here.
   unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME
@@ -20,6 +34,30 @@ setup() {
   export CBOX_MASK=""
   # shellcheck source=/dev/null
   source "$CBOX_SH"
+}
+
+# Runs even when a test failed before its own inline cleanup. A server left
+# running would hold bats' output open (bats then never exits) and keep ports
+# and sockets the following tests need.
+teardown() {
+  if [[ -n "${UP_PID:-}" ]]; then
+    # A failed warden test: the broker's own log says why.
+    [[ -n "${BATS_TEST_COMPLETED:-}" ]] || {
+      echo "--- broker.log"; cat "$CBOX_WARDEN_DIR/broker.log" 2>/dev/null; echo "---"
+    } >&2
+    _warden_teardown
+  fi
+  if [[ -n "${RELAY_TMP:-}" && -d "$RELAY_TMP" ]]; then _relay_teardown; fi
+  if [[ -f "${TT:-/nonexistent}/tunnel.pid" ]]; then
+    kill -TERM -- "-$(cat "$TT/tunnel.pid")" 2>/dev/null || true
+    rm -f "$TT/tunnel.pid"
+  fi
+  return 0
+}
+
+# The runtime command cbox calls on this host.
+_runtime_bin() {
+  if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then echo container; else echo docker; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -287,7 +325,8 @@ _relay_client() {
 _wait_procs() {
   local i
   for i in $(seq 1 $(( $2 * 5 ))); do
-    [ "$(pgrep -fc "$1")" -eq "$3" ] && return 0
+    # Counted with wc: macOS pgrep has no -c.
+    [ "$(pgrep -f "$1" | wc -l | tr -d ' ')" -eq "$3" ] && return 0
     sleep 0.2
   done
   return 1
@@ -473,6 +512,8 @@ class H(http.server.BaseHTTPRequestHandler):
         self.wfile.write(out)
     do_GET = do_POST = do_PUT = do_DELETE = handle_any
     def log_message(self, *a): pass
+# No getfqdn() lookup at bind: it can stall for seconds on macOS.
+http.server.ThreadingHTTPServer.server_bind = lambda self: http.server.socketserver.TCPServer.server_bind(self)
 http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
 PY
   python3 "$WT/upstream.py" "$UP_PORT" &
@@ -861,6 +902,20 @@ _warden_relocate() {
   [ "$took" -lt 10 ]
 }
 
+@test "warden: without docker0 (Docker Desktop on WSL) a failed start says to set CBOX_WARDEN_HOST" {
+  _warden_setup
+  unset CBOX_WARDEN_HOST
+  _CBOX_RUNTIME=docker
+  # No docker0 bridge, and the fallback address is not on this machine
+  # (192.0.2.1 is reserved for documentation; CI runners do have 172.17.0.1).
+  mkdir -p "$WT/bin"; printf '#!/bin/sh\nexit 1\n' > "$WT/bin/ip"; chmod +x "$WT/bin/ip"
+  _cbox_warden_host_ip() { echo 192.0.2.1; }
+  PATH="$WT/bin:$PATH" run _cbox_warden_broker_start
+  _warden_teardown
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no docker0 bridge"*"CBOX_WARDEN_HOST"* ]]
+}
+
 @test "cbox warden: lists resources and what this project gets" {
   _warden_setup
   printf '[proj]\n' > .warden
@@ -881,6 +936,39 @@ _warden_relocate() {
   run _cbox_warden_cmd secret set "Bad Name"
   [ "$status" -eq 1 ]
   [[ "$output" == *"Usage: cbox warden secret set"* ]]
+}
+
+# Fake secret-tool (Linux keyring): store reads the value from stdin into a
+# file per service; lookup prints it. Arguments are logged.
+_fake_secret_tool() {
+  mkdir -p "$BATS_TMPDIR/kr/bin" "$BATS_TMPDIR/kr/items"
+  cat > "$BATS_TMPDIR/kr/bin/secret-tool" <<'SH'
+#!/bin/sh
+d="$(dirname "$0")/../items"; echo "$*" >> "$d/../args"
+op=$1; shift; svc=""
+while [ $# -gt 0 ]; do [ "$1" = service ] && svc=$2; shift; done
+case "$op" in
+  store)  cat > "$d/$svc" ;;
+  lookup) cat "$d/$svc" 2>/dev/null ;;
+esac
+SH
+  chmod +x "$BATS_TMPDIR/kr/bin/secret-tool"
+  PATH="$BATS_TMPDIR/kr/bin:$PATH"
+}
+
+@test "warden on Linux: secret set stores in the keyring; the broker reads it from there" {
+  [[ "$(/usr/bin/uname)" != "Darwin" ]] || skip "macOS uses the Keychain"
+  _warden_setup
+  unset CBOX_WARDEN_SECRET_CMD
+  _fake_secret_tool
+  run bash -c "printf 'kr-secret-123' | { source '$CBOX_SH'; _cbox_warden_cmd secret set llm; }"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"stored in your keyring as cbox.warden.llm"* ]]
+  ! grep -q 'kr-secret-123' "$BATS_TMPDIR/kr/args"
+  url=$(_warden_url)
+  run curl -s "$url/llm/models"
+  _warden_teardown
+  [[ "$output" == *'"authorization": "Bearer kr-secret-123"'* ]]
 }
 
 @test "cbox warden: unknown command shows usage" {
@@ -1467,6 +1555,7 @@ _label_from_json() {
   run bash -c 'set -euo pipefail; source "$1"; '"$(declare -f _apple_json_none _apple_ls_stub _apple_ls_json)"'
     BATS_TMPDIR="$2"; _apple_ls_stub; APPLE_LS=$(_apple_json_none)
     _cbox_system_start() { :; }; _cbox_clean_running() { :; }; clear() { :; }
+    _cbox_require_runtime() { :; }
     cbox prune; echo DONE' _ "$CBOX_SH" "$BATS_TMPDIR"
   [ "$status" -eq 0 ]
   [[ "$output" == *"Nothing to prune."*"DONE"* ]]
@@ -1682,6 +1771,7 @@ _clean_stubs() {
   }
   run bash -c "
     source '$CBOX_SH'
+    _cbox_require_runtime() { :; }
     _cbox_ensure() { true; }
     _cbox_enter() { echo \"agent=\$(_cbox_agent_bin)\"; }
     cbox oc
@@ -1693,6 +1783,7 @@ _clean_stubs() {
 @test "cbox oc safe: sets CBOX_AGENT=opencode for safe mode" {
   run bash -c "
     source '$CBOX_SH'
+    _cbox_require_runtime() { :; }
     _cbox_ensure() { true; }
     _cbox_enter() { echo \"agent=\$(_cbox_agent_bin) mode=\$2\"; }
     cbox oc safe
@@ -1956,17 +2047,23 @@ _run_cbox_script_with_fake_docker() {
   local bin="$BATS_TMPDIR/fake-bin" proj="$BATS_TMPDIR/exitpath"
   mkdir -p "$bin" "$proj" "$BATS_TMPDIR/exitpath-tmp"
   rm -f "$BATS_TMPDIR/exitpath-tmp"/.cbox-active-*
+  # One fake for both runtimes: cbox calls `container` on macOS, `docker` elsewhere.
   cat > "$bin/docker" <<'SH'
 #!/bin/bash
-echo "docker $*" >> "$FAKE_LOG"
+rt=${0##*/}
+echo "$rt $*" >> "$FAKE_LOG"
 case "$1" in
   ps) echo "exitpath running" ;;
-  inspect) echo '[{"Config":{"Labels":{"cbox.mode":"normal"}}}]' ;;
+  ls) echo '[{"configuration":{"id":"exitpath","labels":{"cbox.project":"true","cbox.mode":"normal"}},"status":{"state":"running"}}]' ;;
+  inspect)
+    if [[ "$rt" == container ]]; then echo '[{"configuration":{"labels":{"cbox.mode":"normal"}}}]'
+    else echo '[{"Config":{"Labels":{"cbox.mode":"normal"}}}]'; fi ;;
   exec) [[ " $* " == *" -it "* ]] && exit "${FAKE_EXEC_RC:-0}" ;;
 esac
 exit 0
 SH
   chmod +x "$bin/docker"
+  ln -sf docker "$bin/container"
   : > "$BATS_TMPDIR/exitpath.log"
   cd "$proj"
   FAKE_LOG="$BATS_TMPDIR/exitpath.log" TMPDIR="$BATS_TMPDIR/exitpath-tmp" \
@@ -1976,13 +2073,13 @@ SH
 @test "exit path: container is stopped even when the agent exits non-zero" {
   FAKE_EXEC_RC=130 run _run_cbox_script_with_fake_docker
   [ "$status" -eq 0 ]
-  grep -qx "docker stop exitpath" "$BATS_TMPDIR/exitpath.log"
+  grep -qx "$(_runtime_bin) stop exitpath" "$BATS_TMPDIR/exitpath.log"
 }
 
 @test "exit path: container is stopped when the agent exits cleanly" {
   FAKE_EXEC_RC=0 run _run_cbox_script_with_fake_docker
   [ "$status" -eq 0 ]
-  grep -qx "docker stop exitpath" "$BATS_TMPDIR/exitpath.log"
+  grep -qx "$(_runtime_bin) stop exitpath" "$BATS_TMPDIR/exitpath.log"
 }
 
 # ---------------------------------------------------------------------------
@@ -2623,7 +2720,8 @@ INI
 
 @test "warden opencode: a resource with opencode = <provider> routes that provider through warden" {
   _warden_setup
-  sed -i 's|^env          = OPENAI_BASE_URL={url} OPENAI_API_KEY=warden|&\nopencode     = openrouter|' "$CBOX_WARDEN_DIR/resources"
+  # perl, not sed: BSD sed writes no newline for \n in a replacement.
+  perl -pi -e 's|^env          = OPENAI_BASE_URL=\{url\} OPENAI_API_KEY=warden$|$&\nopencode     = openrouter|' "$CBOX_WARDEN_DIR/resources"
   printf '[s3x]\nupstream = http://127.0.0.1:1\nauth = sigv4\nkey-id = a\nsecret = b\nopencode = x\n' >> "$CBOX_WARDEN_DIR/resources"
   run _warden_env
   base=$(sed -n 's/^WARDEN_URL=//p' <<<"$output")
@@ -2637,7 +2735,7 @@ INI
   _ssh_setup
   _ssh_stubs
   _known_hosts github.com 203.0.113.5 "[198.51.100.7]:2200" "[2001:db8::1]:2222"
-  sed -i 's|^hosts = github.com$|hosts = github.com 203.0.113.5 198.51.100.7:2200 [2001:db8::1]:2222 example.org:22|' "$CBOX_WARDEN_DIR/resources"
+  sed -i.bak 's|^hosts = github.com$|hosts = github.com 203.0.113.5 198.51.100.7:2200 [2001:db8::1]:2222 example.org:22|' "$CBOX_WARDEN_DIR/resources"
   printf '[bad]\ntype = ssh\nkey = %s\nhosts = 10.0.0.1:99999\n' "$TT/keys/two" >> "$CBOX_WARDEN_DIR/resources"
   echo "example.org ssh-ed25519 $(_fake_host_key example.org)" >> "$CBOX_WARDEN_DIR/ssh/known_hosts"
   : > "$TT/loaded"
@@ -2650,7 +2748,7 @@ INI
 @test "warden ssh: a new server's key is confirmed once, from the claudebox known_hosts" {
   _ssh_setup
   _ssh_stubs
-  sed -i 's|^hosts = github.com$|hosts = github.com 198.51.100.7:2200|' "$CBOX_WARDEN_DIR/resources"
+  sed -i.bak 's|^hosts = github.com$|hosts = github.com 198.51.100.7:2200|' "$CBOX_WARDEN_DIR/resources"
   echo "[198.51.100.7]:2200 ssh-ed25519 $(_fake_host_key vm)" > "$TT/keys/known_hosts"
   : > "$TT/loaded"
   # Declined: the server stays off, the key still unlocks for github.com.
@@ -2673,7 +2771,7 @@ INI
 @test "warden ssh: without an entry warden asks the server itself, and never reads ~/.ssh/known_hosts" {
   _ssh_setup
   _ssh_stubs
-  sed -i 's|^hosts = github.com$|hosts = 198.51.100.7:2200|' "$CBOX_WARDEN_DIR/resources"
+  sed -i.bak 's|^hosts = github.com$|hosts = 198.51.100.7:2200|' "$CBOX_WARDEN_DIR/resources"
   mkdir -p "$HOME/.ssh"
   echo "[198.51.100.7]:2200 ssh-ed25519 $(_fake_host_key personal)" > "$HOME/.ssh/known_hosts"
   echo "[198.51.100.7]:2200 ssh-ed25519 $(_fake_host_key scanned)" > "$TT/keyscan"
@@ -2715,7 +2813,7 @@ INI
   once=$(cat "$TT/ssh-add.args")
   # A host added later: the key is added again with the new list.
   _known_hosts github.com gitlab.com example.org
-  sed -i 's|^hosts = gitlab.com$|hosts = gitlab.com example.org|' "$CBOX_WARDEN_DIR/resources"
+  sed -i.bak 's|^hosts = gitlab.com$|hosts = gitlab.com example.org|' "$CBOX_WARDEN_DIR/resources"
   _ssh_py 'ssh_load(sys.argv[1], ["gh"], load_resources(sys.argv[1]), True)' "$CBOX_WARDEN_DIR" 2>/dev/null
   again=$(sed -n 2p "$TT/ssh-add.args")
   _warden_env >/dev/null   # wbox: only the global 'gh' is granted
@@ -2886,6 +2984,15 @@ _enter_safe() {
   run _enter_safe
   run cat "$BATS_TMPDIR/enter-egress"
   [[ "$output" == *"tunnel ebox on"*"ready ebox"*"exec -it"* ]]
+}
+
+@test "_cbox_enter: every session is marked as a claudebox container (CBOX_CONTAINER)" {
+  for MODE in normal safe; do
+    EGRESS=allowlist LOGIN=shared
+    run _enter_safe
+    run cat "$BATS_TMPDIR/enter-egress"
+    [[ "$output" == *"exec -it -w /Workspace/ebox -e CBOX_CONTAINER=ebox "* ]]
+  done
 }
 
 # _cbox_maybe_update for container ubox in $MODE; READY decides whether the
@@ -3096,7 +3203,7 @@ _safe_setup() {
   _cbox_safe_claude_dir sbox
   # /logout + /login in the container: a new file, newer than the shared one.
   rm -f "$SD/.credentials.json"; echo 'new login' > "$SD/.credentials.json"
-  touch -d '2000-01-01' "$CBOX_CLAUDE_DIR/.credentials.json"
+  touch -t 200001010000 "$CBOX_CLAUDE_DIR/.credentials.json"
   _cbox_safe_claude_dir sbox
   [ "$SD/.credentials.json" -ef "$CBOX_CLAUDE_DIR/.credentials.json" ]
   [ "$(cat "$CBOX_CLAUDE_DIR/.credentials.json")" = "new login" ]
@@ -3104,7 +3211,7 @@ _safe_setup() {
 
 @test "_cbox_safe_claude_dir: a newer login in the shared folder replaces the safe one" {
   _safe_setup
-  mkdir -p "$SD"; echo 'stale' > "$SD/.credentials.json"; touch -d '2000-01-01' "$SD/.credentials.json"
+  mkdir -p "$SD"; echo 'stale' > "$SD/.credentials.json"; touch -t 200001010000 "$SD/.credentials.json"
   _cbox_safe_claude_dir sbox
   [ "$SD/.credentials.json" -ef "$CBOX_CLAUDE_DIR/.credentials.json" ]
   [ "$(cat "$SD/.credentials.json")" = "old" ]
@@ -3154,6 +3261,7 @@ _safe_setup() {
 
 @test "cbox shell: opens zsh in an existing safe container" {
   cd "$BATS_TMPDIR"
+  _cbox_require_runtime() { :; }
   _cbox_ensure() { echo "ensure $*"; }
   _cbox_enter() { echo "enter $*"; }
   run cbox shell
@@ -4030,4 +4138,139 @@ _mask_project() {
   run _enter_safe
   run cat "$BATS_TMPDIR/enter-egress"
   [[ "$output" == *"mask-check ebox safe"*"exec -it"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# missing runtime
+# ---------------------------------------------------------------------------
+
+@test "missing runtime: cbox stops at once and says what to install" {
+  _CBOX_CMD=cbox-no-such-runtime _CBOX_RUNTIME=docker
+  _cbox_on_wsl() { return 1; }
+  run cbox shell
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"docker is not installed"* ]]
+  [[ "$output" != *"command not found"* ]]
+  [[ "$output" != *"Creating"* ]]
+}
+
+@test "missing runtime: on WSL the message points to Docker Desktop's WSL integration" {
+  _CBOX_CMD=cbox-no-such-runtime _CBOX_RUNTIME=docker
+  _cbox_on_wsl() { return 0; }
+  run cbox
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"WSL integration"* ]]
+}
+
+@test "missing runtime: host-only commands still work (warden, help)" {
+  _CBOX_CMD=cbox-no-such-runtime _CBOX_RUNTIME=docker
+  run cbox warden
+  [[ "$output" != *"docker is not installed"* ]]
+}
+
+# A docker command that fails like a daemon would, with stderr $1.
+_failing_docker() {
+  mkdir -p "$BATS_TMPDIR/faildocker"
+  printf '#!/bin/sh\necho "Client: fine"\necho "%s" >&2\nexit 1\n' "$1" > "$BATS_TMPDIR/faildocker/docker"
+  chmod +x "$BATS_TMPDIR/faildocker/docker"
+  _CBOX_CMD="$BATS_TMPDIR/faildocker/docker" _CBOX_RUNTIME=docker
+}
+
+@test "missing runtime: no permission on the Docker socket names the docker group" {
+  _failing_docker "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock"
+  _cbox_on_wsl() { return 0; }
+  run cbox shell
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"sudo usermod -aG docker"*"wsl --shutdown"* ]]
+  [[ "$output" != *"Creating"* ]]
+}
+
+@test "missing runtime: Docker Desktop's Windows docker without WSL integration" {
+  _failing_docker "Error response from daemon: The command 'docker' could not be found in this WSL 2 distro."
+  _cbox_on_wsl() { return 0; }
+  run cbox
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Settings → Resources → WSL integration"* ]]
+}
+
+@test "missing runtime: a stopped daemon says so, with its own first error line" {
+  _failing_docker "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+  _cbox_on_wsl() { return 1; }
+  run cbox list
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Docker is not running: Cannot connect to the Docker daemon"*"systemctl start docker"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# image on first use
+# ---------------------------------------------------------------------------
+
+# Fake docker: `image inspect` succeeds only when $1 is "present".
+_image_docker() {
+  mkdir -p "$BATS_TMPDIR/imgdocker"; IMG_LOG="$BATS_TMPDIR/imgdocker/log"; : > "$IMG_LOG"
+  printf '#!/bin/sh\necho "$*" >> "%s"\n[ "$1 $2" = "image inspect" ] && exit %s\nexit 0\n' \
+    "$IMG_LOG" "$([ "$1" = present ] && echo 0 || echo 1)" > "$BATS_TMPDIR/imgdocker/docker"
+  chmod +x "$BATS_TMPDIR/imgdocker/docker"
+  _CBOX_CMD="$BATS_TMPDIR/imgdocker/docker" _CBOX_RUNTIME=docker
+}
+
+@test "image: a missing claudebox image is built on first use, not pulled" {
+  _image_docker missing; CBOX_IMAGE=claudebox
+  run _cbox_ensure_image
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not found — building it once"* ]]
+  grep -q "^build --build-arg HOST_UID=$(id -u) .* -t claudebox " "$IMG_LOG"
+}
+
+@test "image: an existing image is not rebuilt" {
+  _image_docker present; CBOX_IMAGE=claudebox
+  run _cbox_ensure_image
+  [ -z "$output" ]
+  ! grep -q '^build' "$IMG_LOG"
+}
+
+@test "image: a custom CBOX_IMAGE is never built (Docker pulls it as usual)" {
+  _image_docker missing; CBOX_IMAGE=registry.example/team/agent
+  run _cbox_ensure_image
+  [ -z "$output" ]
+  ! grep -q '^build' "$IMG_LOG"
+}
+
+# ---------------------------------------------------------------------------
+# warden broker address on Docker
+# ---------------------------------------------------------------------------
+
+# Fake `ip`: interfaces named in $1 ("docker0 eth0") have an address.
+_fake_ip() {
+  mkdir -p "$BATS_TMPDIR/fakeip"
+  cat > "$BATS_TMPDIR/fakeip/ip" <<SH
+#!/bin/sh
+for i in $1; do
+  [ "\$5" = "\$i" ] && { [ \$i = docker0 ] && a=172.17.0.1 || a=172.20.65.150; echo "7: \$i    inet \$a/20 brd x scope global \$i"; }
+done
+exit 0
+SH
+  chmod +x "$BATS_TMPDIR/fakeip/ip"
+  PATH="$BATS_TMPDIR/fakeip:$PATH"
+  unset CBOX_WARDEN_HOST; _CBOX_RUNTIME=docker
+}
+
+@test "warden address: docker0 when it exists" {
+  _fake_ip "docker0 eth0"; _cbox_on_wsl() { return 0; }
+  [ "$(_cbox_warden_host_ip)" = "172.17.0.1" ]
+}
+
+@test "warden address: on WSL without docker0 (Docker Desktop), the distro's eth0" {
+  _fake_ip "eth0"; _cbox_on_wsl() { return 0; }
+  [ "$(_cbox_warden_host_ip)" = "172.20.65.150" ]
+}
+
+@test "warden address: plain Linux without docker0 never picks eth0" {
+  _fake_ip "eth0"; _cbox_on_wsl() { return 1; }
+  [ "$(_cbox_warden_host_ip)" = "172.17.0.1" ]
+}
+
+@test "warden address: CBOX_WARDEN_HOST wins" {
+  _fake_ip "docker0 eth0"; export CBOX_WARDEN_HOST=10.0.0.9
+  [ "$(_cbox_warden_host_ip)" = "10.0.0.9" ]
 }

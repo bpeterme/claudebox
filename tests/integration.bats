@@ -23,6 +23,10 @@ setup() {
 
 teardown() {
   _cbox_tunnel_stop "$TEST_NAME" 2>/dev/null || true
+  if [[ -n "${UP_PID:-}" ]]; then
+    _cbox_warden_broker_stop 2>/dev/null || true
+    kill "$UP_PID" 2>/dev/null || true
+  fi
   docker rm -f "$TEST_NAME" 2>/dev/null || true
   # $BATS_TMPDIR/claude is shared with unit.bats: drop the symlinks the
   # tests above create there, or later runs trip over them.
@@ -249,4 +253,39 @@ except Exception as e:
   # the files on the host are untouched
   [ "$(cat .env)" = "TOKEN=s3cret" ]
   rm -rf secrets .env .env.example
+}
+
+# ---------------------------------------------------------------------------
+# warden on Docker: the broker listens on the bridge address
+# ---------------------------------------------------------------------------
+
+@test "warden: a Docker container reaches the broker on the bridge; the secret is added on the host" {
+  export CBOX_IMAGE="python:3.12-alpine"
+  unset CBOX_WARDEN_HOST            # the real address choice: docker0
+  rm -rf "$CBOX_WARDEN_DIR"; mkdir -p "$CBOX_WARDEN_DIR"
+  local free='import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'
+  CBOX_WARDEN_PORT=$(python3 -c "$free")
+  local up_port; up_port=$(python3 -c "$free")
+  printf '#!/bin/sh\necho "sk-test-REDACTED-$1"\n' > "$BATS_TMPDIR/secret"; chmod +x "$BATS_TMPDIR/secret"
+  export CBOX_WARDEN_SECRET_CMD="$BATS_TMPDIR/secret"
+  # Upstream on the host's loopback: answers with the Authorization it got.
+  python3 -c '
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        b = (self.headers.get("Authorization") or "none").encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self, *a): pass
+http.server.HTTPServer.server_bind = lambda self: http.server.socketserver.TCPServer.server_bind(self)
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()' "$up_port" </dev/null >/dev/null 2>&1 &
+  UP_PID=$!
+  printf '[llm]\nupstream = http://127.0.0.1:%s/v1\nauth = bearer\nsecret = cbox.warden.llm\n' "$up_port" \
+    > "$CBOX_WARDEN_DIR/resources"
+  _cbox_create "$TEST_NAME" "normal"
+  local url; url=$(_cbox_warden_start "$TEST_NAME" </dev/null | sed -n 's/^WARDEN_URL=//p')
+  [[ "$url" == "http://$(_cbox_warden_host_ip):$CBOX_WARDEN_PORT/"* ]]
+  run docker exec "$TEST_NAME" python3 -c \
+    'import sys, urllib.request; print(urllib.request.urlopen(sys.argv[1] + "/llm/models", timeout=10).read().decode())' "$url"
+  [ "$status" -eq 0 ]
+  [ "$output" = "Bearer sk-test-REDACTED-cbox.warden.llm" ]
 }

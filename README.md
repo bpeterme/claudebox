@@ -98,6 +98,7 @@ cbox oc safe   # opencode in safe mode
 - Agent config read-only, except the login: safe and normal containers share one login, and a refresh in either keeps it valid for both. Each safe container has its own `~/.claude` (in `$CBOX_DATA_DIR/safe-claude/<name>`) whose entries link to the shared folder; its `.credentials.json` is the shared file itself (a hard link). A safe container can therefore change the shared login, but not your settings, hooks or skills
 - Claude Code's telemetry and error reports are off (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`)
 - Internet access only to allowed hosts (see below)
+- Secret files in the project read as empty (see below)
 
 #### Outbound traffic in safe mode
 
@@ -122,6 +123,29 @@ Limits:
 - A host name never leads to your Mac itself or a link-local address. To reach a server on your local network, list its IP address.
 - On Apple's runtime the host-only network still reaches services on your Mac that listen on all interfaces.
 - Safe containers created by an older cbox can still reach everything, or cannot keep the login fresh; cbox says so at session start. Recreate one with `cbox reset`.
+
+#### Hidden secret files
+
+A safe container sees secret files in the project as empty files: it cannot read them, and what it writes to them is discarded. The files on your Mac stay as they are. By default this covers:
+
+- `.env` and `.env.*`, but not `.env.example`, `.env.sample` or `.env.template`
+- `*.pem`, `*.key`, and private SSH keys (`id_rsa*`, `id_ecdsa*`, `id_ed25519*`, but not `*.pub`)
+
+Change the list in `cbox.env`. It applies to both modes once set; `CBOX_MASK=""` hides nothing:
+
+```bash
+CBOX_MASK=".env .env.* !.env.example *.pem secrets/ config/prod.yml"
+```
+
+`name` or `*.ext` matches a file anywhere in the project, `dir/` a folder (shown empty), `a/b` a path from the project root, and `!pattern` keeps a match visible. `.git` and `node_modules` are not searched.
+
+Limits:
+
+- The list is fixed when the container is created. A secret file added later stays visible until `cbox reset`; cbox names such files at session start.
+- Code in the container cannot use the hidden values either. To let it use a credential without seeing it, use [warden](#credentials-warden).
+- A hidden file that git tracks shows up as changed in the container; do not commit it from there (cbox warns when it creates the container). Secrets that were ever committed are still in `.git`.
+- `*.key` also matches Keynote files. If a project has Keynote files, set `CBOX_MASK` with `!*.key` and name its real key files instead.
+- Apple's runtime needs container 1.2.1 or newer (`--masked-path`). With an older one cbox does not create the container, rather than create it without hiding.
 
 ### Git safety (both modes)
 
@@ -157,6 +181,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_WARDEN_PORT` | `47100` | Port of the warden broker, bound only to the container-facing host address |
 | `CBOX_MEMORY` | `4g` | Memory of each container (both modes). Applies to newly created containers: `cbox reset` |
 | `CBOX_EGRESS_ALLOW` | *(unset)* | Hosts a safe container may reach besides the defaults, e.g. `"openrouter.ai *.example.com host:8443"` (see [Outbound traffic in safe mode](#outbound-traffic-in-safe-mode)). Applies from the next session |
+| `CBOX_MASK` | *(safe mode: secret files)* | Files and folders in the project the container sees empty (see [Hidden secret files](#hidden-secret-files)). Unset: the default list in safe mode, nothing in normal mode; once set, it applies to both modes; `""` = nothing. Applies to newly created containers: `cbox reset` |
 | `CBOX_PROTECT_GIT` | `1` | Mount the project's `.git/config` and `.git/hooks` read-only (see [Git safety](#git-safety-both-modes)); `0` = writable. Applies to newly created containers: `cbox reset` |
 | `CBOX_WARDEN_HOST` | `192.168.64.1` (Apple) / `docker0` IP | Host address containers reach the broker on |
 | `CBOX_WARDEN_SECRET_CMD` | *(unset)* | Hosts without the macOS Keychain: command that prints the secret for an item name |

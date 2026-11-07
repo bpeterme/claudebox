@@ -15,6 +15,9 @@ setup() {
   mkdir -p "$CBOX_DATA_DIR" "$CBOX_CLAUDE_DIR" "$CBOX_HOST_CONFIG_DIR" "$CBOX_SHARE_DIR"
   rm -f "$CBOX_MCP_CONFIG" "$CBOX_DATA_DIR"/.claude-*.json "$CBOX_DATA_DIR"/.mcp-*
   rm -rf "$HOME/Library" "$HOME/.claude.json"
+  # Masking scans the project; tests that create containers in $BATS_TMPDIR
+  # must not pick up other tests' files. The masking tests unset it.
+  export CBOX_MASK=""
   # shellcheck source=/dev/null
   source "$CBOX_SH"
 }
@@ -3901,4 +3904,130 @@ _cbox_bin() {
     [[ "$output" != *"internals leaked"* ]] || { echo "$sh: $output"; false; }
     [[ "$output" == *$'list\nimport'* ]] || { echo "$sh: $output"; false; }
   done
+}
+
+# ---------------------------------------------------------------------------
+# masking — secret files the agent sees empty (CBOX_MASK)
+# ---------------------------------------------------------------------------
+
+# A project with secrets, look-alikes that must stay visible, and copies in
+# places cbox does not search. cd's into it.
+_mask_project() {
+  local p="$BATS_TMPDIR/mask-proj"
+  rm -rf "$p"
+  mkdir -p "$p/app/secrets/x" "$p/node_modules/a" "$p/.git" "$p/my dir"
+  (cd "$p" && touch .env .env.local .env.example app/.env app/server.pem \
+    app/deploy.key id_ed25519 id_ed25519.pub "my dir/.env" node_modules/a/.env \
+    .git/.env app/secrets/x/t README.md)
+  cd "$p"
+}
+
+@test "_cbox_mask_paths: the safe-mode default list hides secrets, keeps examples and public keys" {
+  _mask_project
+  run bash -c "source '$CBOX_SH'; unset CBOX_MASK; _cbox_mask_patterns safe | _cbox_mask_paths"
+  [ "$output" = $'.env\n.env.local\napp/.env\napp/deploy.key\napp/server.pem\nid_ed25519\nmy dir/.env' ]
+}
+
+@test "_cbox_mask_paths: folders (dir/), paths from the root, and ! exceptions" {
+  _mask_project
+  run bash -c "source '$CBOX_SH'; printf '%s\n' secrets/ 'app/*.pem' '.env*' '!.env.local' | _cbox_mask_paths"
+  [ "$output" = $'.env\n.env.example\napp/.env\napp/secrets\napp/server.pem\nmy dir/.env' ]
+}
+
+@test "_cbox_mask_patterns: nothing in normal mode unless set; CBOX_MASK=\"\" turns safe mode's off" {
+  run bash -c "source '$CBOX_SH'; unset CBOX_MASK; _cbox_mask_patterns normal"
+  [ -z "$output" ]
+  run bash -c "source '$CBOX_SH'; CBOX_MASK=''; _cbox_mask_patterns safe"
+  [ -z "$output" ]
+  run bash -c "source '$CBOX_SH'; CBOX_MASK='a.txt  b/'; _cbox_mask_patterns normal"
+  [ "$output" = $'a.txt\nb/' ]
+}
+
+@test "_cbox_create: Apple safe container masks the secrets and records them" {
+  local capture="$BATS_TMPDIR/create-mask-apple"
+  _mask_project
+  unset CBOX_MASK
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  _cbox_mask_supported() { return 0; }
+  _CBOX_RUNTIME=apple
+  rm -f "$capture"; _cbox_create "mask-proj" "safe" 2>/dev/null
+  run cat "$capture"
+  [[ "$output" == *$'--masked-path\n/Workspace/mask-proj/.env\n'* ]]
+  [[ "$output" == *$'--masked-path\n/Workspace/mask-proj/my dir/.env\n'* ]]
+  [[ "$output" != *"/Workspace/mask-proj/.env.example"* ]]
+  [ "$(wc -l < "$(_cbox_mask_list_file mask-proj)")" -eq 7 ]
+  # normal mode: nothing masked by default
+  rm -f "$capture"; _cbox_create "mask-proj" "normal" 2>/dev/null
+  run cat "$capture"
+  [[ "$output" != *"--masked-path"* ]]
+}
+
+@test "_cbox_create: Docker masks files with /dev/null and folders with a read-only tmpfs" {
+  local capture="$BATS_TMPDIR/create-mask-docker"
+  _mask_project
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  _CBOX_RUNTIME=docker
+  rm -f "$capture"; CBOX_MASK=".env secrets/"; _cbox_create "mask-proj" "normal" 2>/dev/null
+  run cat "$capture"
+  [[ "$output" == *$'-v\n/dev/null:/Workspace/mask-proj/.env:ro\n'* ]]
+  [[ "$output" == *$'--tmpfs\n/Workspace/mask-proj/app/secrets:ro\n'* ]]
+}
+
+@test "_cbox_create: an Apple runtime without --masked-path refuses to create unmasked" {
+  local capture="$BATS_TMPDIR/create-mask-old"
+  _mask_project
+  unset CBOX_MASK
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  _cbox_mask_supported() { return 1; }
+  _CBOX_RUNTIME=apple
+  rm -f "$capture"
+  run _cbox_create "mask-proj" "safe"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cannot hide files"* ]]
+  [[ "$output" == *'CBOX_MASK=""'* ]]
+  # no container started (the Playwright seed and network calls come first)
+  run grep -qx -- --name "$capture"
+  [ "$status" -ne 0 ]
+}
+
+@test "_cbox_create: warns when a masked file is tracked by git" {
+  _mask_project
+  rm -rf .git && git init -q . && git add app/server.pem README.md
+  unset CBOX_MASK
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { :; }
+  _CBOX_RUNTIME=docker
+  run _cbox_create "mask-proj" "safe"
+  [[ "$output" == *"tracked by git"* ]]
+  [[ "$output" == *"   app/server.pem"* ]]
+  [[ "$output" != *"   README.md"* ]]
+}
+
+@test "_cbox_mask_check: names secrets that are newer than the container, else says nothing" {
+  _mask_project
+  unset CBOX_MASK
+  _cbox_mask_patterns safe | _cbox_mask_paths > "$(mkdir -p "$CBOX_DATA_DIR/mask"; _cbox_mask_list_file mask-proj)"
+  run _cbox_mask_check mask-proj safe
+  [ -z "$output" ]
+  touch app/new.pem
+  run _cbox_mask_check mask-proj safe
+  [[ "$output" == *"   app/new.pem"* ]]
+  [[ "$output" == *"cbox reset"* ]]
+  # a container from before masking (no list): everything is named
+  rm -f "$(_cbox_mask_list_file mask-proj)"
+  run _cbox_mask_check mask-proj safe
+  [[ "$output" == *"   .env"* ]]
+  run _cbox_mask_check mask-proj normal
+  [ -z "$output" ]
+}
+
+@test "_cbox_enter: every session start checks for secrets newer than the container" {
+  MODE=safe EGRESS=allowlist LOGIN=shared
+  _cbox_mask_check() { echo "mask-check $*" >> "$BATS_TMPDIR/enter-egress"; }
+  run _enter_safe
+  run cat "$BATS_TMPDIR/enter-egress"
+  [[ "$output" == *"mask-check ebox safe"*"exec -it"* ]]
 }

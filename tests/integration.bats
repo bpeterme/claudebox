@@ -223,3 +223,27 @@ except Exception as e:
   [[ "$output" == *"403"* ]]
   grep -q "egress: blocked example.com:443" "$CBOX_DATA_DIR/.tunnel-$TEST_NAME.log"
 }
+
+# ---------------------------------------------------------------------------
+# masking — secret files the agent sees empty
+# ---------------------------------------------------------------------------
+
+@test "masked files read empty and cannot be written; masked folders are empty" {
+  mkdir -p secrets
+  echo "TOKEN=s3cret" > .env
+  echo "key" > secrets/k
+  echo "visible" > .env.example
+  CBOX_MASK=".env .env.* !.env.example secrets/" _cbox_create "$TEST_NAME" "normal"
+  run docker exec "$TEST_NAME" cat "/Workspace/$TEST_NAME/.env"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  run docker exec "$TEST_NAME" ls -A "/Workspace/$TEST_NAME/secrets"
+  [ -z "$output" ]
+  run docker exec "$TEST_NAME" sh -c "echo x > /Workspace/$TEST_NAME/.env"
+  [ "$status" -ne 0 ]
+  run docker exec "$TEST_NAME" cat "/Workspace/$TEST_NAME/.env.example"
+  [ "$output" = "visible" ]
+  # the files on the host are untouched
+  [ "$(cat .env)" = "TOKEN=s3cret" ]
+  rm -rf secrets .env .env.example
+}

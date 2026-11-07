@@ -175,6 +175,11 @@ CBOX_MEMORY="${CBOX_MEMORY:-4g}"
 # Mount the project's .git/config and .git/hooks read-only (see _cbox_create).
 # 0 lets the container change them again. Applies when a container is created.
 CBOX_PROTECT_GIT="${CBOX_PROTECT_GIT:-1}"
+# Files in the project the agent sees empty (see _cbox_mask_paths). Unset: the
+# default list below in safe mode, nothing in normal mode; "" = nothing.
+# Applies when a container is created.
+# CBOX_MASK
+_CBOX_MASK_DEFAULT=".env .env.* !.env.example !.env.sample !.env.template *.pem *.key id_rsa* id_ecdsa* id_ed25519* !*.pub"
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_SHARE_CONFIG — folders of ~/.config to share read-only, e.g. "opencode nvim"
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
@@ -4716,6 +4721,128 @@ _cbox_config_mounts() {
   return 0
 }
 
+# ---------------------------------------------------------
+# masking — secret files the agent sees empty
+# ---------------------------------------------------------
+
+# The CBOX_MASK patterns for a container of mode $1, one per line.
+_cbox_mask_patterns() {
+  local list
+  if [[ -n "${CBOX_MASK+set}" ]]; then
+    list="$CBOX_MASK"
+  elif [[ "$1" == "safe" ]]; then
+    list="$_CBOX_MASK_DEFAULT"
+  fi
+  printf '%s\n' "${list:-}" | tr -s ' \t' '\n' | grep -v '^$' || true
+}
+
+# The project's files and folders (relative paths, sorted) that match the
+# patterns on stdin: "name" or "*.ext" match a file name anywhere, "dir/"
+# a folder, "a/b" a path from the project root; "!pattern" keeps a match
+# visible. .git and node_modules are not searched.
+_cbox_mask_paths() {
+  local p pat neg=() expr_f=() expr_d=() path base n keep
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    if [[ "$p" == '!'* ]]; then
+      neg+=("${p#!}")
+    elif [[ "$p" == */ ]]; then
+      pat="${p%/}"
+      if [[ "$pat" == */* ]]; then expr_d+=(-o -path "./$pat"); else expr_d+=(-o -name "$pat"); fi
+    elif [[ "$p" == */* ]]; then
+      expr_f+=(-o -path "./$p")
+    else
+      expr_f+=(-o -name "$p")
+    fi
+  done
+  (( ${#expr_f[@]} + ${#expr_d[@]} )) || return 0
+  # Each list starts with "-o", after a -false that keeps the expression
+  # valid when one list is empty.
+  {
+    find . \( -name .git -o -name node_modules \) -prune \
+      -o -type d \( -false ${expr_d[@]+"${expr_d[@]}"} \) -prune -print \
+      -o -type f \( -false ${expr_f[@]+"${expr_f[@]}"} \) -print \
+      2>/dev/null || true
+  } | while IFS= read -r path; do
+    path="${path#./}"
+    base="${path##*/}"
+    keep=0
+    for n in ${neg[@]+"${neg[@]}"}; do
+      # shellcheck disable=SC2053  # $n is a glob pattern on purpose
+      if [[ "$n" == */* && "$path" == $n ]] || [[ "$n" != */* && "$base" == $n ]]; then
+        keep=1; break
+      fi
+    done
+    (( keep )) || printf '%s\n' "$path"
+  done | LC_ALL=C sort
+}
+
+# Where cbox keeps the paths it masked when it created container $1.
+_cbox_mask_list_file() {
+  echo "$CBOX_DATA_DIR/mask/$1.list"
+}
+
+# True when this runtime can mask a path (Apple: --masked-path, 1.2.1+).
+_cbox_mask_supported() {
+  [[ "$_CBOX_RUNTIME" == "apple" ]] || return 0
+  container run --help 2>&1 | grep -q -- '--masked-path'
+}
+
+# Prints the runtime arguments that mask the paths on stdin, one per line,
+# for container $1, and records them; fails when the runtime cannot mask.
+_cbox_mask_args() {
+  local name="$1" paths path tracked list
+  paths=$(cat)
+  list=$(_cbox_mask_list_file "$name")
+  mkdir -p "$(dirname "$list")"
+  printf '%s' "$paths${paths:+$'\n'}" > "$list"
+  [[ -n "$paths" ]] || return 0
+  if ! _cbox_mask_supported; then
+    echo "✘ This Apple container cannot hide files from the agent (--masked-path, container 1.2.1 or newer)." >&2
+    echo "  Update it (https://github.com/apple/container/releases), or set CBOX_MASK=\"\" in $(_cbox_shown "$_CBOX_ENV_FILE") to create it without." >&2
+    rm -f "$list"
+    return 1
+  fi
+  while IFS= read -r path; do
+    if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
+      printf '%s\n' --masked-path "/Workspace/$name/$path"
+    elif [[ -d "$path" ]]; then
+      printf '%s\n' --tmpfs "/Workspace/$name/$path:ro"
+    else
+      printf '%s\n' -v "/dev/null:/Workspace/$name/$path:ro"
+    fi
+  done <<<"$paths"
+  # Tracked files that are masked, or inside a masked folder.
+  tracked=$(git ls-files 2>/dev/null | awk '
+    NR == FNR { m[$0] = 1; next }
+    { p = $0
+      while (1) {
+        if (p in m) { print $0; break }
+        if (p !~ /\//) break
+        sub(/\/[^\/]*$/, "", p)
+      } }' <(printf '%s\n' "$paths") - || true)
+  if [[ -n "$tracked" ]]; then
+    echo "⚠  Hidden from the agent but tracked by git — the container sees them empty, so do not commit them from there:" >&2
+    while IFS= read -r path; do printf '   %s\n' "$path"; done <<<"$tracked" >&2
+  fi
+  echo "ℹ  Hidden from the agent: $(wc -l <<<"$paths" | tr -d ' ') file(s) matching CBOX_MASK" >&2
+}
+
+# At session start: files matching CBOX_MASK that appeared after container $1
+# was created are not hidden yet; only recreating it hides them.
+_cbox_mask_check() {
+  local name="$1" mode="$2" now new
+  now=$(_cbox_mask_patterns "$mode" | _cbox_mask_paths)
+  [[ -n "$now" ]] || return 0
+  new=$(LC_ALL=C comm -23 <(printf '%s\n' "$now") \
+    <(LC_ALL=C sort "$(_cbox_mask_list_file "$name")" 2>/dev/null))
+  [[ -n "$new" ]] || return 0
+  echo "⚠  Not hidden from the agent yet (they match CBOX_MASK, but are newer than this container):"
+  local f
+  while IFS= read -r f; do printf '   %s\n' "$f"; done <<<"$new"
+  echo "   Hide them: cbox reset"
+}
+
 _cbox_create() {
   local name="$1"
   local mode="$2"
@@ -4874,6 +5001,14 @@ _cbox_create() {
       )
     fi
   fi
+
+  # Secret files (CBOX_MASK) show up empty in the container.
+  local _mask _m
+  _mask=$(_cbox_mask_patterns "$mode" | _cbox_mask_paths | _cbox_mask_args "$name") || return 1
+  while IFS= read -r _m; do
+    [[ -n "$_m" ]] && args+=("$_m")
+  done <<<"$_mask"
+  unset _mask _m
 
   # For each symlink in CBOX_CLAUDE_DIR, resolve it to the real host path and
   # mount that target at its own absolute path inside the container. The symlink
@@ -5270,6 +5405,7 @@ _cbox_enter() {
     _run="mkdir -p -m 700 $_CBOX_TUNNEL_DIR && print -l 'enable-shm = no' 'enable-memfd = no' >| $_CBOX_TUNNEL_DIR/pulse-client.conf; $_run"
   fi
   while IFS= read -r _g; do _exec_args+=(-e "$_g"); done < <(_cbox_git_identity)
+  _cbox_mask_check "$name" "$mode"
   local _egress=""
   if [[ "$mode" == "safe" ]]; then
     # The container's only way out: the tunnel's proxy, which lets through

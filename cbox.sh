@@ -230,14 +230,39 @@ _cbox_name() {
   echo "${name:-project}"
 }
 
-# Returns "NAME STATE" pairs (no header) with optional extra args passed through.
-# Normalises Apple Container tabular output and Docker --format output to the same shape.
+# "NAME STATE" pairs (no header) for all containers, or with LABEL (key=value)
+# only for those carrying it. Apple's runtime lists them as JSON, labels
+# included, in one call: its printed table has changed layout before.
 _cbox_rt_list() {
+  local label="${1:-}"
   if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
-    container ls --all "$@" | awk 'NR==1{for(i=1;i<=NF;i++)if($i=="STATE")col=i;next} col&&NR>1{print $1,$col}'
+    container ls --all --format json | python3 -c "$(_cbox_rt_list_py)" "$label"
+  elif [[ -n "$label" ]]; then
+    docker ps -a --filter "label=$label" --format "{{.Names}} {{.State}}"
   else
-    docker ps -a "$@" --format "{{.Names}} {{.State}}"
+    docker ps -a --format "{{.Names}} {{.State}}"
   fi
+}
+
+# Reads `container ls --format json` on stdin. Accepts the layout since 1.0.0
+# (status.state) and a flat status string; unreadable input lists nothing.
+_cbox_rt_list_py() {
+  cat <<'PYEOF'
+import json, sys
+key, _, value = sys.argv[1].partition("=")
+try:
+    entries = json.load(sys.stdin)
+except ValueError:
+    entries = []
+for e in entries if isinstance(entries, list) else []:
+    conf = e.get("configuration") or {}
+    name = e.get("id") or conf.get("id")
+    status = e.get("status")
+    state = status.get("state") if isinstance(status, dict) else status
+    labels = conf.get("labels") or {}
+    if name and (not key or labels.get(key) == value):
+        print(name, state or "unknown")
+PYEOF
 }
 
 _cbox_rt_image_list() {
@@ -488,8 +513,9 @@ _cbox_session_markers() {
 }
 
 # Asks the container itself whether any exec session is still attached.
-# Exec'd processes run with PPID 0 (PID 1 is _cbox_init_py);
-# the probe's own `ps` is excluded. Returns 0 if a session is active,
+# Exec'd processes run with PPID 0 (PID 1 is the runtime's init); the probe's
+# own `ps` and the command that keeps the container running (`tail`, also
+# with PPID 0 in containers without an init) are excluded. Returns 0 if a session is active,
 # 1 if none, 2 if the probe failed (caller must not treat that as "none").
 # Marker files alone can outlive their session (interrupted cbox in a
 # still-open shell, or macOS PID reuse), so this is the ground truth.
@@ -497,7 +523,7 @@ _cbox_container_has_sessions() {
   local out
   out=$($_CBOX_CMD exec "$1" ps -eo pid=,ppid=,comm= 2>/dev/null) || return 2
   [[ -n "$out" ]] || return 2
-  awk '$2 == 0 && $1 != 1 && $3 != "ps" { found = 1 } END { exit !found }' <<<"$out"
+  awk '$2 == 0 && $1 != 1 && $3 != "ps" && $3 != "tail" { found = 1 } END { exit !found }' <<<"$out"
 }
 
 # ---------------------------------------------------------
@@ -4882,37 +4908,27 @@ _cbox_create() {
   done < <(printf '%s\n' ${_targets[@]+"${_targets[@]}"} | LC_ALL=C sort)
   unset _ro _link _target _kept _nested _targets _mounted
 
+  # PID 1 is the runtime's own init (--init; Docker: tini): it collects every
+  # finished process whose parent is gone, and passes `stop` on. Without one,
+  # finished processes piled up until the process limit stopped the container.
+  # The command itself only has to keep the container running.
   args+=(
+    --init
+    --label "cbox.init=runtime"
     "$CBOX_IMAGE"
-    sh -c "$_CBOX_INIT_SH" sh "$(_cbox_init_py)"
+    tail -f /dev/null
   )
 
   $_CBOX_CMD "${args[@]}"
 }
 
-# The container's PID 1. Every process whose parent exits is handed to PID 1,
-# which has to collect it when it ends; `tail -f /dev/null`, used before,
-# never did, so finished processes piled up until the process limit stopped
-# the container. This one collects them, and stops at once on `container stop`.
-# Runs it; images without python3 (a custom CBOX_IMAGE) keep the old tail.
-# shellcheck disable=SC2016
-_CBOX_INIT_SH='command -v python3 >/dev/null 2>&1 && exec python3 -c "$1"; exec tail -f /dev/null'
-
-_cbox_init_py() {
-  cat <<'PYEOF'
-import os, signal, time
-signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
-while True:
-    try:
-        os.wait()
-    except ChildProcessError:
-        time.sleep(1)
-PYEOF
-}
-
-# True for a container created by an older cbox, whose PID 1 is `tail`.
+# True for a container created by an older cbox whose PID 1 is `tail` itself,
+# without the runtime's init (no cbox.init label): it never collects finished
+# processes. Containers with cbox's former python init are fine.
 _cbox_old_init() {
-  $_CBOX_CMD inspect "$1" 2>/dev/null | grep -Eq '"(/usr/bin/)?tail"'
+  local info
+  info=$($_CBOX_CMD inspect "$1" 2>/dev/null) || return 1
+  grep -Eq '"(/usr/bin/)?tail"' <<<"$info" && ! grep -q '"cbox.init"' <<<"$info"
 }
 
 # Apple's runtime only: a container's filesystem is a disk image that grows
@@ -4928,15 +4944,7 @@ _cbox_clean_running() {
   fi
 
   local running cname
-  running=$(
-    _cbox_rt_list | while read -r cname cstate; do
-      [[ "$cstate" == "running" ]] || continue
-      # Explicit if: see the prune loop (a trailing false test aborts under set -e).
-      if [[ "$(_cbox_rt_label "$cname" "cbox.project")" == "true" ]]; then
-        echo "$cname"
-      fi
-    done
-  )
+  running=$(_cbox_rt_list "$CBOX_LABEL" | awk '$2 == "running" {print $1}')
   [[ -n "$running" ]] || return 0
 
   echo "Reclaiming unused disk space in running cbox containers..."
@@ -5743,24 +5751,7 @@ cbox() {
       echo "Removing stopped cbox containers..."
 
       local stopped
-      if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
-        stopped=$(
-          _cbox_rt_list | while read -r cname cstate; do
-            [[ "$cstate" == "running" ]] && continue
-            # Use an explicit if (not && echo): under `set -euo pipefail` a
-            # trailing false [[ … ]] would make the loop — and thus this
-            # command substitution — exit non-zero, aborting prune before it
-            # removes anything. This bites whenever the last listed container
-            # is a stopped non-cbox one (e.g. Apple Container's buildkit).
-            if [[ "$(_cbox_rt_label "$cname" "cbox.project")" == "true" ]]; then
-              echo "$cname"
-            fi
-          done
-        )
-      else
-        stopped=$(_cbox_rt_list --filter "label=$CBOX_LABEL" \
-          | awk '$2 != "running" {print $1}')
-      fi
+      stopped=$(_cbox_rt_list "$CBOX_LABEL" | awk '$2 != "running" {print $1}')
 
       if [[ -n "$stopped" ]]; then
         echo "$stopped" | xargs "$_CBOX_CMD" rm -f
@@ -5827,8 +5818,9 @@ cbox() {
 # shell completions
 # ---------------------------------------------------------
 
+# cbox's containers (not the runtime's own, e.g. Apple's buildkit).
 _cbox_list_names() {
-  _cbox_rt_list 2>/dev/null | awk '{print $1}'
+  _cbox_rt_list "$CBOX_LABEL" 2>/dev/null | awk '{print $1}'
 }
 
 # `cbox _complete WORD...`: the candidates for the word after `cbox WORD...`,

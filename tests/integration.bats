@@ -53,6 +53,21 @@ _mounts_rw() {
   [ "$output" = "running" ]
 }
 
+@test "PID 1 is the runtime's init: orphans are collected, stop is immediate" {
+  _cbox_create "$TEST_NAME" "normal"
+  run docker inspect --format '{{.HostConfig.Init}}' "$TEST_NAME"
+  [ "$output" = "true" ]
+  # A background process whose parent exits is handed to PID 1.
+  docker exec "$TEST_NAME" sh -c 'sh -c "sleep 1 &"; exit 0'
+  sleep 3
+  run docker exec "$TEST_NAME" sh -c 'grep -l "^State:.*Z" /proc/[0-9]*/status 2>/dev/null | wc -l'
+  [ "$output" -eq 0 ]
+  # SIGTERM reaches the command at once: no wait for the 10 s kill timeout.
+  local t0=$SECONDS
+  docker stop "$TEST_NAME" >/dev/null
+  (( SECONDS - t0 < 5 ))
+}
+
 # ---------------------------------------------------------------------------
 # mounts — normal mode
 # ---------------------------------------------------------------------------

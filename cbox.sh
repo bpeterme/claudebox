@@ -4436,8 +4436,18 @@ _cbox_warden_host_ip() {
   elif [[ "$_CBOX_RUNTIME" == "apple" ]]; then
     echo "192.168.64.1"
   else
-    ip -4 -o addr show docker0 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}' | grep . || echo "172.17.0.1"
+    _cbox_if_ip docker0 && return 0
+    # Docker Desktop on WSL has no docker0 in the distro, but all WSL 2 distros
+    # (Docker Desktop's included) share one network: containers reach the
+    # distro on its eth0 address.
+    _cbox_on_wsl && _cbox_if_ip eth0 && return 0
+    echo "172.17.0.1"
   fi
+}
+
+# IPv4 address of network interface $1, if it has one.
+_cbox_if_ip() {
+  ip -4 -o addr show "$1" 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}' | grep .
 }
 
 _cbox_warden_broker_pid() {

@@ -29,10 +29,14 @@ read -rsp "Keyring password: " pw; echo   # the first unlock creates the keyring
 printf '%s' "$pw" | gnome-keyring-daemon --unlock --components=secrets >/dev/null; unset pw
 ```
 
+Docker Desktop: turn on Settings → Resources → WSL integration for your distro,
+and add yourself to the `docker` group (`sudo usermod -aG docker $USER`, then
+`wsl --shutdown`). `cbox` says which of these is missing.
+
 The warden broker listens on the Docker bridge address (`docker0`). Docker
-Desktop on WSL has no `docker0` inside the distro: if `cbox` reports that the
-broker did not start, set `CBOX_WARDEN_HOST` to an address of the distro that
-containers can reach.
+Desktop on WSL has none inside the distro; there `cbox` uses the distro's `eth0`
+address, which Docker Desktop's containers reach (WSL 2 distros share one
+network). Set `CBOX_WARDEN_HOST` to choose another address.
 
 Mac-only features (iMCP and other host MCP servers that need macOS apps,
 WhatsApp chats) are not available on Linux.
@@ -214,7 +218,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_EGRESS_ALLOW` | *(unset)* | Hosts a safe container may reach besides the defaults, e.g. `"openrouter.ai *.example.com host:8443"` (see [Outbound traffic in safe mode](#outbound-traffic-in-safe-mode)). Applies from the next session |
 | `CBOX_MASK` | *(safe mode: secret files)* | Files and folders in the project the container sees empty (see [Hidden secret files](#hidden-secret-files)). Unset: the default list in safe mode, nothing in normal mode; once set, it applies to both modes; `""` = nothing. Applies to newly created containers: `cbox reset` |
 | `CBOX_PROTECT_GIT` | `1` | Mount the project's `.git/config` and `.git/hooks` read-only (see [Git safety](#git-safety-both-modes)); `0` = writable. Applies to newly created containers: `cbox reset` |
-| `CBOX_WARDEN_HOST` | `192.168.64.1` (Apple) / `docker0` IP | Host address containers reach the broker on |
+| `CBOX_WARDEN_HOST` | `192.168.64.1` (Apple) / `docker0` IP (WSL without it: `eth0`) | Host address containers reach the broker on |
 | `CBOX_WARDEN_SECRET_CMD` | *(unset)* | Instead of the Keychain or keyring: command that prints the secret for an item name |
 
 > [!WARNING]

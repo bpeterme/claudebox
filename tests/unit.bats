@@ -4235,3 +4235,42 @@ _image_docker() {
   [ -z "$output" ]
   ! grep -q '^build' "$IMG_LOG"
 }
+
+# ---------------------------------------------------------------------------
+# warden broker address on Docker
+# ---------------------------------------------------------------------------
+
+# Fake `ip`: interfaces named in $1 ("docker0 eth0") have an address.
+_fake_ip() {
+  mkdir -p "$BATS_TMPDIR/fakeip"
+  cat > "$BATS_TMPDIR/fakeip/ip" <<SH
+#!/bin/sh
+for i in $1; do
+  [ "\$5" = "\$i" ] && { [ \$i = docker0 ] && a=172.17.0.1 || a=172.20.65.150; echo "7: \$i    inet \$a/20 brd x scope global \$i"; }
+done
+exit 0
+SH
+  chmod +x "$BATS_TMPDIR/fakeip/ip"
+  PATH="$BATS_TMPDIR/fakeip:$PATH"
+  unset CBOX_WARDEN_HOST; _CBOX_RUNTIME=docker
+}
+
+@test "warden address: docker0 when it exists" {
+  _fake_ip "docker0 eth0"; _cbox_on_wsl() { return 0; }
+  [ "$(_cbox_warden_host_ip)" = "172.17.0.1" ]
+}
+
+@test "warden address: on WSL without docker0 (Docker Desktop), the distro's eth0" {
+  _fake_ip "eth0"; _cbox_on_wsl() { return 0; }
+  [ "$(_cbox_warden_host_ip)" = "172.20.65.150" ]
+}
+
+@test "warden address: plain Linux without docker0 never picks eth0" {
+  _fake_ip "eth0"; _cbox_on_wsl() { return 1; }
+  [ "$(_cbox_warden_host_ip)" = "172.17.0.1" ]
+}
+
+@test "warden address: CBOX_WARDEN_HOST wins" {
+  _fake_ip "docker0 eth0"; export CBOX_WARDEN_HOST=10.0.0.9
+  [ "$(_cbox_warden_host_ip)" = "10.0.0.9" ]
+}

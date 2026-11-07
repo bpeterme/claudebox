@@ -87,6 +87,7 @@ _CBOX_FLUX_API=1
 
 # Source user config if present (~/.config/claudebox/cbox.env)
 _CBOX_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
+# shellcheck source=/dev/null
 [[ -f "$_CBOX_CONFIG" ]] && . "$_CBOX_CONFIG"
 unset _CBOX_CONFIG
 
@@ -284,7 +285,8 @@ _cbox_maybe_update() {
   agent_bin=$(_cbox_agent_bin)
   agent_pkg=$(_cbox_agent_pkg)
 
-  local stamp="${TMPDIR:-/tmp}/.cbox-update-${agent_bin}-$(date +%Y-%m-%d)"
+  local stamp
+  stamp="${TMPDIR:-/tmp}/.cbox-update-${agent_bin}-$(date +%Y-%m-%d)"
 
   if [[ ! -f "$stamp" ]]; then
     if ! _cbox_update_args "$name" "$mode"; then
@@ -1510,6 +1512,7 @@ PYEOF
 _cbox_tunnel_py() {
   echo '#!/usr/bin/env python3'
   echo '# cbox-tunnel — installed by cbox at session start; local edits are overwritten.'
+  # shellcheck disable=SC2016  # literal backticks in the generated script's comment
   echo '#   serve NAME=SOCKET ...  run by the host over `container exec -i`: clients of'
   echo '#                          SOCKET reach the host service NAME through this exec'
   echo '#                          (SOCKET is a unix socket path, or tcp:ADDR:PORT)'
@@ -4477,6 +4480,7 @@ _cbox_seed_playwright() {
         "$CBOX_IMAGE" \
         sh -c 'cp -a /opt/ms-playwright/. /seed/ 2>/dev/null || true' 2>&1); then
     echo "⚠  Could not seed the Playwright cache from the image:"
+    # shellcheck disable=SC2001  # indents every line; ${//} cannot anchor per line
     echo "$_out" | sed 's/^/    /'
     echo "    Browsers will be downloaded inside the container on first use."
     return 0
@@ -4566,7 +4570,7 @@ _cbox_safe_claude_dir() {
 # Folder names listed in CBOX_SHARE_CONFIG, one per line (zsh does not split
 # an unquoted variable, so no word splitting here).
 _cbox_shared_config_names() {
-  printf '%s\n' "${CBOX_SHARE_CONFIG:-}" | tr -s ' \t' '\n\n' | grep -v '^$' || true
+  printf '%s\n' "${CBOX_SHARE_CONFIG:-}" | tr -s ' \t' '\n' | grep -v '^$' || true
 }
 
 # The -v values for the container's ~/.config and the folders of the real
@@ -5126,6 +5130,7 @@ _cbox_cdot_push() {
     local _out
     if ! _out=$(_cbox_cdot "$@" 2>&1); then
       echo "⚠  cdot $1 failed:"
+      # shellcheck disable=SC2001  # indents every line; ${//} cannot anchor per line
       echo "$_out" | sed 's/^/    /'
     fi
   fi
@@ -5728,6 +5733,9 @@ _cbox_list_names() {
 }
 
 if [[ -n "${ZSH_VERSION:-}" ]]; then
+  # zsh code: $words is set by the completion system, and $(…) in an array
+  # assignment is zsh's way to split lines (no mapfile).
+  # shellcheck disable=SC2154,SC2207
   _cbox_zsh_complete() {
     case $CURRENT in
       2)
@@ -5744,6 +5752,9 @@ if [[ -n "${ZSH_VERSION:-}" ]]; then
   }
   (( ${+functions[compdef]} )) && compdef _cbox_zsh_complete cbox
 elif [[ -n "${BASH_VERSION:-}" ]]; then
+  # COMPREPLY=( $(compgen …) ) is bash's completion idiom; mapfile is not in
+  # macOS's bash 3.2, and completion words contain no spaces.
+  # shellcheck disable=SC2207
   _cbox_bash_complete() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
     local prev="${COMP_WORDS[COMP_CWORD-1]}"

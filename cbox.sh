@@ -58,7 +58,7 @@ fi
 # ---------------------------------------------------------
 
 _cbox_help() {
-    clear
+    clear 2>/dev/null || true  # no terminal (scripts, CI): nothing to clear
     cat <<EOF
 cbox - AI Coding Agent Container Runtime
 
@@ -409,7 +409,7 @@ _cbox_maybe_update() {
 
 _cbox_force_update() {
   local name="$1"
-  clear
+  clear 2>/dev/null || true  # no terminal (scripts, CI): nothing to clear
 
   _cbox_system_start
   if ! _cbox_exists "$name"; then
@@ -5715,7 +5715,7 @@ _cbox_doctor_inline() {
 _cbox_doctor() {
   local name
   name=$(_cbox_name)
-  clear
+  clear 2>/dev/null || true  # no terminal (scripts, CI): nothing to clear
 
   echo "== cbox doctor =="
   echo "Version: $_CBOX_VERSION"
@@ -5853,7 +5853,7 @@ cbox() {
       ;;
 
     rebuild)
-      clear
+      clear 2>/dev/null || true  # no terminal (scripts, CI): nothing to clear
       _cbox_system_start
       echo "Rebuilding image '$CBOX_IMAGE'..."
       $_CBOX_CMD build \
@@ -5897,7 +5897,7 @@ cbox() {
       ;;
 
     list)
-      clear
+      clear 2>/dev/null || true  # no terminal (scripts, CI): nothing to clear
       if _cbox_system_down; then
         echo "✘ Apple's container system is not running, so cbox cannot list containers."
         _cbox_system_down_hint

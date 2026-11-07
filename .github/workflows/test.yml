@@ -33,8 +33,9 @@ jobs:
   unit-macos:
     name: Unit tests (macOS)
     runs-on: macos-latest
-    # Ubuntu takes about 3 minutes; a hang must not hold a runner for 6 hours.
-    timeout-minutes: 15
+    # Ubuntu takes about 3 minutes, macOS over 15 so far; a hang must not hold
+    # a runner for 6 hours.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
       - name: Install bats
@@ -57,12 +58,14 @@ jobs:
         run: |
           tap="$RUNNER_TEMP/unit.tap"
           total=$(bats --count tests/unit.bats)
+          : >"$tap"
+          tail -f "$tap" & tail_pid=$!    # results show in the log as they come
           BATS_TEST_TIMEOUT=60 bats --timing tests/unit.bats </dev/null >"$tap" 2>&1 &
           bats_pid=$!
           while kill -0 "$bats_pid" 2>/dev/null &&
                 [ "$(grep -cE '^(not )?ok ' "$tap")" -lt "$total" ]; do sleep 5; done
           for _ in 1 2 3 4 5 6; do kill -0 "$bats_pid" 2>/dev/null || break; sleep 5; done
-          cat "$tap"
+          sleep 1; kill "$tail_pid" 2>/dev/null || true
           if kill -0 "$bats_pid" 2>/dev/null; then
             echo "::error::bats did not exit: processes left behind by tests still hold its output"
             lsof -t "$tap" | sort -u | while read -r p; do ps -o pid=,ppid=,etime=,command= -p "$p"; done

@@ -27,6 +27,28 @@ jobs:
       - name: Run unit tests
         run: bats tests/unit.bats
 
+  # The Homebrew `cbox` runs with #!/bin/bash, which on macOS is always the
+  # system bash 3.2, next to the BSD userland. The Ubuntu jobs cannot catch
+  # regressions there. Integration tests need Docker, which macOS runners lack.
+  unit-macos:
+    name: Unit tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install bats
+        run: brew install bats-core
+      # The runner image puts Homebrew's bash 5 first on PATH. Put the
+      # system bash 3.2 there instead, as on users' Macs.
+      - name: Use the system bash (3.2)
+        run: |
+          mkdir -p "$RUNNER_TEMP/system-bash"
+          ln -s /bin/bash "$RUNNER_TEMP/system-bash/bash"
+          echo "$RUNNER_TEMP/system-bash" >> "$GITHUB_PATH"
+      - name: Show bash version
+        run: bash --version | head -1
+      - name: Run unit tests
+        run: bats tests/unit.bats
+
   integration:
     name: Integration tests
     runs-on: ubuntu-latest

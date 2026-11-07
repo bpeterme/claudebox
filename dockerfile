@@ -50,7 +50,12 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 RUN printf 'pcm.!default {\n    type pulse\n}\nctl.!default {\n    type pulse\n}\n' > /etc/asound.conf
 
 ARG HOST_UID=1000
-RUN useradd -ms /bin/zsh -u $HOST_UID claude && \
+# claude gets the host user's UID, so files it writes in the workspace belong
+# to the host user. Ubuntu's image already has a user with UID 1000 (ubuntu),
+# which is also the usual first user on Linux and WSL: remove it first.
+RUN existing=$(getent passwd "$HOST_UID" | cut -d: -f1) && \
+    if [ -n "$existing" ]; then userdel -r "$existing" 2>/dev/null || userdel "$existing"; fi && \
+    useradd -ms /bin/zsh -u $HOST_UID claude && \
     echo "claude ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
 # eza (modern ls replacement)

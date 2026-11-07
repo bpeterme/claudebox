@@ -35,3 +35,9 @@ jobs:
           docker run --rm --user claude -v "$RUNNER_TEMP/ws:/Workspace/ws" cbox-ci \
             sh -c 'echo hi > /Workspace/ws/from-container'
           [ "$(stat -c %u "$RUNNER_TEMP/ws/from-container")" = "$(id -u)" ]
+      # UID 1000 is the usual first user on Linux and WSL, and Ubuntu's image
+      # already has a user with it. The runner's own UID is 1001.
+      - name: Build for a host user with UID 1000
+        run: |
+          docker build --build-arg HOST_UID=1000 -t cbox-ci-1000 -f dockerfile .
+          [ "$(docker run --rm --user claude cbox-ci-1000 id -u)" = "1000" ]

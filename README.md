@@ -6,7 +6,7 @@ Each project gets its own container, named after the directory. Two modes are av
 
 ## Prerequisites
 
-- **macOS:** [Apple Container](https://github.com/apple/container) 1.0.0+ — requires macOS 26 and Apple Silicon
+- **macOS:** [Apple Container](https://github.com/apple/container) 1.0.0+ — requires macOS 26 and Apple Silicon (`cbox doctor` tells you when newer releases fix security issues)
 - **Linux:** Docker
 
 ## Installation
@@ -73,7 +73,7 @@ cbox oc safe   # opencode in safe mode
 | Command | Description |
 |---------|-------------|
 | `cbox update` | Force-update the active agent inside a running container |
-| `cbox doctor` | Run environment diagnostics (includes companion tool status) |
+| `cbox doctor` | Run environment diagnostics (includes companion tool status and, on macOS, whether Apple container is up to date) |
 | `cbox mcp` | Show host MCP servers and relay status |
 | `cbox mcp import` | Import MCP servers from Claude Desktop / Claude Code on the host |
 | `cbox warden` | List credential resources (APIs, storage, ssh keys, MCP servers, WhatsApp chats) and what this project gets (see [Credentials (warden)](#credentials-warden)) |

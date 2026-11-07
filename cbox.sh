@@ -5328,12 +5328,71 @@ _cbox_keepalive() {
 # doctor
 # ---------------------------------------------------------
 
+# Apple's runtime: how far the installed version is behind, and whether the
+# newer releases fix security issues. Read from Apple's own release notes, so
+# cbox keeps no version floor that goes stale. Doctor only: one request, short
+# timeout; offline is not an error.
+_CBOX_RUNTIME_RELEASES_URL="${_CBOX_RUNTIME_RELEASES_URL:-https://api.github.com/repos/apple/container/releases?per_page=100}"
+
+# Prints "NEWER SECURITY LATEST" for an installed version, or nothing when the
+# releases could not be read.
+_cbox_runtime_releases_py() {
+  cat <<'PYEOF'
+import json, re, sys, urllib.request
+
+def ver(s):
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", s or "")
+    return tuple(map(int, m.groups())) if m else None
+
+installed, url = ver(sys.argv[1]), sys.argv[2]
+try:
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json", "User-Agent": "claudebox"})
+    with urllib.request.urlopen(req, timeout=3) as r:
+        releases = json.load(r)
+except Exception:
+    sys.exit(0)
+newer = [r for r in releases
+         if not r.get("draft") and not r.get("prerelease")
+         and ver(r.get("tag_name")) and ver(r["tag_name"]) > installed]
+security = [r for r in newer if "GHSA-" in (r.get("body") or "")]
+latest = max((r["tag_name"] for r in newer), key=ver, default="")
+print(len(newer), len(security), latest)
+PYEOF
+}
+
+_cbox_runtime_currency() {
+  local installed counts newer security latest
+  installed=$(container --version 2>/dev/null | sed -nE 's/.*version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')
+  if [[ -z "$installed" ]]; then
+    echo "ℹ Apple container version unknown"
+    return 0
+  fi
+  echo "ℹ checking for newer Apple container releases ($_CBOX_RUNTIME_RELEASES_URL)"
+  counts=$(python3 -c "$(_cbox_runtime_releases_py)" "$installed" "$_CBOX_RUNTIME_RELEASES_URL" 2>/dev/null)
+  if [[ -z "$counts" ]]; then
+    echo "ℹ Apple container $installed — could not check for updates"
+    return 0
+  fi
+  read -r newer security latest <<<"$counts"
+  if (( newer == 0 )); then
+    echo "✔ Apple container $installed (latest)"
+  elif (( security > 0 )); then
+    echo "⚠ Apple container $installed — $newer newer release(s), $security with security fixes; latest is $latest"
+    echo "  Update: https://github.com/apple/container/releases"
+  else
+    echo "ℹ Apple container $installed — $newer newer release(s); latest is $latest"
+    echo "  Update: https://github.com/apple/container/releases"
+  fi
+}
+
 _cbox_doctor_inline() {
   command -v "$_CBOX_CMD" >/dev/null \
     && echo "✔ $_CBOX_CMD command found" \
     || echo "✘ $_CBOX_CMD command missing"
 
   if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
+    _cbox_runtime_currency
     if _cbox_system_running; then
       echo "✔ container system running"
     else

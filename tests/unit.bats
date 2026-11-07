@@ -1441,6 +1441,86 @@ _prune_collect() {
 }
 
 # ---------------------------------------------------------------------------
+# _cbox_runtime_currency (cbox doctor, Apple runtime)
+# ---------------------------------------------------------------------------
+
+# Release list fixture served as file:// (no network); `container --version`
+# reports INSTALLED.
+_currency_stubs() {
+  local f="$BATS_TMPDIR/releases.json"
+  cat > "$f" <<'JSON'
+[
+  {"tag_name": "1.7.1", "body": "Core\n- stats cpuUtilization"},
+  {"tag_name": "1.8.0-rc1", "prerelease": true, "body": "GHSA-xxxx"},
+  {"tag_name": "1.6.0", "body": "Security\n- GHSA-vgrw-36j7-r93w digest"},
+  {"tag_name": "1.10.0", "draft": true, "body": "GHSA-yyyy"},
+  {"tag_name": "1.5.0", "body": "Core"},
+  {"tag_name": "1.3.1", "body": "GHSA-x7pf-2jmj-pgcq"},
+  {"tag_name": "1.0.0", "body": "first"}
+]
+JSON
+  _CBOX_RUNTIME_RELEASES_URL="file://$f"
+  container() { echo "container CLI version $INSTALLED (build: release, commit: abc1234)"; }
+}
+
+@test "_cbox_runtime_currency: latest installed" {
+  _currency_stubs; INSTALLED=1.7.1
+  run _cbox_runtime_currency
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"✔ Apple container 1.7.1 (latest)"* ]]
+}
+
+@test "_cbox_runtime_currency: behind with security fixes; drafts and prereleases ignored" {
+  _currency_stubs; INSTALLED=1.5.0
+  run _cbox_runtime_currency
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"⚠ Apple container 1.5.0 — 2 newer release(s), 1 with security fixes; latest is 1.7.1"* ]]
+}
+
+@test "_cbox_runtime_currency: counts every newer release" {
+  _currency_stubs; INSTALLED=1.0.0
+  run _cbox_runtime_currency
+  [[ "$output" == *"4 newer release(s), 2 with security fixes; latest is 1.7.1"* ]]
+}
+
+@test "_cbox_runtime_currency: compares versions numerically, not as text" {
+  _currency_stubs; INSTALLED=1.9.0
+  printf '%s' '[{"tag_name":"1.10.0","body":""},{"tag_name":"1.9.0","body":""},{"tag_name":"1.8.2","body":"GHSA-z"}]' \
+    > "$BATS_TMPDIR/releases.json"
+  run _cbox_runtime_currency
+  [[ "$output" == *"1 newer release(s); latest is 1.10.0"* ]]
+}
+
+@test "_cbox_runtime_currency: behind without security fixes is informational" {
+  _currency_stubs; INSTALLED=1.6.1
+  run _cbox_runtime_currency
+  [[ "$output" == *"ℹ Apple container 1.6.1 — 1 newer release(s); latest is 1.7.1"* ]]
+  [[ "$output" != *"⚠"* ]]
+}
+
+@test "_cbox_runtime_currency: unreadable release list is not an error" {
+  _currency_stubs; INSTALLED=1.5.0
+  _CBOX_RUNTIME_RELEASES_URL="file://$BATS_TMPDIR/no-such-releases.json"
+  run _cbox_runtime_currency
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Apple container 1.5.0 — could not check for updates"* ]]
+}
+
+@test "_cbox_runtime_currency: shows the URL before contacting it" {
+  _currency_stubs; INSTALLED=1.7.1
+  run _cbox_runtime_currency
+  [[ "${lines[0]}" == *"($_CBOX_RUNTIME_RELEASES_URL)"* ]]
+}
+
+@test "_cbox_runtime_currency: unknown version output skips the check" {
+  _currency_stubs
+  container() { echo "something else"; }
+  run _cbox_runtime_currency
+  [ "$status" -eq 0 ]
+  [ "$output" = "ℹ Apple container version unknown" ]
+}
+
+# ---------------------------------------------------------------------------
 # _cbox_clean_running (cbox prune, Apple runtime)
 # ---------------------------------------------------------------------------
 

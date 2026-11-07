@@ -9,6 +9,46 @@
 #
 # Configure by creating ~/.config/claudebox/cbox.env (see cbox.env.example)
 
+# ---------------------------------------------------------
+# shell completion and the sourced install
+# ---------------------------------------------------------
+
+# Completion asks `cbox _complete` (see _cbox_complete), so it needs nothing
+# else from this file.
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+  # zsh code: $words and $CURRENT are set by the completion system; the
+  # unquoted $(…) splits at newlines (IFS) and drops empty lines; compadd -a
+  # reads the array by name.
+  # shellcheck disable=SC2034,SC2154,SC2207
+  _cbox_zsh_complete() {
+    local IFS=$'\n'
+    local -a candidates
+    candidates=($(cbox _complete "${words[@]:1:$((CURRENT - 2))}" 2>/dev/null))
+    compadd -a candidates
+  }
+  (( ${+functions[compdef]} )) && compdef _cbox_zsh_complete cbox
+elif [[ -n "${BASH_VERSION:-}" ]]; then
+  # COMPREPLY=( $(compgen …) ) is bash's completion idiom (macOS's bash 3.2 has
+  # no mapfile); IFS splits the candidates at newlines only.
+  # shellcheck disable=SC2207
+  _cbox_bash_complete() {
+    local IFS=$'\n'
+    COMPREPLY=( $(compgen -W "$(cbox _complete "${COMP_WORDS[@]:1:COMP_CWORD-1}" 2>/dev/null)" \
+      -- "${COMP_WORDS[COMP_CWORD]}") )
+  }
+  complete -F _cbox_bash_complete cbox
+fi
+
+# Sourced into an interactive shell (`source cbox.sh` in ~/.zshrc or
+# ~/.bashrc): define only `cbox`, which runs this file as a program — as the
+# Homebrew install does — and the completion above. Nothing from the config
+# file or cbox's internals lands in the shell. ($0 is the sourced file in zsh.)
+if [[ $- == *i* ]] && { [[ "${ZSH_EVAL_CONTEXT:-}" == *:file* ]] ||
+    [[ -n "${BASH_VERSION:-}" && "${BASH_SOURCE[0]}" != "$0" ]]; }; then
+  eval "cbox() { bash $(printf %q "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")") \"\$@\"; }"
+  return 0
+fi
+
 # =========================================================
 # cbox - Claude Container Runtime
 # =========================================================
@@ -19,7 +59,7 @@
 
 _cbox_help() {
     clear
-    cat <<'EOF'
+    cat <<EOF
 cbox - AI Coding Agent Container Runtime
 
 Usage:
@@ -42,10 +82,10 @@ Container Management:
   cbox list                           List cbox containers
   cbox stop [name]                    Stop current (or named) container
   cbox reset                          Remove current project container
-  cbox prune                          Remove stopped cbox containers
+  cbox prune                          Remove stopped cbox containers, reclaim disk space
   cbox rebuild                        Rebuild container image
 
-MCP servers on the host (~/.config/claudebox/mcp.json):
+MCP servers on the host ($(_cbox_shown "$CBOX_MCP_CONFIG")):
   cbox mcp                            Show configured host MCP servers and relay status
   cbox mcp import                     Import servers from Claude Desktop / Claude Code
 
@@ -86,9 +126,9 @@ _CBOX_CDOT_API=2
 _CBOX_FLUX_API=1
 
 # Source user config if present (~/.config/claudebox/cbox.env)
-_CBOX_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
-[[ -f "$_CBOX_CONFIG" ]] && . "$_CBOX_CONFIG"
-unset _CBOX_CONFIG
+_CBOX_ENV_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
+# shellcheck source=/dev/null
+[[ -f "$_CBOX_ENV_FILE" ]] && . "$_CBOX_ENV_FILE"
 
 CBOX_VERBOSE="${CBOX_VERBOSE:-0}"
 CBOX_AGENT="${CBOX_AGENT:-claude}"
@@ -165,6 +205,17 @@ fi
 # helpers
 # ---------------------------------------------------------
 
+# A host path for messages: under $HOME it starts with ~ (as `shown` does in
+# the python helpers).
+_cbox_shown() {
+  if [[ "$1" == "$HOME/"* ]]; then
+    # shellcheck disable=SC2088  # a literal ~ for display, not expanded
+    printf '~/%s\n' "${1#"$HOME"/}"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
 _cbox_log() { [[ "${CBOX_VERBOSE:-0}" == "1" ]] && echo "$@" || true; }
 
 _cbox_agent_bin() { [[ "${CBOX_AGENT:-claude}" == "opencode" ]] && echo "opencode" || echo "claude"; }
@@ -179,14 +230,39 @@ _cbox_name() {
   echo "${name:-project}"
 }
 
-# Returns "NAME STATE" pairs (no header) with optional extra args passed through.
-# Normalises Apple Container tabular output and Docker --format output to the same shape.
+# "NAME STATE" pairs (no header) for all containers, or with LABEL (key=value)
+# only for those carrying it. Apple's runtime lists them as JSON, labels
+# included, in one call: its printed table has changed layout before.
 _cbox_rt_list() {
+  local label="${1:-}"
   if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
-    container ls --all "$@" | awk 'NR==1{for(i=1;i<=NF;i++)if($i=="STATE")col=i;next} col&&NR>1{print $1,$col}'
+    container ls --all --format json | python3 -c "$(_cbox_rt_list_py)" "$label"
+  elif [[ -n "$label" ]]; then
+    docker ps -a --filter "label=$label" --format "{{.Names}} {{.State}}"
   else
-    docker ps -a "$@" --format "{{.Names}} {{.State}}"
+    docker ps -a --format "{{.Names}} {{.State}}"
   fi
+}
+
+# Reads `container ls --format json` on stdin. Accepts the layout since 1.0.0
+# (status.state) and a flat status string; unreadable input lists nothing.
+_cbox_rt_list_py() {
+  cat <<'PYEOF'
+import json, sys
+key, _, value = sys.argv[1].partition("=")
+try:
+    entries = json.load(sys.stdin)
+except ValueError:
+    entries = []
+for e in entries if isinstance(entries, list) else []:
+    conf = e.get("configuration") or {}
+    name = e.get("id") or conf.get("id")
+    status = e.get("status")
+    state = status.get("state") if isinstance(status, dict) else status
+    labels = conf.get("labels") or {}
+    if name and (not key or labels.get(key) == value):
+        print(name, state or "unknown")
+PYEOF
 }
 
 _cbox_rt_image_list() {
@@ -240,6 +316,28 @@ _cbox_system_running() {
   container system status >/dev/null 2>&1
 }
 
+# True when the runtime is Apple's and its container system is not running:
+# then no container command works.
+_cbox_system_down() {
+  [[ "$_CBOX_RUNTIME" == "apple" ]] && ! _cbox_system_running
+}
+
+# Starts Apple's container system unless it runs (sessions, and commands that
+# change containers or images, need it).
+_cbox_system_start() {
+  _cbox_system_down || return 0
+  echo "Starting container system..."
+  if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+    container system start
+  else
+    container system start >/dev/null 2>&1
+  fi
+}
+
+_cbox_system_down_hint() {
+  echo "  It starts with your next cbox session, or now with: container system start"
+}
+
 # Writes the per-project ~/.claude.json the container mounts. Host MCP servers
 # come from $CBOX_MCP_CONFIG only — never from a host Claude installation, which
 # may not exist. See the "MCP relay" section for how they reach the container.
@@ -284,7 +382,8 @@ _cbox_maybe_update() {
   agent_bin=$(_cbox_agent_bin)
   agent_pkg=$(_cbox_agent_pkg)
 
-  local stamp="${TMPDIR:-/tmp}/.cbox-update-${agent_bin}-$(date +%Y-%m-%d)"
+  local stamp
+  stamp="${TMPDIR:-/tmp}/.cbox-update-${agent_bin}-$(date +%Y-%m-%d)"
 
   if [[ ! -f "$stamp" ]]; then
     if ! _cbox_update_args "$name" "$mode"; then
@@ -307,6 +406,7 @@ _cbox_force_update() {
   local name="$1"
   clear
 
+  _cbox_system_start
   if ! _cbox_exists "$name"; then
     echo "No container found for '$name'."
     return 0
@@ -413,8 +513,9 @@ _cbox_session_markers() {
 }
 
 # Asks the container itself whether any exec session is still attached.
-# Exec'd processes run with PPID 0 (PID 1 is _cbox_init_py);
-# the probe's own `ps` is excluded. Returns 0 if a session is active,
+# Exec'd processes run with PPID 0 (PID 1 is the runtime's init); the probe's
+# own `ps` and the command that keeps the container running (`tail`, also
+# with PPID 0 in containers without an init) are excluded. Returns 0 if a session is active,
 # 1 if none, 2 if the probe failed (caller must not treat that as "none").
 # Marker files alone can outlive their session (interrupted cbox in a
 # still-open shell, or macOS PID reuse), so this is the ground truth.
@@ -422,7 +523,7 @@ _cbox_container_has_sessions() {
   local out
   out=$($_CBOX_CMD exec "$1" ps -eo pid=,ppid=,comm= 2>/dev/null) || return 2
   [[ -n "$out" ]] || return 2
-  awk '$2 == 0 && $1 != 1 && $3 != "ps" { found = 1 } END { exit !found }' <<<"$out"
+  awk '$2 == 0 && $1 != 1 && $3 != "ps" && $3 != "tail" { found = 1 } END { exit !found }' <<<"$out"
 }
 
 # ---------------------------------------------------------
@@ -1195,8 +1296,8 @@ def connect(name):
         time.sleep(0.25)
     sys.stderr.write(
         f"cbox-mcp-relay: host MCP server '{name}' is not reachable.\n"
-        "It is relayed from the host by cbox: check that it is listed in\n"
-        "~/.config/claudebox/mcp.json and run `cbox mcp` on the host.\n")
+        "It is relayed from the host by cbox: run `cbox mcp` on the host to\n"
+        "see the MCP config file in use and check that the server is listed.\n")
     return 1
 
 
@@ -1300,11 +1401,12 @@ _cbox_mcp_status() {
   local name="$1"
   python3 -c "$(_cbox_mcp_py)" list "$CBOX_MCP_CONFIG" "$CBOX_DATA_DIR/.mcp-relay-$name.log"
   python3 -c "$(_cbox_mcp_py)" has-relay-servers "$CBOX_MCP_CONFIG" || return 0
-  local pid
+  local pid log
+  log=$(_cbox_shown "$CBOX_DATA_DIR/.mcp-relay-$name.log")
   if pid=$(_cbox_mcp_relay_pid "$name"); then
-    echo "✔ relay for '$name' running (pid $pid, log: $CBOX_DATA_DIR/.mcp-relay-$name.log)"
+    echo "✔ relay for '$name' running (pid $pid, log: $log)"
   else
-    echo "ℹ relay for '$name' not running — starts with the next cbox session"
+    echo "ℹ relay for '$name' not running — starts with the next cbox session (log: $log)"
   fi
 }
 
@@ -1510,6 +1612,7 @@ PYEOF
 _cbox_tunnel_py() {
   echo '#!/usr/bin/env python3'
   echo '# cbox-tunnel — installed by cbox at session start; local edits are overwritten.'
+  # shellcheck disable=SC2016  # literal backticks in the generated script's comment
   echo '#   serve NAME=SOCKET ...  run by the host over `container exec -i`: clients of'
   echo '#                          SOCKET reach the host service NAME through this exec'
   echo '#                          (SOCKET is a unix socket path, or tcp:ADDR:PORT)'
@@ -4199,6 +4302,13 @@ def cmd_exposed(d, path):
     sys.exit(1)
 
 
+def cmd_names(d, kind=""):
+    """Resource names, one per line (for tab completion); only of type KIND if given."""
+    for name, r in sorted(load_resources(d).items()):
+        if not kind or r.get("type") == kind:
+            print(name)
+
+
 COMMANDS = {
     "tunnel": lambda a: cmd_tunnel(*a),
     "ssh-stop": lambda a: cmd_ssh_stop(*a),
@@ -4212,6 +4322,7 @@ COMMANDS = {
     "test": lambda a: cmd_test(*a),
     "template": lambda a: cmd_template(*a),
     "whatsapp-pick": lambda a: cmd_whatsapp_pick(*a),
+    "names": lambda a: cmd_names(*a),
 }
 
 if __name__ == "__main__":
@@ -4477,6 +4588,7 @@ _cbox_seed_playwright() {
         "$CBOX_IMAGE" \
         sh -c 'cp -a /opt/ms-playwright/. /seed/ 2>/dev/null || true' 2>&1); then
     echo "⚠  Could not seed the Playwright cache from the image:"
+    # shellcheck disable=SC2001  # indents every line; ${//} cannot anchor per line
     echo "$_out" | sed 's/^/    /'
     echo "    Browsers will be downloaded inside the container on first use."
     return 0
@@ -4566,7 +4678,7 @@ _cbox_safe_claude_dir() {
 # Folder names listed in CBOX_SHARE_CONFIG, one per line (zsh does not split
 # an unquoted variable, so no word splitting here).
 _cbox_shared_config_names() {
-  printf '%s\n' "${CBOX_SHARE_CONFIG:-}" | tr -s ' \t' '\n\n' | grep -v '^$' || true
+  printf '%s\n' "${CBOX_SHARE_CONFIG:-}" | tr -s ' \t' '\n' | grep -v '^$' || true
 }
 
 # The -v values for the container's ~/.config and the folders of the real
@@ -4574,16 +4686,16 @@ _cbox_shared_config_names() {
 # would get write access to config that runs on this Mac, through either its
 # ~/.config or its ~/.claude.
 _cbox_config_mounts() {
-  local real="${XDG_CONFIG_HOME:-$HOME/.config}" n
+  local real="${XDG_CONFIG_HOME:-$HOME/.config}" host_claude="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" n
   if _cbox_holds_host_config "$CBOX_HOST_CONFIG_DIR"; then
     echo "✘ CBOX_HOST_CONFIG_DIR=$CBOX_HOST_CONFIG_DIR would let code in the container change config that runs on this Mac (cbox.env, mcp.json, git)." >&2
-    echo "  Remove that line from $real/claudebox/cbox.env (the default is $real/claudebox/.config)," >&2
+    echo "  Remove that line from $(_cbox_shown "$_CBOX_ENV_FILE") (the default is $(_cbox_shown "$real/claudebox/.config"))," >&2
     echo "  and share the folders you need read-only instead, e.g.: CBOX_SHARE_CONFIG=\"opencode\"" >&2
     return 1
   fi
   if _cbox_holds_host_config "$CBOX_CLAUDE_DIR"; then
-    echo "✘ CBOX_CLAUDE_DIR=$CBOX_CLAUDE_DIR would let code in the container change config that runs on this Mac (Claude Code's hooks in ~/.claude/settings.json)." >&2
-    echo "  Remove that line from $real/claudebox/cbox.env (the default is $real/claudebox/.claude, seeded from ~/.claude on first use)." >&2
+    echo "✘ CBOX_CLAUDE_DIR=$CBOX_CLAUDE_DIR would let code in the container change config that runs on this Mac (Claude Code's hooks in $(_cbox_shown "$host_claude")/settings.json)." >&2
+    echo "  Remove that line from $(_cbox_shown "$_CBOX_ENV_FILE") (the default is $(_cbox_shown "$real/claudebox/.claude"), seeded from $(_cbox_shown "$host_claude") on first use)." >&2
     return 1
   fi
   mkdir -p "$CBOX_HOST_CONFIG_DIR"
@@ -4749,8 +4861,13 @@ _cbox_create() {
       # the intended trade-off for this mode.
       -v "$CBOX_PLAYWRIGHT_DIR:/opt/ms-playwright:ro"
     )
-    # --security-opt and --pids-limit are not supported by Apple's container CLI
-    if [[ "$_CBOX_RUNTIME" != "apple" ]]; then
+    # Apple's container CLI has neither --security-opt nor --pids-limit. Each
+    # of its containers runs its own kernel, so a process limit there caps the
+    # container like --pids-limit does; with all capabilities dropped, root
+    # cannot exceed it either. no-new-privileges has no equivalent.
+    if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
+      args+=(--ulimit nproc=512)
+    else
       args+=(
         --security-opt no-new-privileges
         --pids-limit 512
@@ -4791,37 +4908,51 @@ _cbox_create() {
   done < <(printf '%s\n' ${_targets[@]+"${_targets[@]}"} | LC_ALL=C sort)
   unset _ro _link _target _kept _nested _targets _mounted
 
+  # PID 1 is the runtime's own init (--init; Docker: tini): it collects every
+  # finished process whose parent is gone, and passes `stop` on. Without one,
+  # finished processes piled up until the process limit stopped the container.
+  # The command itself only has to keep the container running.
   args+=(
+    --init
+    --label "cbox.init=runtime"
     "$CBOX_IMAGE"
-    sh -c "$_CBOX_INIT_SH" sh "$(_cbox_init_py)"
+    tail -f /dev/null
   )
 
   $_CBOX_CMD "${args[@]}"
 }
 
-# The container's PID 1. Every process whose parent exits is handed to PID 1,
-# which has to collect it when it ends; `tail -f /dev/null`, used before,
-# never did, so finished processes piled up until the process limit stopped
-# the container. This one collects them, and stops at once on `container stop`.
-# Runs it; images without python3 (a custom CBOX_IMAGE) keep the old tail.
-# shellcheck disable=SC2016
-_CBOX_INIT_SH='command -v python3 >/dev/null 2>&1 && exec python3 -c "$1"; exec tail -f /dev/null'
-
-_cbox_init_py() {
-  cat <<'PYEOF'
-import os, signal, time
-signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
-while True:
-    try:
-        os.wait()
-    except ChildProcessError:
-        time.sleep(1)
-PYEOF
+# True for a container created by an older cbox whose PID 1 is `tail` itself,
+# without the runtime's init (no cbox.init label): it never collects finished
+# processes. Containers with cbox's former python init are fine.
+_cbox_old_init() {
+  local info
+  info=$($_CBOX_CMD inspect "$1" 2>/dev/null) || return 1
+  grep -Eq '"(/usr/bin/)?tail"' <<<"$info" && ! grep -q '"cbox.init"' <<<"$info"
 }
 
-# True for a container created by an older cbox, whose PID 1 is `tail`.
-_cbox_old_init() {
-  $_CBOX_CMD inspect "$1" 2>/dev/null | grep -Eq '"(/usr/bin/)?tail"'
+# Apple's runtime only: a container's filesystem is a disk image that grows
+# but never shrinks, so deleted npm caches and browsers still take space on
+# the Mac. `container clean` gives it back, for running containers only.
+# Docker frees that space by itself.
+_cbox_clean_running() {
+  [[ "$_CBOX_RUNTIME" == "apple" ]] || return 0
+  if ! container clean --help >/dev/null 2>&1; then
+    echo "ℹ  Disk space of running containers not reclaimed: needs a newer Apple container"
+    echo "   (https://github.com/apple/container/releases)."
+    return 0
+  fi
+
+  local running cname
+  running=$(_cbox_rt_list "$CBOX_LABEL" | awk '$2 == "running" {print $1}')
+  [[ -n "$running" ]] || return 0
+
+  echo "Reclaiming unused disk space in running cbox containers..."
+  while IFS= read -r cname; do
+    container clean "$cname" >/dev/null 2>&1 \
+      && echo "✔ $cname" \
+      || echo "⚠  Could not reclaim disk space in '$cname'"
+  done <<<"$running"
 }
 
 # ---------------------------------------------------------
@@ -4832,14 +4963,7 @@ _cbox_ensure() {
   local name="$1"
   local requested_mode="$2"
 
-  if [[ "$_CBOX_RUNTIME" == "apple" ]] && ! _cbox_system_running; then
-    echo "Starting container system..."
-    if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-      container system start
-    else
-      container system start >/dev/null 2>&1
-    fi
-  fi
+  _cbox_system_start
 
   # "existing": whatever mode the container has; a new one is normal.
   if ! _cbox_exists "$name"; then
@@ -5089,6 +5213,7 @@ _cbox_cdot_push() {
     local _out
     if ! _out=$(_cbox_cdot "$@" 2>&1); then
       echo "⚠  cdot $1 failed:"
+      # shellcheck disable=SC2001  # indents every line; ${//} cannot anchor per line
       echo "$_out" | sed 's/^/    /'
     fi
   fi
@@ -5291,12 +5416,71 @@ _cbox_keepalive() {
 # doctor
 # ---------------------------------------------------------
 
+# Apple's runtime: how far the installed version is behind, and whether the
+# newer releases fix security issues. Read from Apple's own release notes, so
+# cbox keeps no version floor that goes stale. Doctor only: one request, short
+# timeout; offline is not an error.
+_CBOX_RUNTIME_RELEASES_URL="${_CBOX_RUNTIME_RELEASES_URL:-https://api.github.com/repos/apple/container/releases?per_page=100}"
+
+# Prints "NEWER SECURITY LATEST" for an installed version, or nothing when the
+# releases could not be read.
+_cbox_runtime_releases_py() {
+  cat <<'PYEOF'
+import json, re, sys, urllib.request
+
+def ver(s):
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", s or "")
+    return tuple(map(int, m.groups())) if m else None
+
+installed, url = ver(sys.argv[1]), sys.argv[2]
+try:
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json", "User-Agent": "claudebox"})
+    with urllib.request.urlopen(req, timeout=3) as r:
+        releases = json.load(r)
+except Exception:
+    sys.exit(0)
+newer = [r for r in releases
+         if not r.get("draft") and not r.get("prerelease")
+         and ver(r.get("tag_name")) and ver(r["tag_name"]) > installed]
+security = [r for r in newer if "GHSA-" in (r.get("body") or "")]
+latest = max((r["tag_name"] for r in newer), key=ver, default="")
+print(len(newer), len(security), latest)
+PYEOF
+}
+
+_cbox_runtime_currency() {
+  local installed counts newer security latest
+  installed=$(container --version 2>/dev/null | sed -nE 's/.*version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')
+  if [[ -z "$installed" ]]; then
+    echo "ℹ Apple container version unknown"
+    return 0
+  fi
+  echo "ℹ checking for newer Apple container releases ($_CBOX_RUNTIME_RELEASES_URL)"
+  counts=$(python3 -c "$(_cbox_runtime_releases_py)" "$installed" "$_CBOX_RUNTIME_RELEASES_URL" 2>/dev/null)
+  if [[ -z "$counts" ]]; then
+    echo "ℹ Apple container $installed — could not check for updates"
+    return 0
+  fi
+  read -r newer security latest <<<"$counts"
+  if (( newer == 0 )); then
+    echo "✔ Apple container $installed (latest)"
+  elif (( security > 0 )); then
+    echo "⚠ Apple container $installed — $newer newer release(s), $security with security fixes; latest is $latest"
+    echo "  Update: https://github.com/apple/container/releases"
+  else
+    echo "ℹ Apple container $installed — $newer newer release(s); latest is $latest"
+    echo "  Update: https://github.com/apple/container/releases"
+  fi
+}
+
 _cbox_doctor_inline() {
   command -v "$_CBOX_CMD" >/dev/null \
     && echo "✔ $_CBOX_CMD command found" \
     || echo "✘ $_CBOX_CMD command missing"
 
   if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
+    _cbox_runtime_currency
     if _cbox_system_running; then
       echo "✔ container system running"
     else
@@ -5304,15 +5488,22 @@ _cbox_doctor_inline() {
     fi
   fi
 
-  _cbox_rt_image_list | grep -q "^$CBOX_IMAGE " \
-    && echo "✔ image '$CBOX_IMAGE' exists" \
-    || echo "✘ image '$CBOX_IMAGE' missing"
+  if _cbox_system_down; then
+    echo "ℹ image '$CBOX_IMAGE' not checked: the container system is not running"
+  else
+    _cbox_rt_image_list | grep -q "^$CBOX_IMAGE " \
+      && echo "✔ image '$CBOX_IMAGE' exists" \
+      || echo "✘ image '$CBOX_IMAGE' missing"
+  fi
 
   echo "Active agent: $(_cbox_agent_bin) (CBOX_AGENT=${CBOX_AGENT:-claude})"
 
   [[ -d "$CBOX_CLAUDE_DIR" ]] \
     && echo "✔ Claude config dir exists ($CBOX_CLAUDE_DIR)" \
     || echo "✘ Claude config dir missing ($CBOX_CLAUDE_DIR)"
+
+  echo "ℹ settings: $(_cbox_shown "$_CBOX_ENV_FILE"), host MCP servers: $(_cbox_shown "$CBOX_MCP_CONFIG")"
+  echo "ℹ data and logs (CBOX_DATA_DIR): $(_cbox_shown "$CBOX_DATA_DIR")"
 
   # Nothing prunes this cache automatically: unlike an image layer it survives
   # rebuilds, so every playwright upgrade leaves its old chromium-<id> behind.
@@ -5468,6 +5659,10 @@ cbox() {
 
     stop)
       local stop_target="${2:-$name}"
+      if _cbox_system_down; then
+        echo "Nothing to stop: Apple's container system is not running."
+        return 0
+      fi
       if ! _cbox_exists "$stop_target"; then
         echo "No container found for '$stop_target'."
         return 0
@@ -5481,6 +5676,7 @@ cbox() {
 
     reset)
       local reset_target="${2:-$name}"
+      _cbox_system_start
       if ! _cbox_exists "$reset_target"; then
         echo "No container found for '$reset_target'."
         return 0
@@ -5494,6 +5690,7 @@ cbox() {
 
     rebuild)
       clear
+      _cbox_system_start
       echo "Rebuilding image '$CBOX_IMAGE'..."
       $_CBOX_CMD build \
         --build-arg HOST_UID="$(id -u)" \
@@ -5530,8 +5727,18 @@ cbox() {
       _cbox_doctor_inline
       ;;
 
+    _complete)
+      shift
+      _cbox_complete "$@"
+      ;;
+
     list)
       clear
+      if _cbox_system_down; then
+        echo "✘ Apple's container system is not running, so cbox cannot list containers."
+        _cbox_system_down_hint
+        return 1
+      fi
       if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
         container ls --all
       else
@@ -5540,33 +5747,19 @@ cbox() {
       ;;
 
     prune)
+      _cbox_system_start
       echo "Removing stopped cbox containers..."
 
       local stopped
-      if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
-        stopped=$(
-          _cbox_rt_list | while read -r cname cstate; do
-            [[ "$cstate" == "running" ]] && continue
-            # Use an explicit if (not && echo): under `set -euo pipefail` a
-            # trailing false [[ … ]] would make the loop — and thus this
-            # command substitution — exit non-zero, aborting prune before it
-            # removes anything. This bites whenever the last listed container
-            # is a stopped non-cbox one (e.g. Apple Container's buildkit).
-            if [[ "$(_cbox_rt_label "$cname" "cbox.project")" == "true" ]]; then
-              echo "$cname"
-            fi
-          done
-        )
-      else
-        stopped=$(_cbox_rt_list --filter "label=$CBOX_LABEL" \
-          | awk '$2 != "running" {print $1}')
-      fi
+      stopped=$(_cbox_rt_list "$CBOX_LABEL" | awk '$2 != "running" {print $1}')
 
       if [[ -n "$stopped" ]]; then
         echo "$stopped" | xargs "$_CBOX_CMD" rm -f
       else
         echo "Nothing to prune."
       fi
+
+      _cbox_clean_running
       ;;
 
     "")
@@ -5622,45 +5815,40 @@ cbox() {
 }
 
 # ---------------------------------------------------------
-# shell completions (sourced case)
+# shell completions
 # ---------------------------------------------------------
 
+# cbox's containers (not the runtime's own, e.g. Apple's buildkit).
 _cbox_list_names() {
-  _cbox_rt_list 2>/dev/null | awk '{print $1}'
+  _cbox_rt_list "$CBOX_LABEL" 2>/dev/null | awk '{print $1}'
 }
 
-if [[ -n "${ZSH_VERSION:-}" ]]; then
-  _cbox_zsh_complete() {
-    case $CURRENT in
-      2)
-        compadd -v --verbose list stop reset prune rebuild update doctor mcp warden safe shell keepalive oc opencode version help
-        ;;
-      3)
-        if [[ "${words[2]}" == "reset" || "${words[2]}" == "stop" ]]; then
-          local -a containers
-          containers=($(_cbox_list_names))
-          (( ${#containers[@]} )) && compadd -a containers
-        fi
-        ;;
-    esac
-  }
-  (( ${+functions[compdef]} )) && compdef _cbox_zsh_complete cbox
-elif [[ -n "${BASH_VERSION:-}" ]]; then
-  _cbox_bash_complete() {
-    local cur="${COMP_WORDS[COMP_CWORD]}"
-    local prev="${COMP_WORDS[COMP_CWORD-1]}"
-    COMPREPLY=()
+# `cbox _complete WORD...`: the candidates for the word after `cbox WORD...`,
+# one per line. Every completion script (completions/_cbox for Homebrew, and
+# the zsh and bash ones below for a sourced cbox.sh) asks this, so none can
+# drift from the commands, and values come from cbox's own configuration.
+_cbox_complete() {
+  local IFS=' '  # "$*" below joins with spaces, also when called with a newline IFS
+  while [[ "${1:-}" =~ ^(-v|--verbose|oc|opencode)$ ]]; do shift; done
+  case "$*" in
+    "")
+      printf '%s\n' -v --verbose safe shell keepalive oc opencode list stop reset \
+        prune rebuild update doctor mcp warden version help
+      ;;
+    stop|reset)                     _cbox_system_down || _cbox_list_names ;;
+    mcp)                            printf '%s\n' list import ;;
+    warden)                         printf '%s\n' list edit secret approve test whatsapp log ;;
+    "warden secret")                echo set ;;
+    "warden secret set"|"warden test") _cbox_warden_python names "$CBOX_WARDEN_DIR" 2>/dev/null ;;
+    "warden whatsapp")              echo pick ;;
+    "warden whatsapp pick")         _cbox_warden_python names "$CBOX_WARDEN_DIR" whatsapp 2>/dev/null ;;
+    "warden whatsapp pick "*)
+      if (( $# == 4 )); then echo --all; fi
+      ;;
+  esac
+  return 0
+}
 
-    if [[ $COMP_CWORD -eq 1 ]]; then
-      COMPREPLY=( $(compgen -W \
-        "-v --verbose list stop reset prune rebuild update doctor mcp warden safe shell keepalive oc opencode version help" \
-        -- "$cur") )
-    elif [[ $COMP_CWORD -eq 2 && ( "$prev" == "reset" || "$prev" == "stop" ) ]]; then
-      COMPREPLY=( $(compgen -W "$(_cbox_list_names)" -- "$cur") )
-    fi
-  }
-  complete -F _cbox_bash_complete cbox
-fi
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   set -euo pipefail

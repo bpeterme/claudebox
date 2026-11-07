@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y \
     nano \
     jq \
     bats \
+    shellcheck \
     btop \
     htop \
     iotop \

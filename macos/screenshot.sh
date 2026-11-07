@@ -5,6 +5,7 @@
 #
 # See macos/README.md for how to assign a keyboard shortcut to this script.
 
+# shellcheck source=/dev/null
 [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env" ]] && \
   . "${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
 CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/claudebox/share}"

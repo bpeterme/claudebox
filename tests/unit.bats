@@ -332,7 +332,8 @@ _wait_procs() {
 @test "mcp relay: unknown server fails with a helpful message" {
   run bash -c "_CBOX_DIR=\$(mktemp -d /tmp/cbr.XXXX); source '$CBOX_SH'; _cbox_mcp_relay_py > \$_CBOX_DIR/r; CBOX_MCP_SOCKET_DIR=\$_CBOX_DIR/s timeout 30 python3 \$_CBOX_DIR/r connect nope; rc=\$?; rm -rf \$_CBOX_DIR; exit \$rc"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"'nope' is not reachable"*"mcp.json"* ]]
+  [[ "$output" == *"'nope' is not reachable"*"cbox mcp"*"MCP config file in use"* ]]
+  [[ "$output" != *".config/claudebox"* ]]
 }
 
 @test "mcp relay: stop leaves no processes or sockets behind" {
@@ -1188,6 +1189,20 @@ auth = sigv4"
   [ "$status" -eq 1 ]
 }
 
+@test "_cbox_container_has_sessions: the runtime's init and its tail are no session" {
+  _CBOX_CMD=_fake_runtime
+  # Docker's tini; and a layout where the kept-alive tail has PPID 0 too
+  _fake_runtime() { printf '    1     0 docker-init\n    7     1 tail\n  900     0 ps\n'; }
+  run _cbox_container_has_sessions "myproject"
+  [ "$status" -eq 1 ]
+  _fake_runtime() { printf '    1     0 init\n    7     0 tail\n  900     0 ps\n'; }
+  run _cbox_container_has_sessions "myproject"
+  [ "$status" -eq 1 ]
+  _fake_runtime() { printf '    1     0 init\n    7     0 tail\n  300     0 zsh\n  900     0 ps\n'; }
+  run _cbox_container_has_sessions "myproject"
+  [ "$status" -eq 0 ]
+}
+
 @test "_cbox_container_has_sessions: returns 0 when another exec session is attached" {
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { printf '    1     0 tail\n  134     0 claude\n  900     0 ps\n'; }
@@ -1314,28 +1329,69 @@ _flux_install_setup() {
 }
 
 # ---------------------------------------------------------------------------
-# _cbox_rt_list STATE column parsing (Apple Container 1.0.0 format)
+# _cbox_rt_list (Apple: `container ls --all --format json`)
 # ---------------------------------------------------------------------------
 
-_rt_list_awk() {
-  # apply the same awk as _cbox_rt_list uses for Apple Container
-  awk 'NR==1{for(i=1;i<=NF;i++)if($i=="STATE")col=i;next} col&&NR>1{print $1,$col}'
+# What Apple's runtime prints for: three cbox containers and its own buildkit.
+_apple_ls_json() {
+  cat <<'JSON'
+[
+ {"id":"proj-a","configuration":{"id":"proj-a","labels":{"cbox.project":"true","cbox.mode":"normal"}},"status":{"state":"running","networks":[]}},
+ {"id":"proj-b","configuration":{"id":"proj-b","labels":{"cbox.project":"true"}},"status":{"state":"stopped","networks":[]}},
+ {"id":"proj-c","configuration":{"id":"proj-c","labels":{"cbox.project":"true"}},"status":{"state":"running","networks":[]}},
+ {"id":"buildkit","configuration":{"id":"buildkit","labels":{}},"status":{"state":"running","networks":[]}}
+]
+JSON
 }
 
-@test "_cbox_rt_list awk: extracts name and STATE from 1.0.0 header format" {
-  local input
-  input=$(printf "ID IMAGE OS ARCH STATE IP CPUS MEMORY STARTED\nmy-app claudebox:latest linux arm64 stopped  4 1024 MB 2026-01-01\nbuildkit builder:0.12.0 linux arm64 running 192.168.64.5/24 2 2048 MB 2026-01-01\n")
-  run bash -c "echo '$input' | $(_rt_list_awk_cmd)"
-  # use helper inline
-  run bash -c "printf 'ID IMAGE OS ARCH STATE IP CPUS MEMORY STARTED\nmy-app claudebox:latest linux arm64 stopped  4 1024 MB 2026-01-01\nbuildkit builder:0.12.0 linux arm64 running 192.168.64.5/24 2 2048 MB 2026-01-01\n' | awk 'NR==1{for(i=1;i<=NF;i++)if(\$i==\"STATE\")col=i;next} col&&NR>1{print \$1,\$col}'"
+# Stubs `container`: `ls` prints $APPLE_LS (default: the fixture above), and
+# every call is logged to $CONTAINER_LOG.
+_apple_ls_stub() {
+  _CBOX_RUNTIME=apple
+  CONTAINER_LOG="$BATS_TMPDIR/container-calls"
+  rm -f "$CONTAINER_LOG"
+  container() {
+    echo "$*" >> "$CONTAINER_LOG"
+    if [[ "$1" == "ls" ]]; then
+      if [[ -n "${APPLE_LS+set}" ]]; then printf '%s' "$APPLE_LS"; else _apple_ls_json; fi
+    fi
+  }
+}
+
+@test "_cbox_rt_list (Apple): every container with its state, in one call" {
+  _apple_ls_stub
+  run _cbox_rt_list
   [ "$status" -eq 0 ]
-  [ "$output" = "$(printf 'my-app stopped\nbuildkit running')" ]
+  [ "$output" = $'proj-a running\nproj-b stopped\nproj-c running\nbuildkit running' ]
+  [ "$(cat "$CONTAINER_LOG")" = "ls --all --format json" ]
 }
 
-@test "_cbox_rt_list awk: tolerates STATE column being absent" {
-  run bash -c "printf 'NAME STATUS\nmy-app stopped\n' | awk 'NR==1{for(i=1;i<=NF;i++)if(\$i==\"STATE\")col=i;next} col&&NR>1{print \$1,\$col}'"
+@test "_cbox_rt_list (Apple): with a label, only containers carrying it" {
+  _apple_ls_stub
+  run _cbox_rt_list "cbox.project=true"
+  [ "$output" = $'proj-a running\nproj-b stopped\nproj-c running' ]
+  run _cbox_rt_list "cbox.mode=normal"
+  [ "$output" = "proj-a running" ]
+}
+
+@test "_cbox_rt_list (Apple): accepts a flat status string, lists nothing for bad input" {
+  _apple_ls_stub
+  APPLE_LS='[{"id":"old","configuration":{"labels":{"cbox.project":"true"}},"status":"stopped"}]'
+  run _cbox_rt_list "cbox.project=true"
+  [ "$output" = "old stopped" ]
+  APPLE_LS='Error: something else'
+  run _cbox_rt_list
   [ "$status" -eq 0 ]
   [ -z "$output" ]
+}
+
+@test "_cbox_rt_list (Docker): label becomes a --filter" {
+  _CBOX_RUNTIME=docker
+  docker() { printf '%s\n' "$*"; }
+  run _cbox_rt_list "cbox.project=true"
+  [ "$output" = "ps -a --filter label=cbox.project=true --format {{.Names}} {{.State}}" ]
+  run _cbox_rt_list
+  [ "$output" = "ps -a --format {{.Names}} {{.State}}" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -1386,58 +1442,194 @@ _label_from_json() {
 }
 
 # ---------------------------------------------------------------------------
-# prune loop robustness under `set -euo pipefail` (Homebrew executable path)
+# cbox prune
 # ---------------------------------------------------------------------------
 
-# Mirrors the Apple Container prune loop, including the `stopped=$(…)`
-# assignment, under the same `set -euo pipefail` the script applies when run as
-# an installed executable. Regression: a stopped, unlabeled container listed
-# LAST (e.g. Apple Container's `buildkit`) left the loop with a non-zero exit
-# status; under `set -e` that aborted prune before it removed anything, with no
-# "Nothing to prune." message. Runs in a subshell so the shell options and stub
-# functions do not leak into the rest of the suite.
-_prune_collect() {
-  (
-    set -euo pipefail
-    _cbox_rt_list() {
-      printf '%s\n' \
-        "Temp stopped" \
-        "companyon-apps running" \
-        "Myproject stopped" \
-        "buildkit stopped"
-    }
-    _cbox_rt_label() {
-      # only cbox containers carry cbox.project=true; buildkit does not
-      case "$1" in
-        buildkit) echo "" ;;
-        *) echo "true" ;;
-      esac
-    }
-    local stopped
-    stopped=$(
-      _cbox_rt_list | while read -r cname cstate; do
-        [[ "$cstate" == "running" ]] && continue
-        if [[ "$(_cbox_rt_label "$cname" "cbox.project")" == "true" ]]; then
-          echo "$cname"
-        fi
-      done
-    )
-    # Reaching here means the substitution did not abort under set -e.
-    printf '%s\n' "$stopped"
-  )
+@test "cbox prune: removes only stopped cbox containers" {
+  _apple_ls_stub
+  _cbox_system_start() { :; }
+  _cbox_clean_running() { :; }
+  # prune removes through xargs, which runs the program, not the function.
+  _CBOX_CMD=container
+  mkdir -p "$BATS_TMPDIR/prune-bin"
+  printf '#!/bin/sh\necho "$*" >> %q\n' "$CONTAINER_LOG" > "$BATS_TMPDIR/prune-bin/container"
+  chmod +x "$BATS_TMPDIR/prune-bin/container"
+  PATH="$BATS_TMPDIR/prune-bin:$PATH" run cbox prune
+  [ "$status" -eq 0 ]
+  run grep '^rm ' "$CONTAINER_LOG"
+  [ "$output" = "rm -f proj-b" ]
 }
 
-@test "prune loop: does not abort under set -e when last container is stopped and unlabeled" {
-  run _prune_collect
+@test "cbox prune: nothing stopped, nothing removed — also under set -euo pipefail" {
+  run bash -c 'set -euo pipefail; source "$1"; '"$(declare -f _apple_json_none _apple_ls_stub _apple_ls_json)"'
+    BATS_TMPDIR="$2"; _apple_ls_stub; APPLE_LS=$(_apple_json_none)
+    _cbox_system_start() { :; }; _cbox_clean_running() { :; }; clear() { :; }
+    cbox prune; echo DONE' _ "$CBOX_SH" "$BATS_TMPDIR"
   [ "$status" -eq 0 ]
+  [[ "$output" == *"Nothing to prune."*"DONE"* ]]
 }
 
-@test "prune loop: collects stopped cbox containers, skips running and unlabeled" {
-  run _prune_collect
+# Only the runtime's own buildkit, stopped: the case that once aborted prune.
+_apple_json_none() {
+  echo '[{"id":"buildkit","configuration":{"labels":{}},"status":{"state":"stopped"}}]'
+}
+
+# ---------------------------------------------------------------------------
+# _cbox_runtime_currency (cbox doctor, Apple runtime)
+# ---------------------------------------------------------------------------
+
+# Release list fixture served as file:// (no network); `container --version`
+# reports INSTALLED.
+_currency_stubs() {
+  local f="$BATS_TMPDIR/releases.json"
+  cat > "$f" <<'JSON'
+[
+  {"tag_name": "1.7.1", "body": "Core\n- stats cpuUtilization"},
+  {"tag_name": "1.8.0-rc1", "prerelease": true, "body": "GHSA-xxxx"},
+  {"tag_name": "1.6.0", "body": "Security\n- GHSA-vgrw-36j7-r93w digest"},
+  {"tag_name": "1.10.0", "draft": true, "body": "GHSA-yyyy"},
+  {"tag_name": "1.5.0", "body": "Core"},
+  {"tag_name": "1.3.1", "body": "GHSA-x7pf-2jmj-pgcq"},
+  {"tag_name": "1.0.0", "body": "first"}
+]
+JSON
+  _CBOX_RUNTIME_RELEASES_URL="file://$f"
+  container() { echo "container CLI version $INSTALLED (build: release, commit: abc1234)"; }
+}
+
+@test "_cbox_runtime_currency: latest installed" {
+  _currency_stubs; INSTALLED=1.7.1
+  run _cbox_runtime_currency
   [ "$status" -eq 0 ]
-  [ "${lines[0]}" = "Temp" ]
-  [ "${lines[1]}" = "Myproject" ]
+  [[ "$output" == *"✔ Apple container 1.7.1 (latest)"* ]]
+}
+
+@test "_cbox_runtime_currency: behind with security fixes; drafts and prereleases ignored" {
+  _currency_stubs; INSTALLED=1.5.0
+  run _cbox_runtime_currency
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"⚠ Apple container 1.5.0 — 2 newer release(s), 1 with security fixes; latest is 1.7.1"* ]]
+}
+
+@test "_cbox_runtime_currency: counts every newer release" {
+  _currency_stubs; INSTALLED=1.0.0
+  run _cbox_runtime_currency
+  [[ "$output" == *"4 newer release(s), 2 with security fixes; latest is 1.7.1"* ]]
+}
+
+@test "_cbox_runtime_currency: compares versions numerically, not as text" {
+  _currency_stubs; INSTALLED=1.9.0
+  printf '%s' '[{"tag_name":"1.10.0","body":""},{"tag_name":"1.9.0","body":""},{"tag_name":"1.8.2","body":"GHSA-z"}]' \
+    > "$BATS_TMPDIR/releases.json"
+  run _cbox_runtime_currency
+  [[ "$output" == *"1 newer release(s); latest is 1.10.0"* ]]
+}
+
+@test "_cbox_runtime_currency: behind without security fixes is informational" {
+  _currency_stubs; INSTALLED=1.6.1
+  run _cbox_runtime_currency
+  [[ "$output" == *"ℹ Apple container 1.6.1 — 1 newer release(s); latest is 1.7.1"* ]]
+  [[ "$output" != *"⚠"* ]]
+}
+
+@test "_cbox_runtime_currency: unreadable release list is not an error" {
+  _currency_stubs; INSTALLED=1.5.0
+  _CBOX_RUNTIME_RELEASES_URL="file://$BATS_TMPDIR/no-such-releases.json"
+  run _cbox_runtime_currency
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Apple container 1.5.0 — could not check for updates"* ]]
+}
+
+@test "_cbox_runtime_currency: shows the URL before contacting it" {
+  _currency_stubs; INSTALLED=1.7.1
+  run _cbox_runtime_currency
+  [[ "${lines[0]}" == *"($_CBOX_RUNTIME_RELEASES_URL)"* ]]
+}
+
+@test "_cbox_runtime_currency: unknown version output skips the check" {
+  _currency_stubs
+  container() { echo "something else"; }
+  run _cbox_runtime_currency
+  [ "$status" -eq 0 ]
+  [ "$output" = "ℹ Apple container version unknown" ]
+}
+
+# ---------------------------------------------------------------------------
+# _cbox_clean_running (cbox prune, Apple runtime)
+# ---------------------------------------------------------------------------
+
+# Stubs `container`: logs every call; `clean --help` succeeds unless
+# CLEAN_MISSING=1, `clean NAME` fails for the container named in CLEAN_FAIL.
+_clean_stubs() {
+  _CBOX_RUNTIME=apple
+  CLEAN_LOG="$BATS_TMPDIR/clean-calls"
+  rm -f "$CLEAN_LOG"
+  container() {
+    echo "$*" >> "$CLEAN_LOG"
+    [[ "$1" == "clean" ]] || return 0
+    [[ "$2" == "--help" ]] && { [[ "${CLEAN_MISSING:-0}" == "1" ]] && return 64; return 0; }
+    [[ "$2" == "${CLEAN_FAIL:-}" ]] && return 1
+    return 0
+  }
+  _cbox_rt_list() {
+    [[ "${1:-}" == "$CBOX_LABEL" ]] || { echo "unexpected: _cbox_rt_list $*" >&2; return 1; }
+    printf '%s\n' "proj-a running" "proj-b stopped" "proj-c running"
+  }
+}
+
+@test "_cbox_clean_running: cleans only running cbox containers" {
+  _clean_stubs
+  run _cbox_clean_running
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"✔ proj-a"* ]]
+  [[ "$output" == *"✔ proj-c"* ]]
+  run grep -E '^clean [^-]' "$CLEAN_LOG"
+  [ "${lines[0]}" = "clean proj-a" ]
+  [ "${lines[1]}" = "clean proj-c" ]
   [ "${#lines[@]}" -eq 2 ]
+}
+
+@test "_cbox_clean_running: a failing container is reported, the others still cleaned" {
+  _clean_stubs
+  CLEAN_FAIL=proj-a run _cbox_clean_running
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Could not reclaim disk space in 'proj-a'"* ]]
+  [[ "$output" == *"✔ proj-c"* ]]
+}
+
+@test "_cbox_clean_running: an older Apple runtime without clean is skipped with a hint" {
+  _clean_stubs
+  CLEAN_MISSING=1 run _cbox_clean_running
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"needs a newer Apple container"* ]]
+  run grep -cE '^clean [^-]' "$CLEAN_LOG"
+  [ "$output" = "0" ]
+}
+
+@test "_cbox_clean_running: does nothing on Docker" {
+  _clean_stubs
+  _CBOX_RUNTIME=docker
+  run _cbox_clean_running
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ ! -f "$CLEAN_LOG" ]
+}
+
+@test "_cbox_clean_running: no running cbox container, no output" {
+  _clean_stubs
+  _cbox_rt_list() { printf '%s\n' "proj-b stopped"; }
+  run _cbox_clean_running
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "_cbox_clean_running: survives set -euo pipefail when no container runs" {
+  _clean_stubs
+  run bash -c 'set -euo pipefail; source "$1"; '"$(declare -f _clean_stubs)"'
+    BATS_TMPDIR="$2"; _clean_stubs; _cbox_rt_list() { echo "proj-b stopped"; }
+    _cbox_clean_running; echo DONE' _ "$CBOX_SH" "$BATS_TMPDIR"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"DONE"* ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -1659,6 +1851,34 @@ _prune_collect() {
   [ "$normal" -eq 1 ]
   [ "$safe" -eq 1 ]
   [ "$custom" -eq 1 ]
+}
+
+@test "_cbox_create: safe mode limits processes on both runtimes, normal mode does not" {
+  local capture="$BATS_TMPDIR/create-nproc-args"
+  cd "$BATS_TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+
+  _CBOX_RUNTIME=apple
+  rm -f "$capture"; _cbox_create "cbox-unit-nproc" "safe"
+  run cat "$capture"
+  [[ "$output" == *$'--ulimit\nnproc=512'* ]]
+  [[ "$output" != *"--pids-limit"* ]]
+  [[ "$output" != *"--security-opt"* ]]
+
+  _CBOX_RUNTIME=docker
+  rm -f "$capture"; _cbox_create "cbox-unit-nproc" "safe"
+  run cat "$capture"
+  [[ "$output" == *$'--pids-limit\n512'* ]]
+  [[ "$output" == *$'--security-opt\nno-new-privileges'* ]]
+  [[ "$output" != *"--ulimit"* ]]
+
+  for _CBOX_RUNTIME in apple docker; do
+    rm -f "$capture"; _cbox_create "cbox-unit-nproc" "normal"
+    run cat "$capture"
+    [[ "$output" != *"--ulimit"* ]]
+    [[ "$output" != *"--pids-limit"* ]]
+  done
 }
 
 @test "_cbox_create: mounts the playwright cache read-only in safe mode" {
@@ -2512,53 +2732,20 @@ print(sorted(set(g.values())), g.get(hub), lab in g)" "$CBOX_WARDEN_DIR" "$(_fak
 # container PID 1
 # ---------------------------------------------------------------------------
 
-@test "_cbox_create: PID 1 is cbox's init, not tail" {
+@test "_cbox_create: PID 1 is the runtime's init (--init), labelled for _cbox_old_init" {
   local capture="$BATS_TMPDIR/create-init-args"
-  rm -f "$capture"
   cd "$BATS_TMPDIR"
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
-  _cbox_create "cbox-unit-init" "normal"
-  run cat "$capture"
-  [[ "$output" == *"-c"$'\n'"$_CBOX_INIT_SH"$'\n'"sh"$'\n'"import os, signal, time"* ]]
-  [[ "$output" != *$'\n'"tail"$'\n'* ]]
-}
-
-@test "_CBOX_INIT_SH: runs the init with python3, and tail in images without it" {
-  mkdir -p "$BATS_TMPDIR/init-bin"
-  printf '#!/bin/sh\necho "python3 $1 $2"\n' > "$BATS_TMPDIR/init-bin/python3"
-  chmod +x "$BATS_TMPDIR/init-bin/python3"
-  run env PATH="$BATS_TMPDIR/init-bin:/usr/bin:/bin" sh -c "$_CBOX_INIT_SH" sh "CODE"
-  [ "$output" = "python3 -c CODE" ]
-  mkdir -p "$BATS_TMPDIR/init-nopy"
-  ln -sf "$(command -v tail)" "$BATS_TMPDIR/init-nopy/tail"
-  run timeout 1 env PATH="$BATS_TMPDIR/init-nopy" /bin/sh -c "$_CBOX_INIT_SH" sh "CODE"
-  [ "$status" -eq 124 ]  # tail -f keeps running
-}
-
-@test "_cbox_init_py: collects orphaned processes and stops on SIGTERM" {
-  # A subreaper stands in for PID 1: orphans of its children come to it.
-  run timeout 20 python3 -c '
-import ctypes, os, signal, subprocess, sys, time
-ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
-if os.fork() == 0:
-    if os.fork() == 0:
-        time.sleep(0.5)
-        os._exit(0)  # ends after its parent: an orphan
-    os._exit(0)
-time.sleep(0.2)
-os.waitpid(-1, 0)  # the direct child; the orphan is now ours
-pid = os.getpid()
-if os.fork() == 0:
-    time.sleep(2)
-    st = subprocess.run(["ps", "-o", "stat=", "--ppid", str(pid)], capture_output=True, text=True).stdout.split()
-    print("zombies", sum(s.startswith("Z") for s in st), flush=True)
-    t = time.time(); os.kill(pid, signal.SIGTERM)
-    os._exit(0)
-os.execvp("python3", ["python3", "-c", sys.argv[1]])
-' "$(_cbox_init_py)"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"zombies 0"* ]]
+  local mode
+  for mode in normal safe; do
+    rm -f "$capture"
+    _cbox_create "cbox-unit-init" "$mode"
+    run cat "$capture"
+    [[ "$output" == *$'\n--init\n'* ]]
+    [[ "$output" == *$'\n--label\ncbox.init=runtime\n'* ]]
+    [[ "$output" == *$'\n'"$CBOX_IMAGE"$'\ntail\n-f\n/dev/null' ]]
+  done
 }
 
 @test "_cbox_old_init: recognises containers created with tail as PID 1" {
@@ -2566,7 +2753,16 @@ os.execvp("python3", ["python3", "-c", sys.argv[1]])
   _fake_runtime() { echo '[{"configuration": {"initProcess": {"executable": "tail", "arguments": ["-f", "/dev/null"]}}}]'; }
   run _cbox_old_init box
   [ "$status" -eq 0 ]
+  # cbox's former python init
   _fake_runtime() { echo '[{"configuration": {"initProcess": {"executable": "python3", "arguments": ["-c", "import os"]}}}]'; }
+  run _cbox_old_init box
+  [ "$status" -ne 0 ]
+  # tail under the runtime's init
+  _fake_runtime() { echo '[{"configuration": {"labels": {"cbox.init": "runtime"}, "initProcess": {"executable": "tail", "arguments": ["-f", "/dev/null"]}}}]'; }
+  run _cbox_old_init box
+  [ "$status" -ne 0 ]
+  # container gone
+  _fake_runtime() { return 1; }
   run _cbox_old_init box
   [ "$status" -ne 0 ]
 }
@@ -3493,4 +3689,216 @@ PY
   [ "$status" -eq 2 ]
   [[ "$output" == *"WhatsApp's chat database was not found"* ]]
   [ ! -e "$WA/out" ]
+}
+
+# ---------------------------------------------------------------------------
+# Paths in messages follow the configuration, never a fixed default
+# ---------------------------------------------------------------------------
+
+@test "_cbox_shown: shortens paths under HOME to ~, leaves others alone" {
+  [ "$(_cbox_shown "$HOME/.config/claudebox/mcp.json")" = "~/.config/claudebox/mcp.json" ]
+  [ "$(_cbox_shown "/opt/cbox/mcp.json")" = "/opt/cbox/mcp.json" ]
+  [ "$(_cbox_shown "${HOME}other/x")" = "${HOME}other/x" ]
+}
+
+@test "help: shows the MCP config file in use" {
+  clear() { :; }
+  CBOX_MCP_CONFIG=/opt/cbox/servers.json run _cbox_help
+  [[ "$output" == *"MCP servers on the host (/opt/cbox/servers.json):"* ]]
+  [[ "$output" != *".config/claudebox/mcp.json"* ]]
+}
+
+@test "_cbox_config_mounts: refusal names the configured cbox.env and Claude folder" {
+  CLAUDE_CONFIG_DIR="$BATS_TMPDIR/host-claude"
+  CBOX_CLAUDE_DIR="$CLAUDE_CONFIG_DIR"
+  mkdir -p "$CLAUDE_CONFIG_DIR"
+  run _cbox_config_mounts
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Claude Code's hooks in $CLAUDE_CONFIG_DIR/settings.json"* ]]
+  [[ "$output" == *"Remove that line from ~/.config/claudebox/cbox.env"* ]]
+  [[ "$output" != *"~/.claude"* ]]
+}
+
+@test "doctor: names the settings file, MCP config and data folder in use" {
+  CBOX_MCP_CONFIG=/opt/cbox/servers.json
+  _cbox_rt_image_list() { :; }
+  run _cbox_doctor_inline
+  [[ "$output" == *"host MCP servers: /opt/cbox/servers.json"* ]]
+  [[ "$output" == *"data and logs (CBOX_DATA_DIR): $CBOX_DATA_DIR"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Apple's container system not running
+# ---------------------------------------------------------------------------
+
+# Stubs `container`: `system status` fails until `system start` ran; every
+# call is logged, and any other command fails like the real one does then.
+_system_down_stubs() {
+  _CBOX_RUNTIME=apple
+  _CBOX_CMD=container
+  SYS_LOG="$BATS_TMPDIR/system-calls"
+  SYS_UP="$BATS_TMPDIR/system-up"
+  rm -f "$SYS_LOG" "$SYS_UP"
+  clear() { :; }
+  container() {
+    echo "$*" >> "$SYS_LOG"
+    case "$1 ${2:-}" in
+      "system status") [[ -f "$SYS_UP" ]] ;;
+      "system start")  touch "$SYS_UP" ;;
+      *) [[ -f "$SYS_UP" ]] || { echo "Error: XPC connection error" >&2; return 1; } ;;
+    esac
+  }
+}
+
+@test "cbox list: clean error when the container system is not running" {
+  _system_down_stubs
+  run cbox list
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Apple's container system is not running, so cbox cannot list containers."* ]]
+  [[ "$output" == *"container system start"* ]]
+  [[ "$output" != *"XPC"* ]]
+  run grep -c 'system start' "$SYS_LOG"
+  [ "$output" = "0" ]
+}
+
+@test "cbox stop: nothing to stop when the container system is not running" {
+  _system_down_stubs
+  run cbox stop
+  [ "$status" -eq 0 ]
+  [ "$output" = "Nothing to stop: Apple's container system is not running." ]
+}
+
+@test "cbox reset/prune/rebuild/update: start the container system first" {
+  _system_down_stubs
+  _cbox_rt_list() { :; }
+  for cmd in reset prune rebuild update; do
+    rm -f "$SYS_LOG" "$SYS_UP"
+    run cbox "$cmd"
+    [[ "$output" != *"XPC"* ]] || { echo "$cmd: $output"; false; }
+    [ "$(head -2 "$SYS_LOG" | tail -1)" = "system start" ] || { echo "$cmd:"; cat "$SYS_LOG"; false; }
+  done
+}
+
+@test "doctor: image not checked while the container system is not running" {
+  _system_down_stubs
+  run _cbox_doctor_inline
+  [[ "$output" == *"image '$CBOX_IMAGE' not checked: the container system is not running"* ]]
+  [[ "$output" != *"XPC"* ]]
+}
+
+@test "docker runtime: never considered down" {
+  _system_down_stubs
+  _CBOX_RUNTIME=docker
+  run _cbox_system_down
+  [ "$status" -ne 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# Tab completion: one list (cbox _complete) behind every completion script
+# ---------------------------------------------------------------------------
+
+@test "_cbox_complete: offers every command the dispatcher handles" {
+  run _cbox_complete
+  [ "$status" -eq 0 ]
+  local cmd
+  # Commands in cbox()'s case, without internal (_*) and hidden companion ones.
+  for cmd in $(awk '/^cbox\(\) \{/{f=1} f && /^    [a-z|-]+\)$/{gsub(/[ )]/,""); gsub(/\|/," "); print} f && /^}/{exit}' "$CBOX_SH"); do
+    [[ "$cmd" == cdot || "$cmd" == flux || "$cmd" == --help || "$cmd" == -h ]] && continue
+    [[ $'\n'"$output"$'\n' == *$'\n'"$cmd"$'\n'* ]] || { echo "missing: $cmd"; false; }
+  done
+}
+
+@test "_cbox_complete: subcommands, ignoring -v and oc in front" {
+  [ "$(_cbox_complete mcp | tr '\n' ' ')" = "list import " ]
+  [ "$(_cbox_complete -v oc warden | tr '\n' ' ')" = "list edit secret approve test whatsapp log " ]
+  [ "$(_cbox_complete warden secret)" = "set" ]
+  [ "$(_cbox_complete warden whatsapp)" = "pick" ]
+  [ "$(_cbox_complete warden whatsapp pick chats)" = "--all" ]
+  [ -z "$(_cbox_complete warden whatsapp pick chats --all)" ]
+  [ -z "$(_cbox_complete nonsense)" ]
+}
+
+@test "_cbox_complete: container names for stop and reset, none while the system is down" {
+  _cbox_rt_list() { printf '%s\n' "proj-a running" "proj-b stopped"; }
+  _cbox_system_down() { return 1; }
+  [ "$(_cbox_complete stop | tr '\n' ' ')" = "proj-a proj-b " ]
+  [ "$(_cbox_complete reset | tr '\n' ' ')" = "proj-a proj-b " ]
+  _cbox_system_down() { return 0; }
+  [ -z "$(_cbox_complete stop)" ]
+}
+
+@test "_cbox_complete: warden resource names, only whatsapp ones for pick" {
+  mkdir -p "$CBOX_WARDEN_DIR"
+  printf '[llm]\nupstream = https://api.example.com\nauth = bearer\nsecret = cbox.warden.llm\nallow = GET /x\n[chats]\ntype = whatsapp\n' \
+    > "$CBOX_WARDEN_DIR/resources"
+  [ "$(_cbox_complete warden test | tr '\n' ' ')" = "chats llm " ]
+  [ "$(_cbox_complete warden secret set | tr '\n' ' ')" = "chats llm " ]
+  [ "$(_cbox_complete warden whatsapp pick)" = "chats" ]
+  rm -f "$CBOX_WARDEN_DIR/resources"
+}
+
+# A `cbox` executable on PATH, as Homebrew installs it, with this cbox.sh.
+_cbox_bin() {
+  mkdir -p "$BATS_TMPDIR/bin"
+  printf '#!/usr/bin/env bash\nexec bash %q "$@"\n' "$CBOX_SH" > "$BATS_TMPDIR/bin/cbox"
+  chmod +x "$BATS_TMPDIR/bin/cbox"
+}
+
+@test "zsh completion (Homebrew file): asks cbox and offers its candidates" {
+  command -v zsh >/dev/null || skip "zsh not installed"
+  _cbox_bin
+  run env PATH="$BATS_TMPDIR/bin:$PATH" zsh -f -c '
+    compadd() { [[ $1 == -a ]] && print -l -- "${(@P)2}"; }
+    source "$1" >/dev/null 2>&1
+    words=(cbox warden ""); CURRENT=3; _cbox; print SEP
+    words=(cbox ""); CURRENT=2; _cbox' _ "$(dirname "$CBOX_SH")/completions/_cbox"
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "list" ]
+  [ "${lines[6]}" = "log" ]
+  [ "${lines[7]}" = "SEP" ]
+  [[ "$output" == *$'\nkeepalive\n'* ]]
+}
+
+@test "zsh completion (sourced cbox.sh): same candidates" {
+  command -v zsh >/dev/null || skip "zsh not installed"
+  run zsh -f -c '
+    compadd() { [[ $1 == -a ]] && print -l -- "${(@P)2}"; }
+    source "$1" >/dev/null 2>&1
+    words=(cbox mcp ""); CURRENT=3; _cbox_zsh_complete' _ "$CBOX_SH"
+  [ "$status" -eq 0 ]
+  [ "$output" = $'list\nimport' ]
+}
+
+@test "bash completion (sourced cbox.sh): several words, inherited newline IFS" {
+  run bash -c 'source "$1" >/dev/null 2>&1
+    COMP_WORDS=(cbox warden secret ""); COMP_CWORD=3; _cbox_bash_complete; printf "%s\n" "${COMPREPLY[@]}"' _ "$CBOX_SH"
+  [ "$status" -eq 0 ]
+  [ "$output" = "set" ]
+}
+
+@test "bash completion (sourced cbox.sh): filters candidates by the typed prefix" {
+  run bash -c 'source "$1" >/dev/null 2>&1
+    COMP_WORDS=(cbox warden s); COMP_CWORD=2; _cbox_bash_complete; printf "%s\n" "${COMPREPLY[@]}"' _ "$CBOX_SH"
+  [ "$status" -eq 0 ]
+  [ "$output" = "secret" ]
+}
+
+# ---------------------------------------------------------------------------
+# Sourced install: only `cbox` and its completion land in the shell
+# ---------------------------------------------------------------------------
+
+@test "sourced in an interactive shell: no config or internals leak, cbox still works" {
+  local sh xdg="$BATS_TMPDIR/src-xdg"
+  mkdir -p "$xdg/claudebox"
+  printf 'LEAKME=1\n' > "$xdg/claudebox/cbox.env"
+  for sh in bash zsh; do
+    command -v "$sh" >/dev/null || continue
+    run env XDG_CONFIG_HOME="$xdg" "$sh" -i -c 'source "$1" 2>/dev/null
+      echo "LEAKME=${LEAKME-unset} IMAGE=${CBOX_IMAGE-unset}"
+      typeset -f _cbox_help >/dev/null 2>&1 && echo "internals leaked"
+      cbox _complete mcp' _ "$CBOX_SH"
+    [[ "$output" == *"LEAKME=unset IMAGE=unset"* ]] || { echo "$sh: $output"; false; }
+    [[ "$output" != *"internals leaked"* ]] || { echo "$sh: $output"; false; }
+    [[ "$output" == *$'list\nimport'* ]] || { echo "$sh: $output"; false; }
+  done
 }

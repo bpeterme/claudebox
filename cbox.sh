@@ -19,7 +19,7 @@
 
 _cbox_help() {
     clear
-    cat <<'EOF'
+    cat <<EOF
 cbox - AI Coding Agent Container Runtime
 
 Usage:
@@ -45,7 +45,7 @@ Container Management:
   cbox prune                          Remove stopped cbox containers, reclaim disk space
   cbox rebuild                        Rebuild container image
 
-MCP servers on the host (~/.config/claudebox/mcp.json):
+MCP servers on the host ($(_cbox_shown "$CBOX_MCP_CONFIG")):
   cbox mcp                            Show configured host MCP servers and relay status
   cbox mcp import                     Import servers from Claude Desktop / Claude Code
 
@@ -86,10 +86,9 @@ _CBOX_CDOT_API=2
 _CBOX_FLUX_API=1
 
 # Source user config if present (~/.config/claudebox/cbox.env)
-_CBOX_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
+_CBOX_ENV_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/cbox.env"
 # shellcheck source=/dev/null
-[[ -f "$_CBOX_CONFIG" ]] && . "$_CBOX_CONFIG"
-unset _CBOX_CONFIG
+[[ -f "$_CBOX_ENV_FILE" ]] && . "$_CBOX_ENV_FILE"
 
 CBOX_VERBOSE="${CBOX_VERBOSE:-0}"
 CBOX_AGENT="${CBOX_AGENT:-claude}"
@@ -165,6 +164,17 @@ fi
 # ---------------------------------------------------------
 # helpers
 # ---------------------------------------------------------
+
+# A host path for messages: under $HOME it starts with ~ (as `shown` does in
+# the python helpers).
+_cbox_shown() {
+  if [[ "$1" == "$HOME/"* ]]; then
+    # shellcheck disable=SC2088  # a literal ~ for display, not expanded
+    printf '~/%s\n' "${1#"$HOME"/}"
+  else
+    printf '%s\n' "$1"
+  fi
+}
 
 _cbox_log() { [[ "${CBOX_VERBOSE:-0}" == "1" ]] && echo "$@" || true; }
 
@@ -1197,8 +1207,8 @@ def connect(name):
         time.sleep(0.25)
     sys.stderr.write(
         f"cbox-mcp-relay: host MCP server '{name}' is not reachable.\n"
-        "It is relayed from the host by cbox: check that it is listed in\n"
-        "~/.config/claudebox/mcp.json and run `cbox mcp` on the host.\n")
+        "It is relayed from the host by cbox: run `cbox mcp` on the host to\n"
+        "see the MCP config file in use and check that the server is listed.\n")
     return 1
 
 
@@ -1302,11 +1312,12 @@ _cbox_mcp_status() {
   local name="$1"
   python3 -c "$(_cbox_mcp_py)" list "$CBOX_MCP_CONFIG" "$CBOX_DATA_DIR/.mcp-relay-$name.log"
   python3 -c "$(_cbox_mcp_py)" has-relay-servers "$CBOX_MCP_CONFIG" || return 0
-  local pid
+  local pid log
+  log=$(_cbox_shown "$CBOX_DATA_DIR/.mcp-relay-$name.log")
   if pid=$(_cbox_mcp_relay_pid "$name"); then
-    echo "✔ relay for '$name' running (pid $pid, log: $CBOX_DATA_DIR/.mcp-relay-$name.log)"
+    echo "✔ relay for '$name' running (pid $pid, log: $log)"
   else
-    echo "ℹ relay for '$name' not running — starts with the next cbox session"
+    echo "ℹ relay for '$name' not running — starts with the next cbox session (log: $log)"
   fi
 }
 
@@ -4578,16 +4589,16 @@ _cbox_shared_config_names() {
 # would get write access to config that runs on this Mac, through either its
 # ~/.config or its ~/.claude.
 _cbox_config_mounts() {
-  local real="${XDG_CONFIG_HOME:-$HOME/.config}" n
+  local real="${XDG_CONFIG_HOME:-$HOME/.config}" host_claude="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" n
   if _cbox_holds_host_config "$CBOX_HOST_CONFIG_DIR"; then
     echo "✘ CBOX_HOST_CONFIG_DIR=$CBOX_HOST_CONFIG_DIR would let code in the container change config that runs on this Mac (cbox.env, mcp.json, git)." >&2
-    echo "  Remove that line from $real/claudebox/cbox.env (the default is $real/claudebox/.config)," >&2
+    echo "  Remove that line from $(_cbox_shown "$_CBOX_ENV_FILE") (the default is $(_cbox_shown "$real/claudebox/.config"))," >&2
     echo "  and share the folders you need read-only instead, e.g.: CBOX_SHARE_CONFIG=\"opencode\"" >&2
     return 1
   fi
   if _cbox_holds_host_config "$CBOX_CLAUDE_DIR"; then
-    echo "✘ CBOX_CLAUDE_DIR=$CBOX_CLAUDE_DIR would let code in the container change config that runs on this Mac (Claude Code's hooks in ~/.claude/settings.json)." >&2
-    echo "  Remove that line from $real/claudebox/cbox.env (the default is $real/claudebox/.claude, seeded from ~/.claude on first use)." >&2
+    echo "✘ CBOX_CLAUDE_DIR=$CBOX_CLAUDE_DIR would let code in the container change config that runs on this Mac (Claude Code's hooks in $(_cbox_shown "$host_claude")/settings.json)." >&2
+    echo "  Remove that line from $(_cbox_shown "$_CBOX_ENV_FILE") (the default is $(_cbox_shown "$real/claudebox/.claude"), seeded from $(_cbox_shown "$host_claude") on first use)." >&2
     return 1
   fi
   mkdir -p "$CBOX_HOST_CONFIG_DIR"
@@ -5414,6 +5425,9 @@ _cbox_doctor_inline() {
   [[ -d "$CBOX_CLAUDE_DIR" ]] \
     && echo "✔ Claude config dir exists ($CBOX_CLAUDE_DIR)" \
     || echo "✘ Claude config dir missing ($CBOX_CLAUDE_DIR)"
+
+  echo "ℹ settings: $(_cbox_shown "$_CBOX_ENV_FILE"), host MCP servers: $(_cbox_shown "$CBOX_MCP_CONFIG")"
+  echo "ℹ data and logs (CBOX_DATA_DIR): $(_cbox_shown "$CBOX_DATA_DIR")"
 
   # Nothing prunes this cache automatically: unlike an image layer it survives
   # rebuilds, so every playwright upgrade leaves its old chromium-<id> behind.

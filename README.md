@@ -73,7 +73,7 @@ cbox oc safe   # opencode in safe mode
 | Command | Description |
 |---------|-------------|
 | `cbox update` | Force-update the active agent inside a running container |
-| `cbox doctor` | Run environment diagnostics (includes companion tool status and, on macOS, whether Apple container is up to date) |
+| `cbox doctor` | Run environment diagnostics: where your settings, data and logs are, companion tool status and, on macOS, whether Apple container is up to date |
 | `cbox mcp` | Show host MCP servers and relay status |
 | `cbox mcp import` | Import MCP servers from Claude Desktop / Claude Code on the host |
 | `cbox warden` | List credential resources (APIs, storage, ssh keys, MCP servers, WhatsApp chats) and what this project gets (see [Credentials (warden)](#credentials-warden)) |
@@ -114,7 +114,7 @@ Add more in `cbox.env`; they apply from the next session:
 CBOX_EGRESS_ALLOW="openrouter.ai *.example.com registry.example.com:8443"
 ```
 
-An entry without a port allows ports 443 and 80. `*.example.com` allows every subdomain, but not `example.com` itself. A blocked request gets `403`; for plain http it carries a note naming the host and the setting, while https clients only report it, e.g. curl's `CONNECT tunnel failed, response 403`. Blocked hosts are also logged in `~/.local/share/claudebox/.tunnel-<name>.log`.
+An entry without a port allows ports 443 and 80. `*.example.com` allows every subdomain, but not `example.com` itself. A blocked request gets `403`; for plain http it carries a note naming the host and the setting, while https clients only report it, e.g. curl's `CONNECT tunnel failed, response 403`. Blocked hosts are also logged in `$CBOX_DATA_DIR/.tunnel-<name>.log`.
 
 Limits:
 
@@ -128,7 +128,7 @@ Limits:
 git on your Mac runs commands that a repository names: hooks in `.git/hooks`, and settings in `.git/config` such as `core.fsmonitor`, filters or `core.sshCommand`. Such a command runs with your Keychain and SSH keys, so code in the container must not be able to plant one.
 
 - **Read-only:** the project's `.git/config` and `.git/hooks` are mounted read-only. Git commands that write the config fail inside the container (`git remote add`, `git config`, the upstream part of `git push -u`); run them on the Mac. A config change made on the Mac may only show up in the container after its next start. `CBOX_PROTECT_GIT=0` turns this off.
-- **Check at the end:** when the last session of a container ends, cbox looks for git settings that run commands and were not there at the start: in nested repositories, submodules, worktrees, or a replaced `.git`. It names each one with its location and offers to put `.git/config` and `.git/hooks` back as they were (the changed files are kept in `~/.local/share/claudebox/git-guard/`). Repositories cloned in the container without such settings are not reported.
+- **Check at the end:** when the last session of a container ends, cbox looks for git settings that run commands and were not there at the start: in nested repositories, submodules, worktrees, or a replaced `.git`. It names each one with its location and offers to put `.git/config` and `.git/hooks` back as they were (the changed files are kept in `$CBOX_DATA_DIR/git-guard/`). Repositories cloned in the container without such settings are not reported.
 - **Claude and config folders:** if the folder mounted as `~/.claude` or `~/.config` is a git repository (e.g. claudedot's sync repo), its whole `.git` is read-only in the container, because claudedot runs git there on the Mac.
 
 ## Configuration
@@ -141,7 +141,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_IMAGE` | `claudebox` | Docker image name |
 | `CBOX_LABEL` | `cbox.project=true` | Label applied to all cbox containers |
 | `CBOX_KEEPALIVE_SECONDS` | `600` | Seconds container stays alive before auto-stop in keepalive mode |
-| `CBOX_DATA_DIR` | `~/.local/share/claudebox` | Per-project container config files (`.claude-<name>.json`), one per project |
+| `CBOX_DATA_DIR` | `~/.local/share/claudebox` | Per-project container config files (`.claude-<name>.json`) and logs; `cbox doctor` shows the folder in use |
 | `CBOX_CLAUDE_DIR` | `~/.config/claudebox/.claude` | The container's Claude Code folder, mounted as `~/.claude` (read-write; read-only in safe mode, except the login). Not your Mac's `~/.claude`: Claude Code on the Mac runs the hooks in its `settings.json`, so cbox refuses it. On first use cbox copies your settings, `CLAUDE.md`, keybindings, agents, commands, skills and output styles into it (copies, not links); log in once inside the container |
 | `CBOX_HOST_CONFIG_DIR` | `~/.config/claudebox/.config` | The container's own `~/.config` (normal mode, read-write). Not your real `~/.config`: that holds config that runs on your Mac and tokens, so cbox refuses it |
 | `CBOX_SHARE_CONFIG` | *(unset)* | Folders of your real `~/.config` to share **read-only** into the container's `~/.config`, e.g. `"opencode nvim"`. Code in the container can read them, so leave out folders holding tokens (`gh`, `gcloud`). `claudebox` is never shared. Applies to newly created containers: `cbox reset` |
@@ -187,7 +187,7 @@ The container user is `claude` (UID matches your host UID to avoid permission is
 
 Some MCP servers only work on the Mac itself — [iMCP](https://github.com/mattt/iMCP)
 (Reminders, Calendar, Contacts, Messages), anything that talks to a macOS app or the
-Keychain. List those in `~/.config/claudebox/mcp.json`, in the usual format:
+Keychain. List those in `$CBOX_MCP_CONFIG` (default `~/.config/claudebox/mcp.json`), in the usual format:
 
 ```json
 {
@@ -211,7 +211,7 @@ Each connection starts a fresh server process, just like a local stdio server.
 
 | Server | Where |
 |--------|-------|
-| Needs macOS (apps, Keychain, local hardware) | `~/.config/claudebox/mcp.json` (host) |
+| Needs macOS (apps, Keychain, local hardware) | `$CBOX_MCP_CONFIG` (host) |
 | Works on files or repositories (filesystem, git, …) | Inside the container: the project's `.mcp.json` or `claude mcp add` — a host server would see host paths, not `/Workspace` |
 | Remote (`https://…`) without a token | `mcp.json` (passed through as-is) or inside the container |
 | Remote with an API key or token | A warden resource with `type = mcp` (see [Credentials](#credentials-warden)) — the token stays on the host |
@@ -226,11 +226,7 @@ Host MCP servers are not available in safe mode.
 
 If Claude reports that a host server failed to connect (for example after its 30 s
 connect timeout), start with `cbox mcp`: it shows the latest problem under each server.
-The full log is on the host:
-
-```bash
-tail ~/.local/share/claudebox/.mcp-relay-<project>.log
-```
+The full log is on the host; `cbox mcp` prints its path.
 
 "no response from the server … after a client connected" means the server started
 but never answered. The relay is fine in that case; the server is stuck. Check
@@ -285,7 +281,7 @@ cbox warden edit                    # define the resource (template included)
 cbox warden test openrouter         # check it from the host
 ```
 
-Resources live in `~/.local/share/claudebox/warden/resources` (`$CBOX_WARDEN_DIR`).
+Resources live in `$CBOX_WARDEN_DIR/resources` (default `~/.local/share/claudebox/warden/resources`).
 The file holds no secrets — only Keychain item names and URLs — so it can be
 kept in a dotfiles repo and symlinked there. Keep it out of anything a container
 mounts: if a container could edit it, it could point a resource at its own
@@ -520,7 +516,7 @@ Run `cbox doctor` to check PulseAudio status. If voice fails inside the containe
 pactl info
 ```
 
-If `pactl` cannot connect, check on the host that PulseAudio runs (`pulseaudio --check`) and look at the tunnel's log: `~/.local/share/claudebox/.tunnel-<project>.log`.
+If `pactl` cannot connect, check on the host that PulseAudio runs (`pulseaudio --check`) and look at the tunnel's log: `$CBOX_DATA_DIR/.tunnel-<project>.log`.
 
 ## How It Works
 
@@ -533,7 +529,7 @@ If `pactl` cannot connect, check on the host that PulseAudio runs (`pulseaudio -
 - `cbox keepalive` leaves the container running for 10 minutes (useful for follow-up `exec` calls)
 - Log in once inside a container (`/login`); the login is kept in `CBOX_CLAUDE_DIR` and shared by all containers
 - If [claudedot](https://github.com/bpeterme/claudedot) is installed, Claude config and history sync runs automatically at session start and exit (Claude sessions only)
-- Host services the container needs as sockets — warden's ssh agent, PulseAudio and safe mode's proxy — reach it through one long-lived `exec` per container (a tunnel; log: `~/.local/share/claudebox/.tunnel-<name>.log`). Neither side opens a network port for them
+- Host services the container needs as sockets — warden's ssh agent, PulseAudio and safe mode's proxy — reach it through one long-lived `exec` per container (a tunnel; log: `$CBOX_DATA_DIR/.tunnel-<name>.log`). Neither side opens a network port for them
 - If [flux](https://github.com/bpeterme/flux) is installed, the container runs the host's flux version, and flux projects reach their storage through warden: `dvc pull` and a plain `git push` (flux's pre-push hook uploads the data first) work inside the container
 
 ## Companion Tools

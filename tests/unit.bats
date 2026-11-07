@@ -332,7 +332,8 @@ _wait_procs() {
 @test "mcp relay: unknown server fails with a helpful message" {
   run bash -c "_CBOX_DIR=\$(mktemp -d /tmp/cbr.XXXX); source '$CBOX_SH'; _cbox_mcp_relay_py > \$_CBOX_DIR/r; CBOX_MCP_SOCKET_DIR=\$_CBOX_DIR/s timeout 30 python3 \$_CBOX_DIR/r connect nope; rc=\$?; rm -rf \$_CBOX_DIR; exit \$rc"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"'nope' is not reachable"*"mcp.json"* ]]
+  [[ "$output" == *"'nope' is not reachable"*"cbox mcp"*"MCP config file in use"* ]]
+  [[ "$output" != *".config/claudebox"* ]]
 }
 
 @test "mcp relay: stop leaves no processes or sockets behind" {
@@ -3678,4 +3679,40 @@ PY
   [ "$status" -eq 2 ]
   [[ "$output" == *"WhatsApp's chat database was not found"* ]]
   [ ! -e "$WA/out" ]
+}
+
+# ---------------------------------------------------------------------------
+# Paths in messages follow the configuration, never a fixed default
+# ---------------------------------------------------------------------------
+
+@test "_cbox_shown: shortens paths under HOME to ~, leaves others alone" {
+  [ "$(_cbox_shown "$HOME/.config/claudebox/mcp.json")" = "~/.config/claudebox/mcp.json" ]
+  [ "$(_cbox_shown "/opt/cbox/mcp.json")" = "/opt/cbox/mcp.json" ]
+  [ "$(_cbox_shown "${HOME}other/x")" = "${HOME}other/x" ]
+}
+
+@test "help: shows the MCP config file in use" {
+  clear() { :; }
+  CBOX_MCP_CONFIG=/opt/cbox/servers.json run _cbox_help
+  [[ "$output" == *"MCP servers on the host (/opt/cbox/servers.json):"* ]]
+  [[ "$output" != *".config/claudebox/mcp.json"* ]]
+}
+
+@test "_cbox_config_mounts: refusal names the configured cbox.env and Claude folder" {
+  CLAUDE_CONFIG_DIR="$BATS_TMPDIR/host-claude"
+  CBOX_CLAUDE_DIR="$CLAUDE_CONFIG_DIR"
+  mkdir -p "$CLAUDE_CONFIG_DIR"
+  run _cbox_config_mounts
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Claude Code's hooks in $CLAUDE_CONFIG_DIR/settings.json"* ]]
+  [[ "$output" == *"Remove that line from ~/.config/claudebox/cbox.env"* ]]
+  [[ "$output" != *"~/.claude"* ]]
+}
+
+@test "doctor: names the settings file, MCP config and data folder in use" {
+  CBOX_MCP_CONFIG=/opt/cbox/servers.json
+  _cbox_rt_image_list() { :; }
+  run _cbox_doctor_inline
+  [[ "$output" == *"host MCP servers: /opt/cbox/servers.json"* ]]
+  [[ "$output" == *"data and logs (CBOX_DATA_DIR): $CBOX_DATA_DIR"* ]]
 }

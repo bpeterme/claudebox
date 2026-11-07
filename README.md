@@ -185,6 +185,21 @@ Limits:
 - `*.key` also matches Keynote files. If a project has Keynote files, set `CBOX_MASK` with `!*.key` and name its real key files instead.
 - Apple's runtime needs container 1.2.1 or newer (`--masked-path`). With an older one cbox does not create the container, rather than create it without hiding.
 
+### Reaching a server in the container (`.cbox`)
+
+A web server in the container can be opened on your host at `http://localhost:<port>`, at the same address every session. List its ports in a `.cbox` file in the project folder:
+
+```ini
+# .cbox (in the project folder, e.g. tracked in git)
+ports = 47821 3000
+```
+
+- **localhost only:** each port is published on the host's `127.0.0.1`, never to your network. `localhost` also counts as a secure origin, so browser features that need HTTPS (e.g. `crypto.subtle`) work over plain http.
+- **Listen on `0.0.0.0`:** the server inside must listen on all addresses (`0.0.0.0`), not only on the container's `127.0.0.1`.
+- **Set at creation:** a runtime publishes ports when it creates a container. After you change `.cbox`, cbox says so at the next start; apply it with `cbox reset`.
+- **Normal mode only:** safe containers publish no ports.
+- Ports 1024–65535; a port another program on the host already uses cannot be published.
+
 ### Git safety (both modes)
 
 git on your host runs commands that a repository names: hooks in `.git/hooks`, and settings in `.git/config` such as `core.fsmonitor`, filters or `core.sshCommand`. Such a command runs with your Keychain (or keyring) and SSH keys, so code in the container must not be able to plant one.

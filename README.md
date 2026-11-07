@@ -1,6 +1,6 @@
 # claudebox
 
-A shell utility that runs AI coding agents ([Claude Code](https://github.com/anthropics/claude-code) or [opencode](https://github.com/opencode-ai/opencode)) inside an isolated container, scoped to your current project directory. Uses [Apple Container](https://github.com/apple/container) on macOS and Docker on Linux.
+A shell utility that runs AI coding agents ([Claude Code](https://github.com/anthropics/claude-code) or [opencode](https://github.com/opencode-ai/opencode)) inside an isolated container, scoped to your current project directory. Uses [Apple Container](https://github.com/apple/container) on macOS and Docker on Linux, including WSL2 on Windows.
 
 Each project gets its own container, named after the directory. Two modes are available: **normal** (full access to your config and SSH keys) and **safe** (sandboxed with dropped capabilities, memory/CPU limits, and internet access only to hosts you allow).
 
@@ -43,7 +43,7 @@ WhatsApp chats) are not available on Linux.
 
 ## Installation
 
-### Homebrew (recommended)
+### Homebrew (macOS)
 
 ```bash
 brew tap bpeterme/claudebox
@@ -51,10 +51,13 @@ brew install bpeterme/claudebox/claudebox
 cbox --help
 ```
 
-### Manual
+### Manual (Linux, WSL — or macOS)
+
+Homebrew on Linux is untested; use a clone:
 
 ```bash
 git clone https://github.com/bpeterme/claudebox.git ~/claudebox
+# update later: git -C ~/claudebox pull
 ```
 
 Add to your `~/.zshrc` or `~/.bashrc`:
@@ -155,7 +158,7 @@ An entry without a port allows ports 443 and 80. `*.example.com` allows every su
 Limits:
 
 - Only programs that use the proxy settings get out: curl, git over https, npm, pip, uv, Claude Code, opencode. git over ssh does not work in safe mode.
-- A host name never leads to your Mac itself or a link-local address. To reach a server on your local network, list its IP address.
+- A host name never leads to this machine itself or a link-local address. To reach a server on your local network, list its IP address.
 - On Apple's runtime the host-only network still reaches services on your Mac that listen on all interfaces.
 - Safe containers created by an older cbox can still reach everything, or cannot keep the login fresh; cbox says so at session start. Recreate one with `cbox reset`.
 
@@ -184,11 +187,11 @@ Limits:
 
 ### Git safety (both modes)
 
-git on your Mac runs commands that a repository names: hooks in `.git/hooks`, and settings in `.git/config` such as `core.fsmonitor`, filters or `core.sshCommand`. Such a command runs with your Keychain and SSH keys, so code in the container must not be able to plant one.
+git on your host runs commands that a repository names: hooks in `.git/hooks`, and settings in `.git/config` such as `core.fsmonitor`, filters or `core.sshCommand`. Such a command runs with your Keychain (or keyring) and SSH keys, so code in the container must not be able to plant one.
 
-- **Read-only:** the project's `.git/config` and `.git/hooks` are mounted read-only. Git commands that write the config fail inside the container (`git remote add`, `git config`, the upstream part of `git push -u`); run them on the Mac. A config change made on the Mac may only show up in the container after its next start. `CBOX_PROTECT_GIT=0` turns this off.
+- **Read-only:** the project's `.git/config` and `.git/hooks` are mounted read-only. Git commands that write the config fail inside the container (`git remote add`, `git config`, the upstream part of `git push -u`); run them on the host. A config change made on the Mac may only show up in the container after its next start. `CBOX_PROTECT_GIT=0` turns this off.
 - **Check at the end:** when the last session of a container ends, cbox looks for git settings that run commands and were not there at the start: in nested repositories, submodules, worktrees, or a replaced `.git`. It names each one with its location and offers to put `.git/config` and `.git/hooks` back as they were (the changed files are kept in `$CBOX_DATA_DIR/git-guard/`). Repositories cloned in the container without such settings are not reported.
-- **Claude and config folders:** if the folder mounted as `~/.claude` or `~/.config` is a git repository (e.g. claudedot's sync repo), its whole `.git` is read-only in the container, because claudedot runs git there on the Mac.
+- **Claude and config folders:** if the folder mounted as `~/.claude` or `~/.config` is a git repository (e.g. claudedot's sync repo), its whole `.git` is read-only in the container, because claudedot runs git there on the host.
 
 ## Configuration
 
@@ -323,7 +326,7 @@ the project (or run `cbox stop`) and start `cbox` again.
 
 Code in the container can use API keys and other credentials **without the
 container ever holding them**. A broker on the host keeps the secret (macOS
-Keychain), checks each request against what you allowed, and adds the
+Keychain or Linux keyring), checks each request against what you allowed, and adds the
 credential on the way out. Inside the container, requests go to
 `$WARDEN_URL/<resource>/...` — the key a client sends is always replaced.
 
@@ -369,7 +372,7 @@ project in a bucket:
 prefix = my-project
 ```
 
-**SSH keys** (`type = ssh`) stay on the Mac. The container gets an ssh agent
+**SSH keys** (`type = ssh`) stay on the host. The container gets an ssh agent
 (`SSH_AUTH_SOCK`) instead of the key file, so `git push` and `ssh` work as
 usual, but nothing in the container can copy the key. Keys come only from
 `CBOX_SSH_DIR`, the claudebox ssh folder set in `cbox.env` — never from your own
@@ -390,14 +393,14 @@ refused; without `CBOX_SSH_DIR`, ssh resources stay off.
 
 - warden runs an agent of its own (not your usual one) and adds the key with
   `ssh-add -h <host>`, so the agent itself refuses to sign for any other host.
-  The first `cbox` session after a Mac restart unlocks it; on macOS, ssh-add
+  The first `cbox` session after a restart unlocks it; on macOS, ssh-add
   takes the passphrase from the Keychain, and asks once otherwise.
 - The agent recognises each server by its host key. warden keeps its own list
   of confirmed server keys (`$CBOX_WARDEN_DIR/ssh/known_hosts`, never mounted).
   For a new server, the next `cbox` session shows the key's fingerprint and asks
   once whether to trust it. The key comes from `$CBOX_SSH_DIR/known_hosts`
   if it lists the server, otherwise from the server itself (`ssh-keyscan` from
-  the Mac). It is never trusted from that file alone, because containers can
+  the host). It is never trusted from that file alone, because containers can
   write it. If a server's key changes, delete its line from warden's list.
   The container's ssh gets the confirmed keys of its granted servers as its
   system list (`/etc/ssh/ssh_known_hosts`), so it does not ask again.

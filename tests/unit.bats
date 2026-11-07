@@ -1555,6 +1555,7 @@ _label_from_json() {
   run bash -c 'set -euo pipefail; source "$1"; '"$(declare -f _apple_json_none _apple_ls_stub _apple_ls_json)"'
     BATS_TMPDIR="$2"; _apple_ls_stub; APPLE_LS=$(_apple_json_none)
     _cbox_system_start() { :; }; _cbox_clean_running() { :; }; clear() { :; }
+    _cbox_require_runtime() { :; }
     cbox prune; echo DONE' _ "$CBOX_SH" "$BATS_TMPDIR"
   [ "$status" -eq 0 ]
   [[ "$output" == *"Nothing to prune."*"DONE"* ]]
@@ -1770,6 +1771,7 @@ _clean_stubs() {
   }
   run bash -c "
     source '$CBOX_SH'
+    _cbox_require_runtime() { :; }
     _cbox_ensure() { true; }
     _cbox_enter() { echo \"agent=\$(_cbox_agent_bin)\"; }
     cbox oc
@@ -1781,6 +1783,7 @@ _clean_stubs() {
 @test "cbox oc safe: sets CBOX_AGENT=opencode for safe mode" {
   run bash -c "
     source '$CBOX_SH'
+    _cbox_require_runtime() { :; }
     _cbox_ensure() { true; }
     _cbox_enter() { echo \"agent=\$(_cbox_agent_bin) mode=\$2\"; }
     cbox oc safe
@@ -3258,6 +3261,7 @@ _safe_setup() {
 
 @test "cbox shell: opens zsh in an existing safe container" {
   cd "$BATS_TMPDIR"
+  _cbox_require_runtime() { :; }
   _cbox_ensure() { echo "ensure $*"; }
   _cbox_enter() { echo "enter $*"; }
   run cbox shell
@@ -4134,4 +4138,32 @@ _mask_project() {
   run _enter_safe
   run cat "$BATS_TMPDIR/enter-egress"
   [[ "$output" == *"mask-check ebox safe"*"exec -it"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# missing runtime
+# ---------------------------------------------------------------------------
+
+@test "missing runtime: cbox stops at once and says what to install" {
+  _CBOX_CMD=cbox-no-such-runtime _CBOX_RUNTIME=docker
+  _cbox_on_wsl() { return 1; }
+  run cbox shell
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"docker is not installed"* ]]
+  [[ "$output" != *"command not found"* ]]
+  [[ "$output" != *"Creating"* ]]
+}
+
+@test "missing runtime: on WSL the message points to Docker Desktop's WSL integration" {
+  _CBOX_CMD=cbox-no-such-runtime _CBOX_RUNTIME=docker
+  _cbox_on_wsl() { return 0; }
+  run cbox
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"WSL integration"* ]]
+}
+
+@test "missing runtime: host-only commands still work (warden, help)" {
+  _CBOX_CMD=cbox-no-such-runtime _CBOX_RUNTIME=docker
+  run cbox warden
+  [[ "$output" != *"docker is not installed"* ]]
 }

@@ -339,6 +339,24 @@ _cbox_system_start() {
   fi
 }
 
+# True inside WSL (Windows Subsystem for Linux).
+_cbox_on_wsl() { grep -qi microsoft /proc/version 2>/dev/null; }
+
+# Stops with one message saying what to install when the runtime command is
+# missing, instead of letting every later runtime call fail on its own.
+_cbox_require_runtime() {
+  command -v "$_CBOX_CMD" >/dev/null 2>&1 && return 0
+  if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
+    echo "✘ Apple's container tool is not installed: https://github.com/apple/container/releases" >&2
+  elif _cbox_on_wsl; then
+    echo "✘ docker is not available in this WSL distro. Start Docker Desktop and turn on" >&2
+    echo "  Settings → Resources → WSL integration for this distro, or install Docker Engine here." >&2
+  else
+    echo "✘ docker is not installed: https://docs.docker.com/engine/install/" >&2
+  fi
+  return 1
+}
+
 _cbox_system_down_hint() {
   echo "  It starts with your next cbox session, or now with: container system start"
 }
@@ -5794,6 +5812,11 @@ cbox() {
 
   local name
   name=$(_cbox_name)
+
+  case "$subcommand" in
+    ""|oc|opencode|safe|shell|keepalive|stop|reset|rebuild|update|list|prune)
+      _cbox_require_runtime || return 1 ;;
+  esac
 
   case "$subcommand" in
 

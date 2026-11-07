@@ -67,6 +67,9 @@ cbox --help
 
 ## Quick Start
 
+The image is built once before the first session: on Linux the first `cbox`
+does it (about 5–10 minutes); on macOS run `cbox rebuild` once.
+
 ```bash
 cd ~/my-project
 cbox           # start Claude Code in a container for this project

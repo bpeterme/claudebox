@@ -4918,6 +4918,25 @@ _cbox_mask_check() {
   echo "   Hide them: cbox reset"
 }
 
+# Builds cbox's image from the dockerfile (cbox rebuild, and on first use).
+_cbox_build_image() {
+  $_CBOX_CMD build \
+    --build-arg HOST_UID="$(id -u)" \
+    --build-arg BUILD_PLAYWRIGHT="${BUILD_PLAYWRIGHT:-0}" \
+    -t "$CBOX_IMAGE" "$_CBOX_BUILD_DIR"
+}
+
+# Docker would try to pull a missing image from Docker Hub, where cbox's is not
+# published: build it instead. Only for cbox's own image name — any other
+# CBOX_IMAGE is the user's and is pulled as usual. (On macOS, Homebrew's
+# install note says to run cbox rebuild.)
+_cbox_ensure_image() {
+  [[ "$_CBOX_RUNTIME" == "docker" && "$CBOX_IMAGE" == "claudebox" ]] || return 0
+  $_CBOX_CMD image inspect "$CBOX_IMAGE" >/dev/null 2>&1 && return 0
+  echo "Image '$CBOX_IMAGE' not found — building it once (about 5–10 minutes)..."
+  _cbox_build_image
+}
+
 _cbox_create() {
   local name="$1"
   local mode="$2"
@@ -4941,6 +4960,7 @@ _cbox_create() {
 
   local claude_json="$CBOX_DATA_DIR/.claude-$name.json"
 
+  _cbox_ensure_image || return 1
   echo "Creating $mode container '$name' ($agent_bin)..."
 
   local args=(
@@ -5910,10 +5930,7 @@ cbox() {
       clear 2>/dev/null || true  # no terminal (scripts, CI): nothing to clear
       _cbox_system_start
       echo "Rebuilding image '$CBOX_IMAGE'..."
-      $_CBOX_CMD build \
-        --build-arg HOST_UID="$(id -u)" \
-        --build-arg BUILD_PLAYWRIGHT="${BUILD_PLAYWRIGHT:-0}" \
-        -t "$CBOX_IMAGE" "$_CBOX_BUILD_DIR"
+      _cbox_build_image
       ;;
 
     update)

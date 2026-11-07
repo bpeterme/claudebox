@@ -4200,3 +4200,38 @@ _failing_docker() {
   [ "$status" -eq 1 ]
   [[ "$output" == *"Docker is not running: Cannot connect to the Docker daemon"*"systemctl start docker"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# image on first use
+# ---------------------------------------------------------------------------
+
+# Fake docker: `image inspect` succeeds only when $1 is "present".
+_image_docker() {
+  mkdir -p "$BATS_TMPDIR/imgdocker"; IMG_LOG="$BATS_TMPDIR/imgdocker/log"; : > "$IMG_LOG"
+  printf '#!/bin/sh\necho "$*" >> "%s"\n[ "$1 $2" = "image inspect" ] && exit %s\nexit 0\n' \
+    "$IMG_LOG" "$([ "$1" = present ] && echo 0 || echo 1)" > "$BATS_TMPDIR/imgdocker/docker"
+  chmod +x "$BATS_TMPDIR/imgdocker/docker"
+  _CBOX_CMD="$BATS_TMPDIR/imgdocker/docker" _CBOX_RUNTIME=docker
+}
+
+@test "image: a missing claudebox image is built on first use, not pulled" {
+  _image_docker missing; CBOX_IMAGE=claudebox
+  run _cbox_ensure_image
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not found — building it once"* ]]
+  grep -q "^build --build-arg HOST_UID=$(id -u) .* -t claudebox " "$IMG_LOG"
+}
+
+@test "image: an existing image is not rebuilt" {
+  _image_docker present; CBOX_IMAGE=claudebox
+  run _cbox_ensure_image
+  [ -z "$output" ]
+  ! grep -q '^build' "$IMG_LOG"
+}
+
+@test "image: a custom CBOX_IMAGE is never built (Docker pulls it as usual)" {
+  _image_docker missing; CBOX_IMAGE=registry.example/team/agent
+  run _cbox_ensure_image
+  [ -z "$output" ]
+  ! grep -q '^build' "$IMG_LOG"
+}

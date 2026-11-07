@@ -325,7 +325,8 @@ _relay_client() {
 _wait_procs() {
   local i
   for i in $(seq 1 $(( $2 * 5 ))); do
-    [ "$(pgrep -fc "$1")" -eq "$3" ] && return 0
+    # Counted with wc: macOS pgrep has no -c.
+    [ "$(pgrep -f "$1" | wc -l | tr -d ' ')" -eq "$3" ] && return 0
     sleep 0.2
   done
   return 1
@@ -511,6 +512,8 @@ class H(http.server.BaseHTTPRequestHandler):
         self.wfile.write(out)
     do_GET = do_POST = do_PUT = do_DELETE = handle_any
     def log_message(self, *a): pass
+# No getfqdn() lookup at bind: it can stall for seconds on macOS.
+http.server.ThreadingHTTPServer.server_bind = lambda self: http.server.socketserver.TCPServer.server_bind(self)
 http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
 PY
   python3 "$WT/upstream.py" "$UP_PORT" &
@@ -2931,6 +2934,15 @@ _enter_safe() {
   run _enter_safe
   run cat "$BATS_TMPDIR/enter-egress"
   [[ "$output" == *"tunnel ebox on"*"ready ebox"*"exec -it"* ]]
+}
+
+@test "_cbox_enter: every session is marked as a claudebox container (CBOX_CONTAINER)" {
+  for MODE in normal safe; do
+    EGRESS=allowlist LOGIN=shared
+    run _enter_safe
+    run cat "$BATS_TMPDIR/enter-egress"
+    [[ "$output" == *"exec -it -w /Workspace/ebox -e CBOX_CONTAINER=ebox "* ]]
+  done
 }
 
 # _cbox_maybe_update for container ubox in $MODE; READY decides whether the

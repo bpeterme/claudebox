@@ -3599,6 +3599,13 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def server_bind(self):
+        # HTTPServer would look up the address's DNS name (socket.getfqdn),
+        # which on macOS can stall startup for many seconds when reverse DNS
+        # does not answer. Nothing here uses that name.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
 
 def cmd_serve(d, bind, port, pidfile):
     Broker.d = d
@@ -5395,7 +5402,9 @@ _cbox_enter() {
     _cbox_audio_start && _audio=1
   fi
 
-  local _exec_args=(-it -w "/Workspace/$name")
+  # CBOX_CONTAINER tells tools such as flux they run in a claudebox container
+  # rather than on a host, which on Linux they cannot tell from the OS alone.
+  local _exec_args=(-it -w "/Workspace/$name" -e "CBOX_CONTAINER=$name")
   local _run="$command" _g _tunnel=$_audio _warden_mcp="" _warden_oc=""
   if (( _audio )); then
     # Through the tunnel, PulseAudio sees a local client and would offer shared

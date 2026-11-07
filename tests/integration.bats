@@ -228,7 +228,7 @@ except Exception as e:
 # masking — secret files the agent sees empty
 # ---------------------------------------------------------------------------
 
-@test "masked files read empty and cannot be written; masked folders are empty" {
+@test "masked files read empty and writes never reach them; masked folders are empty" {
   mkdir -p secrets
   echo "TOKEN=s3cret" > .env
   echo "key" > secrets/k
@@ -239,8 +239,11 @@ except Exception as e:
   [ -z "$output" ]
   run docker exec "$TEST_NAME" ls -A "/Workspace/$TEST_NAME/secrets"
   [ -z "$output" ]
-  run docker exec "$TEST_NAME" sh -c "echo x > /Workspace/$TEST_NAME/.env"
-  [ "$status" -ne 0 ]
+  # A masked file is /dev/null, read-only: a device file can still be opened
+  # for writing on a read-only mount, so a write "succeeds" but goes nowhere.
+  docker exec "$TEST_NAME" sh -c "echo x > /Workspace/$TEST_NAME/.env" || true
+  run docker exec "$TEST_NAME" cat "/Workspace/$TEST_NAME/.env"
+  [ -z "$output" ]
   run docker exec "$TEST_NAME" cat "/Workspace/$TEST_NAME/.env.example"
   [ "$output" = "visible" ]
   # the files on the host are untouched

@@ -126,7 +126,7 @@ Limits:
 
 #### Hidden secret files
 
-A safe container sees secret files in the project as empty files: it can neither read nor change them. The files on your Mac stay as they are. By default this covers:
+A safe container sees secret files in the project as empty files: it cannot read them, and what it writes to them is discarded. The files on your Mac stay as they are. By default this covers:
 
 - `.env` and `.env.*`, but not `.env.example`, `.env.sample` or `.env.template`
 - `*.pem`, `*.key`, and private SSH keys (`id_rsa*`, `id_ecdsa*`, `id_ed25519*`, but not `*.pub`)

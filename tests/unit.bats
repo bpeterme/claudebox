@@ -4274,3 +4274,154 @@ SH
   _fake_ip "docker0 eth0"; export CBOX_WARDEN_HOST=10.0.0.9
   [ "$(_cbox_warden_host_ip)" = "10.0.0.9" ]
 }
+
+# ---------------------------------------------------------------------------
+# published ports (.cbox)
+# ---------------------------------------------------------------------------
+
+@test "_cbox_project_ports: nothing without a .cbox" {
+  mkdir -p "$BATS_TMPDIR/ports-none" && cd "$BATS_TMPDIR/ports-none"
+  rm -f .cbox
+  run _cbox_project_ports
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "_cbox_project_ports: reads spaces, commas and comments, sorted without duplicates" {
+  mkdir -p "$BATS_TMPDIR/ports-ok" && cd "$BATS_TMPDIR/ports-ok"
+  printf '# servers the Mac opens\n\n  ports = 47821, 3000 3000  # dev\n' > .cbox
+  run _cbox_project_ports
+  [ "$status" -eq 0 ]
+  [ "$output" = "3000 47821" ]
+}
+
+@test "_cbox_project_ports: a last line without newline counts" {
+  mkdir -p "$BATS_TMPDIR/ports-nonl" && cd "$BATS_TMPDIR/ports-nonl"
+  printf 'ports = 8080' > .cbox
+  run _cbox_project_ports
+  [ "$output" = "8080" ]
+}
+
+@test "_cbox_project_ports: refuses privileged, out-of-range and non-numeric ports" {
+  mkdir -p "$BATS_TMPDIR/ports-bad" && cd "$BATS_TMPDIR/ports-bad"
+  for bad in 80 65536 0 abc 3000x 99999999999; do
+    printf 'ports = 3000 %s\n' "$bad" > .cbox
+    run _cbox_project_ports
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"'$bad' is not a port cbox publishes"* ]]
+  done
+}
+
+@test "_cbox_project_ports: refuses a line that is not name = value, warns about unknown names" {
+  mkdir -p "$BATS_TMPDIR/ports-syntax" && cd "$BATS_TMPDIR/ports-syntax"
+  printf 'ports 3000\n' > .cbox
+  run _cbox_project_ports
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"is not a 'name = value' line"* ]]
+
+  printf 'colour = blue\nports = 3000\n' > .cbox
+  run _cbox_project_ports
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"unknown setting 'colour' ignored"* ]]
+  [[ "$output" == *"3000"* ]]
+}
+
+@test "_cbox_create: publishes .cbox ports on 127.0.0.1 with a label, normal mode only" {
+  local capture="$BATS_TMPDIR/create-ports-args"
+  mkdir -p "$BATS_TMPDIR/ports-create" && cd "$BATS_TMPDIR/ports-create"
+  printf 'ports = 47821 3000\n' > .cbox
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+
+  rm -f "$capture"; _cbox_create "cbox-unit-ports" "normal"
+  run cat "$capture"
+  [[ "$output" == *$'-p\n127.0.0.1:3000:3000\n-p\n127.0.0.1:47821:47821'* ]]
+  [[ "$output" == *$'--label\ncbox.ports=3000,47821'* ]]
+
+  rm -f "$capture"; _cbox_create "cbox-unit-ports" "safe"
+  run cat "$capture"
+  [[ "$output" != *"127.0.0.1:"* ]]
+  [[ "$output" != *"cbox.ports"* ]]
+}
+
+@test "_cbox_create: no port arguments without a .cbox" {
+  local capture="$BATS_TMPDIR/create-noports-args"
+  mkdir -p "$BATS_TMPDIR/ports-create-none" && cd "$BATS_TMPDIR/ports-create-none"
+  rm -f .cbox "$capture"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  _cbox_create "cbox-unit-noports" "normal"
+  run cat "$capture"
+  [[ "$output" != *$'\n-p\n'* ]]
+  [[ "$output" != *"cbox.ports"* ]]
+}
+
+@test "_cbox_create: a broken .cbox creates nothing" {
+  local capture="$BATS_TMPDIR/create-badports-args"
+  mkdir -p "$BATS_TMPDIR/ports-create-bad" && cd "$BATS_TMPDIR/ports-create-bad"
+  printf 'ports = 80\n' > .cbox
+  rm -f "$capture"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  run _cbox_create "cbox-unit-badports" "normal"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"'80' is not a port cbox publishes"* ]]
+  [[ "$output" != *"Creating"* ]]
+  # No `run --name …` reached the runtime (grep: 0 matches or no capture file).
+  run grep -c -- '^--name$' "$capture"
+  [ "$status" -ne 0 ]
+}
+
+@test "_cbox_ports_check: shows published ports; quiet when .cbox matches" {
+  mkdir -p "$BATS_TMPDIR/ports-check" && cd "$BATS_TMPDIR/ports-check"
+  printf 'ports = 47821\n' > .cbox
+  _cbox_rt_label() { [[ "$2" == cbox.ports ]] && echo "47821"; }
+  run _cbox_ports_check proj normal
+  [ "$status" -eq 0 ]
+  [ "$output" = "ℹ  Published: http://localhost:47821" ]
+}
+
+@test "_cbox_ports_check: a changed .cbox suggests cbox reset" {
+  mkdir -p "$BATS_TMPDIR/ports-changed" && cd "$BATS_TMPDIR/ports-changed"
+  printf 'ports = 3000 47821\n' > .cbox
+  _cbox_rt_label() { [[ "$2" == cbox.ports ]] && echo "47821"; }
+  run _cbox_ports_check proj normal
+  [[ "$output" == *".cbox lists ports 3000 47821, but this container publishes 47821."* ]]
+  [[ "$output" == *"cbox reset"* ]]
+
+  # An older container (no label) with ports now listed.
+  _cbox_rt_label() { echo ""; }
+  run _cbox_ports_check proj normal
+  [[ "$output" == *"but this container publishes none."* ]]
+
+  # Ports removed from .cbox.
+  rm -f .cbox
+  _cbox_rt_label() { [[ "$2" == cbox.ports ]] && echo "3000,47821"; }
+  run _cbox_ports_check proj normal
+  [[ "$output" == *"ℹ  Published: http://localhost:3000"* ]]
+  [[ "$output" == *".cbox lists ports (none), but this container publishes 3000 47821."* ]]
+}
+
+@test "_cbox_ports_check: says nothing without .cbox and ports; notes safe mode" {
+  mkdir -p "$BATS_TMPDIR/ports-quiet" && cd "$BATS_TMPDIR/ports-quiet"
+  rm -f .cbox
+  _cbox_rt_label() { echo ""; }
+  run _cbox_ports_check proj normal
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+
+  printf 'ports = 3000\n' > .cbox
+  run _cbox_ports_check proj safe
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not published for safe containers"* ]]
+}
+
+@test "_cbox_ports_check: a broken .cbox says so and does not fail the session" {
+  mkdir -p "$BATS_TMPDIR/ports-broken" && cd "$BATS_TMPDIR/ports-broken"
+  printf 'ports = 22\n' > .cbox
+  _cbox_rt_label() { echo ""; }
+  run _cbox_ports_check proj normal
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"'22' is not a port cbox publishes"* ]]
+  [[ "$output" == *"stay as they are until .cbox is fixed"* ]]
+}

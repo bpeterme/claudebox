@@ -85,6 +85,9 @@ Container Management:
   cbox prune                          Remove stopped cbox containers, reclaim disk space
   cbox rebuild                        Rebuild container image
 
+Project file .cbox:
+  ports = 47821 3000                  Reach servers in the container at http://localhost:<port>
+
 MCP servers on the host ($(_cbox_shown "$CBOX_MCP_CONFIG")):
   cbox mcp                            Show configured host MCP servers and relay status
   cbox mcp import                     Import servers from Claude Desktop / Claude Code
@@ -4928,6 +4931,88 @@ _cbox_mask_check() {
   echo "   Hide them: cbox reset"
 }
 
+# ---------------------------------------------------------
+# published ports (the project's .cbox)
+# ---------------------------------------------------------
+#
+# A project's .cbox file lists ports of servers in its container that the
+# host reaches at http://localhost:<port>:
+#
+#   ports = 47821 3000
+#
+# They are published on the host's 127.0.0.1 only, never to the network, and
+# only for normal containers. A runtime publishes ports when it creates a
+# container, so a changed list applies after cbox reset.
+
+_cbox_project_file() { echo "$PWD/.cbox"; }
+
+# Prints the ports the project's .cbox lists, sorted and space-separated;
+# nothing without a .cbox. Fails, saying why on stderr, for a line or port it
+# cannot use.
+_cbox_project_ports() {
+  local file shown line key value p ports=() list=()
+  file=$(_cbox_project_file)
+  [[ -f "$file" ]] || return 0
+  shown=$(_cbox_shown "$file")
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    if [[ ! "$line" =~ ^[[:space:]]*([A-Za-z_-]+)[[:space:]]*=(.*)$ ]]; then
+      echo "✖ $shown: '$line' is not a 'name = value' line, e.g.  ports = 3000" >&2
+      return 1
+    fi
+    key="${BASH_REMATCH[1]}" value="${BASH_REMATCH[2]}"
+    case "$key" in
+      ports)
+        IFS=', ' read -r -a list <<<"$value"
+        for p in ${list[@]+"${list[@]}"}; do
+          if [[ ! "$p" =~ ^[0-9]{1,5}$ ]] || (( 10#$p < 1024 || 10#$p > 65535 )); then
+            echo "✖ $shown: '$p' is not a port cbox publishes — use numbers from 1024 to 65535" >&2
+            return 1
+          fi
+          ports+=("$((10#$p))")
+        done ;;
+      *) echo "⚠  $shown: unknown setting '$key' ignored (known: ports)" >&2 ;;
+    esac
+  done <"$file"
+  [[ ${#ports[@]} -gt 0 ]] || return 0
+  printf '%s\n' "${ports[@]}" | sort -nu | paste -s -d ' ' -
+}
+
+# Runtime arguments, one per line, that publish ports $1 (space-separated) on
+# the host's 127.0.0.1 only.
+_cbox_port_args() {
+  local p
+  for p in $1; do printf '%s\n' -p "127.0.0.1:$p:$p"; done
+}
+
+# The ports container $1 publishes, space-separated (cbox.ports label).
+_cbox_published_ports() {
+  local have
+  have=$(_cbox_rt_label "$1" cbox.ports)
+  echo "${have//,/ }"
+}
+
+# At session start: where the container's servers are reachable, and a note
+# when the project's .cbox lists other ports than the container publishes.
+_cbox_ports_check() {
+  local name="$1" mode="$2" want have p
+  if [[ "$mode" == "safe" ]]; then
+    [[ -n "$(_cbox_project_ports 2>/dev/null)" ]] &&
+      echo "ℹ  .cbox ports are not published for safe containers (normal mode only)"
+    return 0
+  fi
+  if ! want=$(_cbox_project_ports); then
+    echo "   Published ports stay as they are until .cbox is fixed."
+    return 0
+  fi
+  have=$(_cbox_published_ports "$name")
+  for p in $have; do echo "ℹ  Published: http://localhost:$p"; done
+  [[ "$want" == "$have" ]] && return 0
+  echo "⚠  .cbox lists ports ${want:-(none)}, but this container publishes ${have:-none}."
+  echo "   Ports are set when a container is created: cbox reset"
+}
+
 # Builds cbox's image from the dockerfile (cbox rebuild, and on first use).
 _cbox_build_image() {
   $_CBOX_CMD build \
@@ -4971,6 +5056,13 @@ _cbox_create() {
   local claude_json="$CBOX_DATA_DIR/.claude-$name.json"
 
   _cbox_ensure_image || return 1
+
+  # Before anything is created: a broken .cbox stops here with its reason.
+  local _ports=""
+  if [[ "$mode" == "normal" ]]; then
+    _ports=$(_cbox_project_ports) || return 1
+  fi
+
   echo "Creating $mode container '$name' ($agent_bin)..."
 
   local args=(
@@ -5147,6 +5239,15 @@ _cbox_create() {
     args+=(-v "$_target:$_target$_ro")
   done < <(printf '%s\n' ${_targets[@]+"${_targets[@]}"} | LC_ALL=C sort)
   unset _ro _link _target _kept _nested _targets _mounted
+
+  # Ports the project's .cbox lists (normal mode): on the host's 127.0.0.1
+  # only. The label lets a session tell when .cbox has changed since.
+  if [[ -n "$_ports" ]]; then
+    args+=(--label "cbox.ports=${_ports// /,}")
+    local _pa
+    while IFS= read -r _pa; do args+=("$_pa"); done < <(_cbox_port_args "$_ports")
+    unset _pa
+  fi
 
   # PID 1 is the runtime's own init (--init; Docker: tini): it collects every
   # finished process whose parent is gone, and passes `stop` on. Without one,
@@ -5513,6 +5614,7 @@ _cbox_enter() {
   fi
   while IFS= read -r _g; do _exec_args+=(-e "$_g"); done < <(_cbox_git_identity)
   _cbox_mask_check "$name" "$mode"
+  _cbox_ports_check "$name" "$mode"
   local _egress=""
   if [[ "$mode" == "safe" ]]; then
     # The container's only way out: the tunnel's proxy, which lets through
@@ -5844,8 +5946,11 @@ _cbox_doctor() {
     else
       echo "✔ container stopped"
     fi
+
+    _cbox_ports_check "$name" "$mode"
   else
     echo "ℹ container does not exist yet"
+    _cbox_project_ports >/dev/null || true
   fi
 
   echo

@@ -321,6 +321,16 @@ _cbox_busy_hold() {
 _cbox_busy_release() {
   [[ -z "$_CBOX_RELAY_DIR" ]] || rm -f "$_CBOX_RELAY_DIR/paused"
 }
+# A step's announcement: while busy, the spinner's label (lower-cased, like
+# all labels); otherwise a plain line, as without a terminal. Never starts
+# the spinner itself, so commands without one (rebuild) stay as they are.
+_cbox_step() {
+  if [[ -n "$_CBOX_RELAY_DIR" ]]; then
+    _cbox_busy_begin "$(printf '%s' "${1:0:1}" | tr '[:upper:]' '[:lower:]')${1:1}"
+  else
+    echo "$1"
+  fi
+}
 _cbox_busy_end() {
   if [[ -n "$_CBOX_RELAY_DIR" ]]; then
     local d="$_CBOX_RELAY_DIR"
@@ -440,7 +450,7 @@ _cbox_system_down() {
 # change containers or images, need it).
 _cbox_system_start() {
   _cbox_system_down || return 0
-  echo "Starting container system..."
+  _cbox_step "Starting container system..."
   if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
     container system start
   else
@@ -577,7 +587,7 @@ _cbox_force_update() {
   fi
 
   if ! _cbox_running "$name"; then
-    echo "Starting container '$name'..."
+    _cbox_step "Starting container '$name'..."
     if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
       $_CBOX_CMD start "$name"
     else
@@ -598,8 +608,7 @@ _cbox_force_update() {
     return 1
   fi
 
-  echo "Updating ${agent_bin}..."
-  _cbox_busy_begin "updating ${agent_bin}..."
+  _cbox_step "Updating ${agent_bin}..."
 
   $_CBOX_CMD exec --user root ${_CBOX_UPDATE_ARGS[@]+"${_CBOX_UPDATE_ARGS[@]}"} "$name" \
     npm update -g --no-fund "$agent_pkg"
@@ -5225,7 +5234,7 @@ _cbox_create() {
     _ports=$(_cbox_project_ports) || return 1
   fi
 
-  echo "Creating $mode container '$name' ($agent_bin)..."
+  _cbox_step "Creating $mode container '$name' ($agent_bin)..."
 
   local args=(
     run -d
@@ -5425,7 +5434,6 @@ _cbox_create() {
   # The runtime's progress steps and the container id it prints are noise
   # under the spinner (not a terminal, so every step becomes its own line):
   # shown with -v, and always when creating fails.
-  _cbox_busy_begin "creating container..."
   if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
     $_CBOX_CMD "${args[@]}"
   else
@@ -5499,7 +5507,7 @@ _cbox_ensure() {
   fi
 
   if ! _cbox_running "$name"; then
-    echo "Starting container '$name'..."
+    _cbox_step "Starting container '$name'..."
     if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
       $_CBOX_CMD start "$name"
     else
@@ -5900,8 +5908,7 @@ _cbox_enter() {
 
   if [[ "$stop_on_exit" == "yes" ]]; then
     if (( _last_session )); then
-      _cbox_busy_begin "stopping container..."
-      echo "Stopping container '$name'..."
+      _cbox_step "Stopping container '$name'..."
       $_CBOX_CMD stop "$name" >/dev/null || echo "⚠  Failed to stop container '$name' — run: cbox stop"
     else
       echo "Session closed. Container '$name' kept alive (other sessions still active)."
@@ -6208,7 +6215,7 @@ cbox() {
         return 0
       fi
       _cbox_busy_begin "stopping container..."
-      echo "Stopping container '$stop_target'..."
+      _cbox_step "Stopping container '$stop_target'..."
       _cbox_mcp_relay_stop "$stop_target"
       _cbox_tunnel_stop "$stop_target"
       _cbox_warden_end "$stop_target"
@@ -6224,8 +6231,7 @@ cbox() {
         echo "No container found for '$reset_target'."
         return 0
       fi
-      _cbox_busy_begin "removing container..."
-      echo "Removing container '$reset_target'..."
+      _cbox_step "Removing container '$reset_target'..."
       _cbox_mcp_relay_stop "$reset_target"
       _cbox_tunnel_stop "$reset_target"
       _cbox_warden_end "$reset_target"
@@ -6296,8 +6302,7 @@ cbox() {
     prune)
       _cbox_busy_begin "starting container system..."
       _cbox_system_start
-      _cbox_busy_begin "removing stopped containers..."
-      echo "Removing stopped cbox containers..."
+      _cbox_step "Removing stopped cbox containers..."
 
       local stopped
       stopped=$(_cbox_rt_list "$CBOX_LABEL" | awk '$2 != "running" {print $1}')

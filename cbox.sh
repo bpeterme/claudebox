@@ -226,6 +226,122 @@ _cbox_shown() {
 
 _cbox_log() { [[ "${CBOX_VERBOSE:-0}" == "1" ]] && echo "$@" || true; }
 
+# ---------------------------------------------------------
+# spinner — one per phase, so a slow step never looks like a hang
+# ---------------------------------------------------------
+# _cbox_busy_begin starts the spinner (or, while it runs, only changes its
+# label) and routes all output of this shell and its children through a
+# relay: each line first clears the spinner line, so it lands at column 0
+# and the spinner redraws below it. The frame sits in column 0, where ✔/⚠
+# appear. _cbox_busy_end drains the relay, restores the terminal and stops
+# the spinner — always before handing the terminal to the agent. For a
+# question, _cbox_busy_hold pauses the spinner (line cleared, cursor shown)
+# and _cbox_busy_release lets it go on; warden's ask() does the same from
+# Python through the exported relay dir. Off without a terminal (scripts, CI).
+_CBOX_SPINNER_PID=""
+_CBOX_SPINNER_MSG=""
+_CBOX_RELAY_DIR=""
+_cbox_spin_start() {
+  local msg="$1"
+  if [[ -n "$_CBOX_SPINNER_PID" ]]; then
+    printf '%s\n' "$msg" > "$_CBOX_SPINNER_MSG"
+    return 0
+  fi
+  [[ -t 1 ]] || return 0
+  _CBOX_SPINNER_MSG=$(mktemp)
+  printf '%s\n' "$msg" > "$_CBOX_SPINNER_MSG"
+  printf '\033[?25l'
+  ( local f=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) i=0 m="$msg" held=0
+    while true; do
+      if [[ -n "$_CBOX_RELAY_DIR" && -f "$_CBOX_RELAY_DIR/paused" ]]; then
+        (( held )) || printf '\r\033[K\033[?25h'
+        held=1; sleep 0.05; continue
+      fi
+      (( held )) && printf '\033[?25l'
+      held=0
+      IFS= read -r m < "$_CBOX_SPINNER_MSG" 2>/dev/null || true
+      printf '\r\033[K%s %s' "${f[$i]}" "$m"
+      i=$(( (i+1) % 10 ))
+      sleep 0.1
+    done ) &
+  _CBOX_SPINNER_PID=$!
+}
+_cbox_spin_stop() {
+  [[ -n "$_CBOX_SPINNER_PID" ]] || return 0
+  kill "$_CBOX_SPINNER_PID" 2>/dev/null || true
+  wait "$_CBOX_SPINNER_PID" 2>/dev/null || true
+  printf '\r\033[K\033[?25h'
+  rm -f "$_CBOX_SPINNER_MSG"
+  _CBOX_SPINNER_PID=""; _CBOX_SPINNER_MSG=""
+}
+# Reads the busy-phase output; $1 is the relay dir. A "drain" line is not
+# printed: it marks everything before it as shown (see _cbox_busy_end).
+_cbox_relay() {
+  local l
+  while IFS= read -r l || [[ -n "$l" ]]; do
+    if [[ "$l" == "cbox-relay-drain:$1" ]]; then
+      : > "$1/drained"; continue
+    fi
+    printf '\r\033[K%s\n' "$l"
+  done
+}
+_cbox_busy_begin() {
+  local msg="$1"
+  if [[ -n "$_CBOX_RELAY_DIR" ]]; then
+    _cbox_spin_start "$msg"
+    return 0
+  fi
+  [[ -t 1 ]] || return 0
+  _CBOX_RELAY_DIR=$(mktemp -d) || return 0
+  mkfifo "$_CBOX_RELAY_DIR/out" || { rm -rf "$_CBOX_RELAY_DIR"; _CBOX_RELAY_DIR=""; return 0; }
+  export _CBOX_RELAY_DIR  # warden's ask() holds the spinner through it
+  trap '_cbox_busy_end' EXIT
+  _cbox_spin_start "$msg"
+  exec 7>&1 8>&2
+  _cbox_relay "$_CBOX_RELAY_DIR" < "$_CBOX_RELAY_DIR/out" >&7 2>&8 &
+  exec > "$_CBOX_RELAY_DIR/out" 2>&1
+}
+# Waits until the relay printed everything written so far. Bounded, so a
+# stuck relay can never block cbox.
+_cbox_relay_drain() {
+  local d="$1" i=0
+  rm -f "$d/drained"
+  echo "cbox-relay-drain:$d"
+  while [[ ! -f "$d/drained" ]] && (( i < 100 )); do sleep 0.02; i=$(( i + 1 )); done
+}
+# Before a question: earlier output shown, spinner paused (line cleared,
+# cursor shown). Fails when not busy. Write the question to /dev/tty, since
+# output without a newline would wait in the relay.
+_cbox_busy_hold() {
+  [[ -n "$_CBOX_RELAY_DIR" ]] || return 1
+  _cbox_relay_drain "$_CBOX_RELAY_DIR"
+  : > "$_CBOX_RELAY_DIR/paused"
+  sleep 0.15  # the spinner checks every 0.05–0.1 s
+}
+_cbox_busy_release() {
+  [[ -z "$_CBOX_RELAY_DIR" ]] || rm -f "$_CBOX_RELAY_DIR/paused"
+}
+# A step's announcement: while busy, the spinner's label (lower-cased, like
+# all labels); otherwise a plain line, as without a terminal. Never starts
+# the spinner itself, so commands without one (rebuild) stay as they are.
+_cbox_step() {
+  if [[ -n "$_CBOX_RELAY_DIR" ]]; then
+    _cbox_busy_begin "$(printf '%s' "${1:0:1}" | tr '[:upper:]' '[:lower:]')${1:1}"
+  else
+    echo "$1"
+  fi
+}
+_cbox_busy_end() {
+  if [[ -n "$_CBOX_RELAY_DIR" ]]; then
+    local d="$_CBOX_RELAY_DIR"
+    _cbox_relay_drain "$d"
+    _CBOX_RELAY_DIR=""
+    exec 1>&7 2>&8 7>&- 8>&-
+    rm -rf "$d"
+  fi
+  _cbox_spin_stop
+}
+
 _cbox_agent_bin() { [[ "${CBOX_AGENT:-claude}" == "opencode" ]] && echo "opencode" || echo "claude"; }
 _cbox_agent_pkg() { [[ "${CBOX_AGENT:-claude}" == "opencode" ]] && echo "opencode-ai" || echo "@anthropic-ai/claude-code"; }
 
@@ -334,7 +450,7 @@ _cbox_system_down() {
 # change containers or images, need it).
 _cbox_system_start() {
   _cbox_system_down || return 0
-  echo "Starting container system..."
+  _cbox_step "Starting container system..."
   if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
     container system start
   else
@@ -463,6 +579,7 @@ _cbox_force_update() {
   local name="$1"
   clear 2>/dev/null || true  # no terminal (scripts, CI): nothing to clear
 
+  _cbox_busy_begin "starting container..."
   _cbox_system_start
   if ! _cbox_exists "$name"; then
     echo "No container found for '$name'."
@@ -470,8 +587,12 @@ _cbox_force_update() {
   fi
 
   if ! _cbox_running "$name"; then
-    echo "Starting container '$name'..."
-    $_CBOX_CMD start "$name"
+    _cbox_step "Starting container '$name'..."
+    if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+      $_CBOX_CMD start "$name"
+    else
+      $_CBOX_CMD start "$name" >/dev/null
+    fi
   fi
 
   local agent_bin agent_pkg
@@ -487,12 +608,13 @@ _cbox_force_update() {
     return 1
   fi
 
-  echo "Updating ${agent_bin}..."
+  _cbox_step "Updating ${agent_bin}..."
 
   $_CBOX_CMD exec --user root ${_CBOX_UPDATE_ARGS[@]+"${_CBOX_UPDATE_ARGS[@]}"} "$name" \
     npm update -g --no-fund "$agent_pkg"
   # A tunnel started just for this goes again; a session's stays.
   (( had_tunnel )) || _cbox_tunnel_stop "$name"
+  _cbox_busy_end
 }
 
 # Prints the network for safe containers, which have no way out of their own:
@@ -3337,12 +3459,49 @@ def cmd_whatsapp_pick(d, name, everything=""):
 
 # --- session: decide grants, issue token, print container env ---------------
 
+def spinner_hold():
+    """cbox's spinner runs while warden decides (see _cbox_busy_hold): show
+    the output so far, pause the spinner and return its dir, or None."""
+    d = os.environ.get("_CBOX_RELAY_DIR", "")
+    if not d or not os.path.isdir(d):
+        return None
+    drained = os.path.join(d, "drained")
+    try:
+        os.remove(drained)
+    except OSError:
+        pass
+    sys.stderr.write(f"cbox-relay-drain:{d}\n")
+    sys.stderr.flush()
+    for _ in range(100):
+        if os.path.exists(drained):
+            break
+        time.sleep(0.02)
+    open(os.path.join(d, "paused"), "w").close()
+    time.sleep(0.15)
+    return d
+
+
 def ask(question):
     if not sys.stdin.isatty():
         return False
-    sys.stderr.write(question)
-    sys.stderr.flush()
-    return sys.stdin.readline().strip().lower() in ("y", "yes")
+    held = spinner_hold()
+    try:
+        # Held: stderr runs through cbox's relay, which shows whole lines only.
+        try:
+            out = open("/dev/tty", "w") if held else sys.stderr
+        except OSError:
+            out = sys.stderr
+        out.write(question)
+        out.flush()
+        if out is not sys.stderr:
+            out.close()
+        return sys.stdin.readline().strip().lower() in ("y", "yes")
+    finally:
+        if held:
+            try:
+                os.remove(os.path.join(held, "paused"))
+            except OSError:
+                pass
 
 
 def approve(d, project, interactive):
@@ -5075,7 +5234,7 @@ _cbox_create() {
     _ports=$(_cbox_project_ports) || return 1
   fi
 
-  echo "Creating $mode container '$name' ($agent_bin)..."
+  _cbox_step "Creating $mode container '$name' ($agent_bin)..."
 
   local args=(
     run -d
@@ -5272,7 +5431,18 @@ _cbox_create() {
     tail -f /dev/null
   )
 
-  $_CBOX_CMD "${args[@]}"
+  # The runtime's progress steps and the container id it prints are noise
+  # under the spinner (not a terminal, so every step becomes its own line):
+  # shown with -v, and always when creating fails.
+  if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+    $_CBOX_CMD "${args[@]}"
+  else
+    local _out
+    if ! _out=$($_CBOX_CMD "${args[@]}" 2>&1); then
+      printf '%s\n' "$_out"
+      return 1
+    fi
+  fi
 }
 
 # True for a container created by an older cbox whose PID 1 is `tail` itself,
@@ -5337,7 +5507,7 @@ _cbox_ensure() {
   fi
 
   if ! _cbox_running "$name"; then
-    echo "Starting container '$name'..."
+    _cbox_step "Starting container '$name'..."
     if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
       $_CBOX_CMD start "$name"
     else
@@ -5482,9 +5652,11 @@ _cbox_git_guard_start() {
 # Asks on a terminal only; anything else means no.
 _cbox_git_guard_ask() {
   [[ -t 0 ]] || return 1
-  local answer=""
-  printf '   Restore .git/config and .git/hooks as they were at the session start? [y/N] '
-  read -r answer || return 1
+  local answer="" out=/dev/stdout
+  _cbox_busy_hold && out=/dev/tty
+  printf '   Restore .git/config and .git/hooks as they were at the session start? [y/N] ' > "$out"
+  read -r answer || answer=""
+  _cbox_busy_release
   [[ "$answer" == [yY]* ]]
 }
 
@@ -5588,7 +5760,9 @@ _cbox_enter() {
   agent_bin=$(_cbox_agent_bin)
 
   if [[ "$command" != "zsh" ]]; then
+    _cbox_busy_begin "checking for ${agent_bin} updates..."
     _cbox_maybe_update "$name" "$mode"
+    _cbox_busy_begin "syncing Claude config..."
     if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
       if [[ "$agent_bin" == "claude" ]]; then
         if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
@@ -5608,6 +5782,7 @@ _cbox_enter() {
     fi
   fi
 
+  _cbox_busy_begin "preparing session..."
   local _audio=0
   if [[ -n "${CBOX_AUDIO:-}" ]] && [[ "$mode" != "safe" ]] && [[ "$agent_bin" == "claude" ]]; then
     _cbox_audio_start && _audio=1
@@ -5697,11 +5872,14 @@ _cbox_enter() {
 
   _cbox_git_guard_start "$name" || true
   _cbox_session_start "$name"
+  _cbox_busy_end
 
   # The agent's exit status is irrelevant here, but under the script's
   # `set -e` a non-zero one would skip every teardown step below —
   # including stopping the container.
   $_CBOX_CMD exec "${_exec_args[@]}" "$name" zsh -ic "$_run" || true
+
+  _cbox_busy_begin "closing session..."
 
   if [[ "$command" != "zsh" && "$mode" != "safe" ]]; then
     if command -v cdot >/dev/null 2>&1 && _cbox_check_companion_api cdot "$_CBOX_CDOT_API"; then
@@ -5730,7 +5908,7 @@ _cbox_enter() {
 
   if [[ "$stop_on_exit" == "yes" ]]; then
     if (( _last_session )); then
-      echo "Stopping container '$name'..."
+      _cbox_step "Stopping container '$name'..."
       $_CBOX_CMD stop "$name" >/dev/null || echo "⚠  Failed to stop container '$name' — run: cbox stop"
     else
       echo "Session closed. Container '$name' kept alive (other sessions still active)."
@@ -5748,6 +5926,7 @@ _cbox_enter() {
       find "$CBOX_SHARE_DIR" -mindepth 1 -delete 2>/dev/null || true
     unset _cache_base
   fi
+  _cbox_busy_end
 }
 
 # ---------------------------------------------------------
@@ -6006,17 +6185,20 @@ cbox() {
       ;;
 
     safe)
+      _cbox_busy_begin "starting container..."
       _cbox_ensure "$name" "safe" || return 1
       _cbox_enter "$name" "$(_cbox_agent_bin)"
       ;;
 
     shell)
       # Joins a safe container too, with its limits (no new normal one).
+      _cbox_busy_begin "starting container..."
       _cbox_ensure "$name" "existing" || return 1
       _cbox_enter "$name" "zsh"
       ;;
 
     keepalive)
+      _cbox_busy_begin "starting container..."
       _cbox_ensure "$name" "normal" || return 1
       _cbox_enter "$name" "$(_cbox_agent_bin)" "no"
       _cbox_keepalive "$name"
@@ -6032,25 +6214,34 @@ cbox() {
         echo "No container found for '$stop_target'."
         return 0
       fi
-      echo "Stopping container '$stop_target'..."
+      _cbox_busy_begin "stopping container..."
+      _cbox_step "Stopping container '$stop_target'..."
       _cbox_mcp_relay_stop "$stop_target"
       _cbox_tunnel_stop "$stop_target"
       _cbox_warden_end "$stop_target"
       $_CBOX_CMD stop "$stop_target" >/dev/null
+      _cbox_busy_end
       ;;
 
     reset)
       local reset_target="${2:-$name}"
+      _cbox_busy_begin "starting container system..."
       _cbox_system_start
       if ! _cbox_exists "$reset_target"; then
         echo "No container found for '$reset_target'."
         return 0
       fi
-      echo "Removing container '$reset_target'..."
+      _cbox_step "Removing container '$reset_target'..."
       _cbox_mcp_relay_stop "$reset_target"
       _cbox_tunnel_stop "$reset_target"
       _cbox_warden_end "$reset_target"
-      $_CBOX_CMD rm -f "$reset_target"
+      # The runtime echoes the removed name — "Removing …" already said it.
+      if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+        $_CBOX_CMD rm -f "$reset_target"
+      else
+        $_CBOX_CMD rm -f "$reset_target" >/dev/null
+      fi
+      _cbox_busy_end
       ;;
 
     rebuild)
@@ -6109,8 +6300,9 @@ cbox() {
       ;;
 
     prune)
+      _cbox_busy_begin "starting container system..."
       _cbox_system_start
-      echo "Removing stopped cbox containers..."
+      _cbox_step "Removing stopped cbox containers..."
 
       local stopped
       stopped=$(_cbox_rt_list "$CBOX_LABEL" | awk '$2 != "running" {print $1}')
@@ -6121,11 +6313,14 @@ cbox() {
         echo "Nothing to prune."
       fi
 
+      _cbox_busy_begin "reclaiming disk space..."
       _cbox_clean_running
+      _cbox_busy_end
       ;;
 
     "")
 
+      _cbox_busy_begin "starting container..."
       _cbox_ensure "$name" "normal" || return 1
       _cbox_enter "$name" "$(_cbox_agent_bin)"
       ;;

@@ -1,10 +1,15 @@
 name: Release
 
 on:
-  push:
+  # Only after the Test workflow passed on a push to main — a failing
+  # main never reaches a tag or the Homebrew tap. (workflow_run always uses
+  # this file as it is on main.)
+  workflow_run:
+    workflows: [Test]
+    types: [completed]
     branches: [main]
 
-# GitHub occasionally delivers a push event twice. Runs queue up instead of
+# GitHub occasionally delivers an event twice, and a test run can be re-run. Runs queue up instead of
 # racing, and a run whose commit already has a release tag stops early.
 concurrency:
   group: release
@@ -14,12 +19,16 @@ jobs:
   release:
     name: Tag, create GitHub release, and update Homebrew tap
     runs-on: ubuntu-latest
-    if: github.actor != 'github-actions[bot]'
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.actor.login != 'github-actions[bot]'
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}  # the commit that was tested
           fetch-depth: 0
 
       - name: Skip when this commit is already released

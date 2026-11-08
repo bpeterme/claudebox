@@ -1503,7 +1503,9 @@ class Mux:
       E id        either way: no more bytes this way (the other way stays open)
       C id        either way: the connection is closed
     Every connection writes through its own thread and queue, so a slow socket
-    never holds up the others."""
+    never holds up the others. The thread reading frames never writes to the
+    pipe itself: if both pipes filled up while both ends were writing, neither
+    would read again. Its C frames go out through their own thread instead."""
     HDR = struct.Struct(">cII")
     MAX_FRAME = 1 << 20
     MAX_QUEUED = 256  # frames waiting for one socket; beyond that it is dropped
@@ -1516,12 +1518,23 @@ class Mux:
         self.conns = {}
         self.next_id = 0
         self.ready = False
+        self.closes = queue.Queue()  # ids to send C for, by _send_closes
 
     def send(self, kind, cid, data=b""):
         frame = self.HDR.pack(kind, cid, len(data)) + data
         with self.wlock:
             while frame:
                 frame = frame[os.write(self.wfd, frame):]
+
+    def _send_closes(self):
+        while True:
+            cid = self.closes.get()
+            if cid is None:
+                return
+            try:
+                self.send(b"C", cid)
+            except OSError:
+                pass
 
     def add(self, sock, cid=None, channel=None):
         """Carries sock. Without cid (container side) a new id is taken and the
@@ -1551,10 +1564,7 @@ class Mux:
             except OSError:
                 pass
         if tell:
-            try:
-                self.send(b"C", cid)
-            except OSError:
-                pass
+            self.closes.put(cid)
 
     def _eof(self, cid, side):
         """Marks EOF in one direction; the connection ends once both are done."""
@@ -1618,12 +1628,13 @@ class Mux:
         except OSError:
             sock = None
         if sock is None:
-            self.send(b"C", cid)
+            self.closes.put(cid)
         else:
             self.add(sock, cid=cid)
 
     def run(self):
         """Handles frames until the pipe closes, then drops every connection."""
+        threading.Thread(target=self._send_closes, daemon=True).start()
         try:
             while True:
                 hdr = self._read_exact(self.HDR.size)
@@ -1661,6 +1672,7 @@ class Mux:
             pass
         for cid in list(self.conns):
             self.drop(cid, tell=False)
+        self.closes.put(None)
 PYEOF
 }
 

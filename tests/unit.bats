@@ -2628,6 +2628,35 @@ ssh keys 1 True" ] || { cat "$TT/tunnel.log"; false; }
   [ "$nogrant" = "closed" ]
 }
 
+@test "tunnel: a full outgoing pipe never stops the mux from reading frames" {
+  # Refusing a channel sends a C frame. With the pipe to the other end full,
+  # that write would block; if the frame reader made it, the other connections
+  # would stop getting data, and two full pipes would stall both ends.
+  run timeout 20 python3 -c "$(_cbox_tunnel_mux_py)"'
+import fcntl
+in_r, in_w = os.pipe(); out_r, out_w = os.pipe()
+fl = fcntl.fcntl(out_w, fcntl.F_GETFL)
+fcntl.fcntl(out_w, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+try:
+    while True: os.write(out_w, b"x" * 65536)
+except BlockingIOError:
+    pass
+fcntl.fcntl(out_w, fcntl.F_SETFL, fl)
+mux = Mux(in_r, out_w, opener=lambda name: None)
+mine, theirs = socket.socketpair(); mine.settimeout(5)
+mux.add(theirs, cid=2)
+threading.Thread(target=mux.run, daemon=True).start()
+H = Mux.HDR
+os.write(in_w, H.pack(b"O", 1, 4) + b"nope" + H.pack(b"D", 2, 5) + b"hello")
+try:
+    print(mine.recv(5).decode())
+except socket.timeout:
+    print("stalled")
+import sys; sys.stdout.flush(); os._exit(0)
+'
+  [ "$output" = "hello" ]
+}
+
 @test "_cbox_create: with a warden ssh resource only public SSH files are mounted" {
   local capture="$BATS_TMPDIR/create-ssh-args"
   cd "$BATS_TMPDIR"

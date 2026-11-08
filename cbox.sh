@@ -234,8 +234,10 @@ _cbox_log() { [[ "${CBOX_VERBOSE:-0}" == "1" ]] && echo "$@" || true; }
 # relay: each line first clears the spinner line, so it lands at column 0
 # and the spinner redraws below it. The frame sits in column 0, where ✔/⚠
 # appear. _cbox_busy_end drains the relay, restores the terminal and stops
-# the spinner — always before handing the terminal to the agent or asking
-# a question. Off without a terminal (scripts, CI).
+# the spinner — always before handing the terminal to the agent. For a
+# question, _cbox_busy_hold pauses the spinner (line cleared, cursor shown)
+# and _cbox_busy_release lets it go on; warden's ask() does the same from
+# Python through the exported relay dir. Off without a terminal (scripts, CI).
 _CBOX_SPINNER_PID=""
 _CBOX_SPINNER_MSG=""
 _CBOX_RELAY_DIR=""
@@ -249,8 +251,14 @@ _cbox_spin_start() {
   _CBOX_SPINNER_MSG=$(mktemp)
   printf '%s\n' "$msg" > "$_CBOX_SPINNER_MSG"
   printf '\033[?25l'
-  ( local f=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) i=0 m="$msg"
+  ( local f=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) i=0 m="$msg" held=0
     while true; do
+      if [[ -n "$_CBOX_RELAY_DIR" && -f "$_CBOX_RELAY_DIR/paused" ]]; then
+        (( held )) || printf '\r\033[K\033[?25h'
+        held=1; sleep 0.05; continue
+      fi
+      (( held )) && printf '\033[?25l'
+      held=0
       IFS= read -r m < "$_CBOX_SPINNER_MSG" 2>/dev/null || true
       printf '\r\033[K%s %s' "${f[$i]}" "$m"
       i=$(( (i+1) % 10 ))
@@ -286,20 +294,38 @@ _cbox_busy_begin() {
   [[ -t 1 ]] || return 0
   _CBOX_RELAY_DIR=$(mktemp -d) || return 0
   mkfifo "$_CBOX_RELAY_DIR/out" || { rm -rf "$_CBOX_RELAY_DIR"; _CBOX_RELAY_DIR=""; return 0; }
+  export _CBOX_RELAY_DIR  # warden's ask() holds the spinner through it
   trap '_cbox_busy_end' EXIT
   _cbox_spin_start "$msg"
   exec 7>&1 8>&2
   _cbox_relay "$_CBOX_RELAY_DIR" < "$_CBOX_RELAY_DIR/out" >&7 2>&8 &
   exec > "$_CBOX_RELAY_DIR/out" 2>&1
 }
+# Waits until the relay printed everything written so far. Bounded, so a
+# stuck relay can never block cbox.
+_cbox_relay_drain() {
+  local d="$1" i=0
+  rm -f "$d/drained"
+  echo "cbox-relay-drain:$d"
+  while [[ ! -f "$d/drained" ]] && (( i < 100 )); do sleep 0.02; i=$(( i + 1 )); done
+}
+# Before a question: earlier output shown, spinner paused (line cleared,
+# cursor shown). Fails when not busy. Write the question to /dev/tty, since
+# output without a newline would wait in the relay.
+_cbox_busy_hold() {
+  [[ -n "$_CBOX_RELAY_DIR" ]] || return 1
+  _cbox_relay_drain "$_CBOX_RELAY_DIR"
+  : > "$_CBOX_RELAY_DIR/paused"
+  sleep 0.15  # the spinner checks every 0.05–0.1 s
+}
+_cbox_busy_release() {
+  [[ -z "$_CBOX_RELAY_DIR" ]] || rm -f "$_CBOX_RELAY_DIR/paused"
+}
 _cbox_busy_end() {
   if [[ -n "$_CBOX_RELAY_DIR" ]]; then
-    local d="$_CBOX_RELAY_DIR" i=0
+    local d="$_CBOX_RELAY_DIR"
+    _cbox_relay_drain "$d"
     _CBOX_RELAY_DIR=""
-    # Wait until the relay printed everything so far, then restore the
-    # terminal. Bounded, so a stuck relay can never block cbox.
-    echo "cbox-relay-drain:$d"
-    while [[ ! -f "$d/drained" ]] && (( i < 100 )); do sleep 0.02; i=$(( i + 1 )); done
     exec 1>&7 2>&8 7>&- 8>&-
     rm -rf "$d"
   fi
@@ -3417,12 +3443,49 @@ def cmd_whatsapp_pick(d, name, everything=""):
 
 # --- session: decide grants, issue token, print container env ---------------
 
+def spinner_hold():
+    """cbox's spinner runs while warden decides (see _cbox_busy_hold): show
+    the output so far, pause the spinner and return its dir, or None."""
+    d = os.environ.get("_CBOX_RELAY_DIR", "")
+    if not d or not os.path.isdir(d):
+        return None
+    drained = os.path.join(d, "drained")
+    try:
+        os.remove(drained)
+    except OSError:
+        pass
+    sys.stderr.write(f"cbox-relay-drain:{d}\n")
+    sys.stderr.flush()
+    for _ in range(100):
+        if os.path.exists(drained):
+            break
+        time.sleep(0.02)
+    open(os.path.join(d, "paused"), "w").close()
+    time.sleep(0.15)
+    return d
+
+
 def ask(question):
     if not sys.stdin.isatty():
         return False
-    sys.stderr.write(question)
-    sys.stderr.flush()
-    return sys.stdin.readline().strip().lower() in ("y", "yes")
+    held = spinner_hold()
+    try:
+        # Held: stderr runs through cbox's relay, which shows whole lines only.
+        try:
+            out = open("/dev/tty", "w") if held else sys.stderr
+        except OSError:
+            out = sys.stderr
+        out.write(question)
+        out.flush()
+        if out is not sys.stderr:
+            out.close()
+        return sys.stdin.readline().strip().lower() in ("y", "yes")
+    finally:
+        if held:
+            try:
+                os.remove(os.path.join(held, "paused"))
+            except OSError:
+                pass
 
 
 def approve(d, project, interactive):
@@ -5352,7 +5415,19 @@ _cbox_create() {
     tail -f /dev/null
   )
 
-  $_CBOX_CMD "${args[@]}"
+  # The runtime's progress steps and the container id it prints are noise
+  # under the spinner (not a terminal, so every step becomes its own line):
+  # shown with -v, and always when creating fails.
+  _cbox_busy_begin "creating container..."
+  if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+    $_CBOX_CMD "${args[@]}"
+  else
+    local _out
+    if ! _out=$($_CBOX_CMD "${args[@]}" 2>&1); then
+      printf '%s\n' "$_out"
+      return 1
+    fi
+  fi
 }
 
 # True for a container created by an older cbox whose PID 1 is `tail` itself,
@@ -5562,10 +5637,11 @@ _cbox_git_guard_start() {
 # Asks on a terminal only; anything else means no.
 _cbox_git_guard_ask() {
   [[ -t 0 ]] || return 1
-  _cbox_busy_end  # the question needs the plain terminal, not the spinner
-  local answer=""
-  printf '   Restore .git/config and .git/hooks as they were at the session start? [y/N] '
-  read -r answer || return 1
+  local answer="" out=/dev/stdout
+  _cbox_busy_hold && out=/dev/tty
+  printf '   Restore .git/config and .git/hooks as they were at the session start? [y/N] ' > "$out"
+  read -r answer || answer=""
+  _cbox_busy_release
   [[ "$answer" == [yY]* ]]
 }
 
@@ -5730,8 +5806,6 @@ _cbox_enter() {
       echo "   Recreate it: cbox reset"
     fi
   else
-    # warden may ask to approve grants: no spinner over its questions
-    _cbox_warden_enabled && _cbox_busy_end
     local _w_env
     while IFS= read -r _w_env; do
       case "$_w_env" in
@@ -5750,7 +5824,6 @@ _cbox_enter() {
         ?*) _exec_args+=(-e "$_w_env") ;;
       esac
     done < <(_cbox_warden_start "$name")
-    _cbox_busy_begin "preparing session..."
   fi
 
   if [[ "$agent_bin" == "claude" ]]; then

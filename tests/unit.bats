@@ -4469,3 +4469,34 @@ SH
   [ "$output" = $'\r\033[Ka\n\r\033[Kb' ]
   [ -f "$d/drained" ]
 }
+
+@test "_cbox_create: hides the runtime's progress and container id; shows them with -v or on failure" {
+  cd "$BATS_TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() {
+    [[ "$1" == run ]] || return 0
+    echo "[1/6] Fetching image [0s]"; echo "cbox-unit-quiet"
+    return "${FAKE_RC:-0}"
+  }
+
+  run _cbox_create "cbox-unit-quiet" "normal"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Fetching image"* ]]
+  [[ "$output" != *$'\ncbox-unit-quiet'* ]]
+
+  CBOX_VERBOSE=1 run _cbox_create "cbox-unit-quiet" "normal"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Fetching image"* ]]
+
+  FAKE_RC=1 run _cbox_create "cbox-unit-quiet" "normal"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Fetching image"* ]]
+}
+
+@test "spinner: _cbox_busy_hold fails without a spinner, so questions go to stdout as before" {
+  _CBOX_RELAY_DIR=""
+  run _cbox_busy_hold
+  [ "$status" -eq 1 ]
+  run _cbox_busy_release
+  [ "$status" -eq 0 ]
+}

@@ -4454,3 +4454,18 @@ SH
   [[ "$output" == *"'22' is not a port cbox publishes"* ]]
   [[ "$output" == *"stay as they are until .cbox is fixed"* ]]
 }
+
+@test "spinner: off without a terminal — output passes through unchanged" {
+  run bash -c 'source "$1"; _cbox_busy_begin "starting container..."
+    echo line; echo err >&2; _cbox_busy_end; echo "relay=[$_CBOX_RELAY_DIR] spinner=[$_CBOX_SPINNER_PID]"' _ "$CBOX_SH"
+  [ "$status" -eq 0 ]
+  [ "$output" = $'line\nerr\nrelay=[] spinner=[]' ]
+}
+
+@test "_cbox_relay: clears the spinner line before each line and acks the drain marker" {
+  local d="$BATS_TMPDIR/relay"; mkdir -p "$d"
+  run bash -c 'source "$1"; printf "a\ncbox-relay-drain:%s\nb" "$2" | _cbox_relay "$2"' _ "$CBOX_SH" "$d"
+  [ "$status" -eq 0 ]
+  [ "$output" = $'\r\033[Ka\n\r\033[Kb' ]
+  [ -f "$d/drained" ]
+}

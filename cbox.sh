@@ -569,6 +569,7 @@ _cbox_force_update() {
   local name="$1"
   clear 2>/dev/null || true  # no terminal (scripts, CI): nothing to clear
 
+  _cbox_busy_begin "starting container..."
   _cbox_system_start
   if ! _cbox_exists "$name"; then
     echo "No container found for '$name'."
@@ -577,7 +578,11 @@ _cbox_force_update() {
 
   if ! _cbox_running "$name"; then
     echo "Starting container '$name'..."
-    $_CBOX_CMD start "$name"
+    if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+      $_CBOX_CMD start "$name"
+    else
+      $_CBOX_CMD start "$name" >/dev/null
+    fi
   fi
 
   local agent_bin agent_pkg
@@ -594,11 +599,13 @@ _cbox_force_update() {
   fi
 
   echo "Updating ${agent_bin}..."
+  _cbox_busy_begin "updating ${agent_bin}..."
 
   $_CBOX_CMD exec --user root ${_CBOX_UPDATE_ARGS[@]+"${_CBOX_UPDATE_ARGS[@]}"} "$name" \
     npm update -g --no-fund "$agent_pkg"
   # A tunnel started just for this goes again; a session's stays.
   (( had_tunnel )) || _cbox_tunnel_stop "$name"
+  _cbox_busy_end
 }
 
 # Prints the network for safe containers, which have no way out of their own:
@@ -6200,25 +6207,35 @@ cbox() {
         echo "No container found for '$stop_target'."
         return 0
       fi
+      _cbox_busy_begin "stopping container..."
       echo "Stopping container '$stop_target'..."
       _cbox_mcp_relay_stop "$stop_target"
       _cbox_tunnel_stop "$stop_target"
       _cbox_warden_end "$stop_target"
       $_CBOX_CMD stop "$stop_target" >/dev/null
+      _cbox_busy_end
       ;;
 
     reset)
       local reset_target="${2:-$name}"
+      _cbox_busy_begin "starting container system..."
       _cbox_system_start
       if ! _cbox_exists "$reset_target"; then
         echo "No container found for '$reset_target'."
         return 0
       fi
+      _cbox_busy_begin "removing container..."
       echo "Removing container '$reset_target'..."
       _cbox_mcp_relay_stop "$reset_target"
       _cbox_tunnel_stop "$reset_target"
       _cbox_warden_end "$reset_target"
-      $_CBOX_CMD rm -f "$reset_target"
+      # The runtime echoes the removed name — "Removing …" already said it.
+      if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+        $_CBOX_CMD rm -f "$reset_target"
+      else
+        $_CBOX_CMD rm -f "$reset_target" >/dev/null
+      fi
+      _cbox_busy_end
       ;;
 
     rebuild)
@@ -6277,7 +6294,9 @@ cbox() {
       ;;
 
     prune)
+      _cbox_busy_begin "starting container system..."
       _cbox_system_start
+      _cbox_busy_begin "removing stopped containers..."
       echo "Removing stopped cbox containers..."
 
       local stopped
@@ -6289,7 +6308,9 @@ cbox() {
         echo "Nothing to prune."
       fi
 
+      _cbox_busy_begin "reclaiming disk space..."
       _cbox_clean_running
+      _cbox_busy_end
       ;;
 
     "")

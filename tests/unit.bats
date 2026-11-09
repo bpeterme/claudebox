@@ -1270,6 +1270,44 @@ auth = sigv4"
 }
 
 # ---------------------------------------------------------------------------
+# _cbox_share_clear
+# ---------------------------------------------------------------------------
+
+# A share folder under the cache dir with one file, and an empty session dir.
+_share_setup() {
+  export XDG_CACHE_HOME="$BATS_TMPDIR/share-cache"
+  CBOX_SHARE_DIR="$XDG_CACHE_HOME/claudebox/share"
+  _CBOX_SESSION_DIR="$BATS_TMPDIR/share-sessions"
+  rm -rf "$XDG_CACHE_HOME" "$_CBOX_SESSION_DIR"
+  mkdir -p "$CBOX_SHARE_DIR/sub" "$_CBOX_SESSION_DIR"
+  echo note > "$CBOX_SHARE_DIR/sub/notes.md"
+}
+
+@test "_cbox_share_clear: empties the share folder when no cbox session is left" {
+  _share_setup
+  touch "$_CBOX_SESSION_DIR/.cbox-active-repoa-999999999"   # stale marker
+  _cbox_share_clear
+  [ -d "$CBOX_SHARE_DIR" ]
+  [ -z "$(ls -A "$CBOX_SHARE_DIR")" ]
+}
+
+@test "_cbox_share_clear: keeps files while another repo's session is still open" {
+  _share_setup
+  touch "$_CBOX_SESSION_DIR/.cbox-active-repob-1"   # PID 1 is always alive
+  _cbox_share_clear
+  [ -f "$CBOX_SHARE_DIR/sub/notes.md" ]
+}
+
+@test "_cbox_share_clear: never touches a share folder outside the cache dir or /tmp" {
+  _share_setup
+  CBOX_SHARE_DIR="/Users/someone/Documents/share"
+  find() { echo "find $*" >> "$BATS_TMPDIR/share-find"; }
+  rm -f "$BATS_TMPDIR/share-find"
+  _cbox_share_clear
+  [ ! -f "$BATS_TMPDIR/share-find" ]
+}
+
+# ---------------------------------------------------------------------------
 # _cbox_container_has_sessions
 # ---------------------------------------------------------------------------
 

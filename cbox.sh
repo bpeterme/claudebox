@@ -4944,7 +4944,8 @@ _cbox_safe_claude_dir() {
   # The session registry is the container's own (see "sessions" in _cbox_create);
   # an older cbox linked it to the read-only shared one.
   [[ -L "$dir/sessions" ]] && rm -f "$dir/sessions"
-  mkdir -p -m 700 "$dir/sessions"
+  mkdir -p "$dir/sessions"
+  chmod 700 "$dir/sessions"
 
   local s="$src/.credentials.json" l="$dir/.credentials.json"
   [[ -L "$s" || -L "$l" ]] && return 0  # Claude Code would not open it anyway
@@ -5349,7 +5350,8 @@ _cbox_create() {
     # sessions of different containers overwrite and delete each other's
     # records. So each container has its own. (The mount point is made here,
     # or the runtime would make it, root-owned on Linux.)
-    mkdir -p -m 700 "$CBOX_DATA_DIR/sessions/$name" "$CBOX_CLAUDE_DIR/sessions"
+    mkdir -p "$CBOX_DATA_DIR/sessions/$name" "$CBOX_CLAUDE_DIR/sessions"
+    chmod 700 "$CBOX_DATA_DIR/sessions/$name" "$CBOX_CLAUDE_DIR/sessions"
     args+=(
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude"
       -v "$CBOX_DATA_DIR/sessions/$name:/home/claude/.claude/sessions"

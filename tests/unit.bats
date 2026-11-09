@@ -4175,6 +4175,113 @@ PY
   [ "$(wc -l <<<"$out")" -eq 3 ]
 }
 
+@test "warden mail: cbox/watch tells each session about unread mail once, waits for more, never reads it" {
+  _mail_setup alpha beta
+  _mail_serve alpha '{"name":"mail_send","arguments":{"to":"beta","subject":"q","text":"question"}}' >/dev/null
+  tid=$(_mail_thread)
+  out=$( {
+    echo '{"jsonrpc":"2.0","id":1,"method":"cbox/watch","params":{"session":"s1","seconds":0}}'
+    echo '{"jsonrpc":"2.0","id":2,"method":"cbox/watch","params":{"session":"s1","seconds":0}}'
+    echo '{"jsonrpc":"2.0","id":3,"method":"cbox/watch","params":{"session":"s2","seconds":0}}'
+    echo '{"jsonrpc":"2.0","id":4,"method":"cbox/watch","params":{"session":"../x","seconds":0}}'
+    echo '{"jsonrpc":"2.0","id":5,"method":"cbox/watch","params":{"session":"s1","seconds":30}}'
+    sleep 1.5
+    _mail_serve alpha "{\"name\":\"mail_send\",\"arguments\":{\"thread\":\"$tid\",\"text\":\"more\"}}" >/dev/null
+    sleep 1.5
+    # A watch still waiting when the client goes away gets no answer.
+    echo '{"jsonrpc":"2.0","id":6,"method":"cbox/watch","params":{"session":"s1","seconds":30}}'
+  } | timeout 20 python3 -I "$MD/server.py" "$MD" team beta )
+  read=$(_mail_serve beta '{"name":"mail_read"}' | _wa_text 2)
+  after=$(echo '{"jsonrpc":"2.0","id":1,"method":"cbox/watch","params":{"session":"s3","seconds":0}}' |
+    python3 -I "$MD/server.py" "$MD" team beta)
+  news() { sed -n "${1}p" <<<"$out" | python3 -c 'import json,sys; m=json.load(sys.stdin); print(m["result"]["news"] if "result" in m else "ERROR " + m["error"]["message"])'; }
+  [ "$(news 1)" = "1 new message(s) from alpha in thread $tid (\"q\")" ]
+  [ "$(news 2)" = "" ]
+  [ "$(news 3)" = "1 new message(s) from alpha in thread $tid (\"q\")" ]
+  [ "$(news 4)" = "ERROR invalid session" ]
+  [ "$(news 5)" = "1 new message(s) from alpha in thread $tid (\"q\")" ]
+  [ "$(wc -l <<<"$out")" -eq 5 ]
+  # Told is not read: both messages are still unread, and once read no session is told.
+  [[ "$read" == *"question"*"more"* ]]
+  [ "$after" = '{"jsonrpc": "2.0", "id": 1, "result": {"news": ""}}' ]
+}
+
+# cbox-mail-watch in the "container", reaching mail group team through the test relay as rbox.
+_mail_watch_setup() {
+  [ -r /proc/self/stat ] || skip "cbox-mail-watch runs in the Linux container (/proc)"
+  _mail_setup alpha rbox
+  # Where warden keeps it: cbox installs cbox-mail-watch for a mail/server.py.
+  cp "$MD/server.py" "$MD/mail/server.py"
+  mkdir -p "$CBOX_WARDEN_DIR/sessions"
+  printf '{"mcpServers": {"team": {"command": "python3", "args": ["-I", "%s", "%s", "team", "rbox"]}}}\n' \
+    "$MD/mail/server.py" "$MD" > "$CBOX_WARDEN_DIR/sessions/rbox.mcp"
+  _relay_setup
+  MW="${_CBOX_MCP_RELAY%/*}/cbox-mail-watch"
+}
+
+_mail_watch_teardown() {
+  _relay_teardown
+  rm -f "$CBOX_WARDEN_DIR/sessions/rbox.mcp"
+}
+
+@test "cbox-mail-watch: arm wakes the agent (exit 2) when mail comes, once; disarm ends the waiting" {
+  _mail_watch_setup
+  hook='{"session_id":"bats-arm-1","hook_event_name":"Stop"}'
+  run env -u WARDEN_MAIL python3 "$MW" arm <<<"$hook"
+  no_group=$status
+  ( sleep 2; _mail_serve alpha '{"name":"mail_send","arguments":{"to":"rbox","subject":"q","text":"hi"}}' >/dev/null ) &
+  run env WARDEN_MAIL=team timeout 30 python3 "$MW" arm <<<"$hook"
+  wait
+  woke=$status woke_out=$output
+  # Told once: armed again, it keeps waiting until disarm.
+  WARDEN_MAIL=team python3 "$MW" arm <<<"$hook" 2>/dev/null & pid=$!
+  sleep 2
+  kill -0 "$pid" && waited=yes || waited=no
+  WARDEN_MAIL=team python3 "$MW" disarm <<<"$hook"
+  sleep 1.5
+  kill -0 "$pid" 2>/dev/null && ended=no || ended=yes
+  _mail_watch_teardown
+  [ "$no_group" -eq 0 ]
+  [ "$woke" -eq 2 ]
+  [[ "$woke_out" == "1 new message(s) from alpha in thread "*' ("q")'$'\n'*"Read them with mail_read"* ]]
+  [ "$waited" = yes ]
+  [ "$ended" = yes ]
+  [ ! -e /tmp/cbox-mail-watch/bats-arm-1.pid ]
+}
+
+@test "cbox-mail-watch: a newer arm replaces the older; a watcher ends when its agent is gone" {
+  _mail_watch_setup
+  hook='{"session_id":"bats-arm-2","hook_event_name":"Stop"}'
+  echo "$hook" > "$BATS_TMPDIR/hook.json"
+  WARDEN_MAIL=team python3 "$MW" arm <<<"$hook" & first=$!
+  sleep 1
+  WARDEN_MAIL=team python3 "$MW" arm <<<"$hook" & second=$!
+  sleep 1.5
+  kill -0 "$first" 2>/dev/null && replaced=no || replaced=yes
+  kill -0 "$second" && kept=yes || kept=no
+  WARDEN_MAIL=team python3 "$MW" disarm <<<"$hook"
+  # The agent (a non-shell process) runs the hook under sh -c, then quits.
+  WARDEN_MAIL=team python3 -c 'import subprocess, sys, time
+subprocess.Popen(["sh", "-c", sys.argv[1] + " arm < " + sys.argv[2]])
+time.sleep(1)' "python3 $MW" "$BATS_TMPDIR/hook.json"
+  sleep 3
+  left=$(ps -eo args | grep -c "[c]box-mail-watch arm" || true)
+  _mail_watch_teardown
+  [ "$replaced" = yes ]
+  [ "$kept" = yes ]
+  [ "$left" -eq 0 ]
+}
+
+@test "_cbox_mail_hooks_json: arm at SessionStart and Stop in the background, disarm at UserPromptSubmit" {
+  run python3 -c 'import json, sys
+h = json.load(sys.stdin)["hooks"]
+for ev in ("SessionStart", "Stop", "UserPromptSubmit"):
+    c = h[ev][0]["hooks"][0]
+    print(ev, c["command"].split("/")[-1], c.get("asyncRewake", False), c["timeout"], c.get("rewakeSummary", "-"))' <<<"$(_cbox_mail_hooks_json)"
+  [ "$status" -eq 0 ]
+  [ "$output" = $'SessionStart cbox-mail-watch arm True 86400 cbox: new agent mail\nStop cbox-mail-watch arm True 86400 cbox: new agent mail\nUserPromptSubmit cbox-mail-watch disarm False 10 -' ]
+}
+
 @test "warden mail: a granted group gets a relayed server for this container, which joins the group" {
   _warden_setup
   printf '[team]\ntype = mail\navailability = project\n' >> "$CBOX_WARDEN_DIR/resources"
@@ -4190,6 +4297,7 @@ PY
   _cbox_warden_python end "$CBOX_WARDEN_DIR" wbox || true
   _warden_teardown
   [ "$mcp" = '{"team": null}' ]
+  [ "$(sed -n 's/^WARDEN_MAIL=//p' <<<"$output")" = team ]
   [[ "$relay" == *'"python3"'*'"-I"'*"\"$CBOX_WARDEN_DIR/mail/server.py\""*"\"$CBOX_WARDEN_DIR\""*'"team"'*'"wbox"'* ]]
   [ -s "$CBOX_WARDEN_DIR/mail/server.py" ]
   [ "$(stat -c %a "$CBOX_WARDEN_DIR/mail/server.py" 2>/dev/null || stat -f %Lp "$CBOX_WARDEN_DIR/mail/server.py")" = "600" ]

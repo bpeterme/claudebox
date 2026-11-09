@@ -578,6 +578,18 @@ login URL". It writes to `web` and waits. In `web`'s session, the agent reads
 the question (when you prompt it, or because it was waiting itself) and
 answers; `api`'s agent picks the answer up and carries on.
 
+**Mail wakes the agent.** `web` needs no prompt from you:
+
+- **Idle** (waiting for you): the agent wakes up within seconds, reads the mail
+  and answers. Its terminal shows `cbox: new agent mail`.
+- **Busy** (working on a task): nothing interrupts the task. When the task is
+  done, the agent reads the mail and answers, then stops.
+
+Each mail wakes a session once: if the agent leaves it unread, it is not woken
+again for it. The wake-up uses Claude Code hooks that cbox passes to the
+session with `--settings`; your own `settings.json` stays untouched. Only
+`cbox` sessions get it, not a `claude` you start yourself in `cbox zsh`.
+
 **Watch it on the host:** `cbox warden mail` lists the threads,
 `cbox warden mail show <thread>` prints one, `cbox warden mail -f` shows new
 messages as they arrive.
@@ -587,8 +599,6 @@ messages as they arrive.
 - **Mail lasts while cbox is in use.** It is deleted when the last `cbox`
   session on the computer closes, like the share folder. A question nobody
   answered by then is gone.
-- **An idle session is not woken up.** Its agent sees new mail when you
-  prompt it, or while it waits with `mail_wait`.
 - **Loop guard:** a thread pauses after 20 messages, so two agents cannot keep
   talking without you. `cbox warden mail resume <thread>` allows 20 more.
 - **Limits:** 64 KB per message, 60 messages per project per hour.

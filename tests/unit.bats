@@ -4556,6 +4556,21 @@ SH
   [ "$(_cbox_warden_host_ip)" = "172.17.0.1" ]
 }
 
+@test "warden address: Apple's default network gateway, 192.168.64.1 when it cannot be read" {
+  unset CBOX_WARDEN_HOST; _CBOX_RUNTIME=apple
+  _CBOX_CMD=_fake_container
+  _fake_container() {
+    [[ "$*" == "network inspect default" ]] || return 1
+    echo '[{"id": "default", "status": {"ipv4Gateway": "192.168.65.1", "ipv4Subnet": "192.168.65.0/24"}}]'
+  }
+  [ "$(_cbox_warden_host_ip)" = "192.168.65.1" ]
+  # An older container CLI without networks, or garbage.
+  _fake_container() { return 1; }
+  [ "$(_cbox_warden_host_ip)" = "192.168.64.1" ]
+  _fake_container() { echo '[{"status": {"ipv4Gateway": "1.2.3.4; rm -rf /"}}]'; }
+  [ "$(_cbox_warden_host_ip)" = "192.168.64.1" ]
+}
+
 @test "warden address: CBOX_WARDEN_HOST wins" {
   _fake_ip "docker0 eth0"; export CBOX_WARDEN_HOST=10.0.0.9
   [ "$(_cbox_warden_host_ip)" = "10.0.0.9" ]

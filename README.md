@@ -237,7 +237,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_EGRESS_ALLOW` | *(unset)* | Hosts a safe container may reach besides the defaults, e.g. `"openrouter.ai *.example.com host:8443"` (see [Outbound traffic in safe mode](#outbound-traffic-in-safe-mode)). Applies from the next session |
 | `CBOX_MASK` | *(safe mode: secret files)* | Files and folders in the project the container sees empty (see [Hidden secret files](#hidden-secret-files)). Unset: the default list in safe mode, nothing in normal mode; once set, it applies to both modes; `""` = nothing. Applies to newly created containers: `cbox reset` |
 | `CBOX_PROTECT_GIT` | `1` | Mount the project's `.git/config` and `.git/hooks` read-only (see [Git safety](#git-safety-both-modes)); `0` = writable. Applies to newly created containers: `cbox reset` |
-| `CBOX_WARDEN_HOST` | `192.168.64.1` (Apple) / `docker0` IP (WSL without it: `eth0`) | Host address containers reach the broker on |
+| `CBOX_WARDEN_HOST` | Apple: the default network's gateway (usually `192.168.64.1`) / `docker0` IP (WSL without it: `eth0`) | Host address containers reach the broker on |
 | `CBOX_WARDEN_SECRET_CMD` | *(unset)* | Instead of the Keychain or keyring: command that prints the secret for an item name |
 
 > [!WARNING]

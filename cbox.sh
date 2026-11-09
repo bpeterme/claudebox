@@ -5129,7 +5129,7 @@ _cbox_warden_host_ip() {
   if [[ -n "${CBOX_WARDEN_HOST:-}" ]]; then
     echo "$CBOX_WARDEN_HOST"
   elif [[ "$_CBOX_RUNTIME" == "apple" ]]; then
-    echo "192.168.64.1"
+    _cbox_apple_gateway || echo "192.168.64.1"
   else
     _cbox_if_ip docker0 && return 0
     # Docker Desktop on WSL has no docker0 in the distro, but all WSL 2 distros
@@ -5138,6 +5138,16 @@ _cbox_warden_host_ip() {
     _cbox_on_wsl && _cbox_if_ip eth0 && return 0
     echo "172.17.0.1"
   fi
+}
+
+# The host's address on Apple's default container network. Usually
+# 192.168.64.1, but an update of container can recreate the network with
+# another subnet (e.g. 192.168.65.0/24), so it is read, not assumed.
+_cbox_apple_gateway() {
+  $_CBOX_CMD network inspect default 2>/dev/null | python3 -c '
+import json, sys
+print(json.load(sys.stdin)[0]["status"]["ipv4Gateway"])' 2>/dev/null |
+    grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
 }
 
 # IPv4 address of network interface $1, if it has one.

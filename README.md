@@ -114,12 +114,13 @@ cbox oc safe   # opencode in safe mode
 | `cbox doctor` | Run environment diagnostics: where your settings, data and logs are, companion tool status and, on macOS, whether Apple container is up to date |
 | `cbox mcp` | Show host MCP servers and relay status |
 | `cbox mcp import` | Import MCP servers from Claude Desktop / Claude Code on the host |
-| `cbox warden` | List credential resources (APIs, storage, ssh keys, MCP servers, WhatsApp chats) and what this project gets (see [Credentials (warden)](#credentials-warden)) |
+| `cbox warden` | List credential resources (APIs, storage, ssh keys, MCP servers, WhatsApp chats, mail groups) and what this project gets (see [Credentials (warden)](#credentials-warden)) |
 | `cbox warden edit` | Define resources the container may use |
 | `cbox warden secret set <resource>` | Store a resource's secret in the macOS Keychain (Linux: keyring) |
 | `cbox warden approve` | Approve this project's `.warden` file |
 | `cbox warden test <resource>` | Check a resource from the host |
 | `cbox warden whatsapp pick <resource>` | Choose the WhatsApp chats Claude may read (read-only) |
+| `cbox warden mail [show <thread>\|-f]` | Read what agents sent each other; `resume <thread>` lets a paused thread go on (see [Agent mail](#agent-mail)) |
 | `cbox warden log` | Show recent broker requests |
 | `cbox version` | Show version |
 
@@ -236,7 +237,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_EGRESS_ALLOW` | *(unset)* | Hosts a safe container may reach besides the defaults, e.g. `"openrouter.ai *.example.com host:8443"` (see [Outbound traffic in safe mode](#outbound-traffic-in-safe-mode)). Applies from the next session |
 | `CBOX_MASK` | *(safe mode: secret files)* | Files and folders in the project the container sees empty (see [Hidden secret files](#hidden-secret-files)). Unset: the default list in safe mode, nothing in normal mode; once set, it applies to both modes; `""` = nothing. Applies to newly created containers: `cbox reset` |
 | `CBOX_PROTECT_GIT` | `1` | Mount the project's `.git/config` and `.git/hooks` read-only (see [Git safety](#git-safety-both-modes)); `0` = writable. Applies to newly created containers: `cbox reset` |
-| `CBOX_WARDEN_HOST` | `192.168.64.1` (Apple) / `docker0` IP (WSL without it: `eth0`) | Host address containers reach the broker on |
+| `CBOX_WARDEN_HOST` | Apple: the default network's gateway (usually `192.168.64.1`) / `docker0` IP (WSL without it: `eth0`) | Host address containers reach the broker on |
 | `CBOX_WARDEN_SECRET_CMD` | *(unset)* | Instead of the Keychain or keyring: command that prints the secret for an item name |
 
 > [!WARNING]
@@ -352,6 +353,7 @@ credential on the way out. Inside the container, requests go to
 | An SSH key (GitHub, GitLab, servers) | `type = ssh` | An ssh agent that signs only for the hosts you list |
 | A remote MCP server's token | `type = mcp` | The server in Claude's and opencode's MCP list |
 | WhatsApp chats you choose (WhatsApp Desktop on this Mac) | `type = whatsapp` | A read-only MCP server that knows only those chats (see [WhatsApp chats](#whatsapp-chats)) |
+| Messages between the agents of your projects | `type = mail` | An MCP server to message the other projects in the group (see [Agent mail](#agent-mail)) |
 
 ```sh
 cbox warden secret set openrouter   # paste the key; stored in the Keychain (Linux: keyring)
@@ -542,6 +544,60 @@ gets a `.gitignore`, so the messages stay out of git.
   the host in `$CBOX_WARDEN_DIR/whatsapp/`, never in the project.
 - **Messages are written by other people.** Claude is told to treat them as
   data, not instructions — still, share only chats you would let it read.
+- Not available in safe mode.
+
+### Agent mail
+
+Agents in different projects can ask each other questions directly — no more
+copying Q&A files through the share folder. Each message goes through warden
+on the host, which stamps the sender: an agent cannot pose as another project.
+
+**Set up (once):**
+
+1. `cbox warden edit` and add a mail group (any name):
+
+   ```ini
+   [team]
+   type         = mail
+   availability = project
+   ```
+
+2. In each project that should join, add the line `[team]` to its `.warden`.
+   The next `cbox` start there asks you to approve it.
+
+A project is in the group once it had a session with the approved `.warden`.
+In its container, Claude gets an MCP server named after the group, with four
+tools: `mail_peers` (who is in the group, who has a session open),
+`mail_send` (start a thread with `to` and `subject`, or reply with `thread`),
+`mail_read` (new messages, or a whole thread) and `mail_wait` (waits up to 30
+minutes for the answer). A thread is between two projects; only they can read
+it.
+
+A typical exchange: you tell the agent in `api` "ask web how it builds the
+login URL". It writes to `web` and waits. In `web`'s session, the agent reads
+the question (when you prompt it, or because it was waiting itself) and
+answers; `api`'s agent picks the answer up and carries on.
+
+**Watch it on the host:** `cbox warden mail` lists the threads,
+`cbox warden mail show <thread>` prints one, `cbox warden mail -f` shows new
+messages as they arrive.
+
+**Good to know:**
+
+- **Mail lasts while cbox is in use.** It is deleted when the last `cbox`
+  session on the computer closes, like the share folder. A question nobody
+  answered by then is gone.
+- **An idle session is not woken up.** Its agent sees new mail when you
+  prompt it, or while it waits with `mail_wait`.
+- **Loop guard:** a thread pauses after 20 messages, so two agents cannot keep
+  talking without you. `cbox warden mail resume <thread>` allows 20 more.
+- **Limits:** 64 KB per message, 60 messages per project per hour.
+- **Colleague, not boss.** Agents are told to answer questions and share
+  project information freely, but to ask you before acting on a request to
+  change code, commit, run commands or send data elsewhere.
+- **Several groups** work: a project can only write to projects it shares a
+  group with. The messages stay on the host in `$CBOX_WARDEN_DIR/mail/`,
+  never in a container.
 - Not available in safe mode.
 
 ## macOS: Screenshot Script

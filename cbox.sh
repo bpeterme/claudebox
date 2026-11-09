@@ -145,8 +145,9 @@ CBOX_CLAUDE_DIR="${CBOX_CLAUDE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/
 CBOX_HOST_CONFIG_DIR="${CBOX_HOST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/.config}"
 CBOX_SHARE_DIR="${CBOX_SHARE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/claudebox/share}"
 # Playwright browser cache, mounted over the image's /opt/ms-playwright. Lives in
-# CBOX_DATA_DIR, not CBOX_SHARE_DIR: the share dir is wiped when the last session
-# closes, and these browsers are ~660 MB we never want to re-download.
+# CBOX_DATA_DIR, not CBOX_SHARE_DIR: the share dir is wiped when the last cbox
+# session on this host closes, and these browsers are ~660 MB we never want to
+# re-download.
 CBOX_PLAYWRIGHT_DIR="${CBOX_PLAYWRIGHT_DIR:-$CBOX_DATA_DIR/ms-playwright}"
 # Host MCP servers relayed into the container (see "MCP relay" below)
 CBOX_MCP_CONFIG="${CBOX_MCP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/claudebox/mcp.json}"
@@ -677,6 +678,29 @@ _cbox_session_end() {
   return $others
 }
 
+# Returns 0 if a live cbox session of any container remains on this host.
+# Host-wide resources (the share folder, PulseAudio) are released only when
+# this returns 1.
+_cbox_any_session_active() {
+  local f pid
+  while IFS= read -r f; do
+    pid="${f##*-}"
+    [[ "$pid" =~ ^[0-9]+$ ]] && ps -p "$pid" >/dev/null 2>&1 && return 0
+  done < <(find "$_CBOX_SESSION_DIR" -maxdepth 1 -name '.cbox-active-*' 2>/dev/null)
+  return 1
+}
+
+# Empties the share folder, which every container mounts. Skipped while any
+# cbox session (of any container) is still open, so files handed from one
+# repo to another survive until the last session on this host closes. Only
+# touches folders under the cache dir or /tmp, never a custom location.
+_cbox_share_clear() {
+  local _cache_base="${XDG_CACHE_HOME:-$HOME/.cache}"
+  [[ -n "$CBOX_SHARE_DIR" && ( "$CBOX_SHARE_DIR" == /tmp/* || "$CBOX_SHARE_DIR" == "$_cache_base"/* ) ]] || return 0
+  _cbox_any_session_active && return 0
+  find "$CBOX_SHARE_DIR" -mindepth 1 -delete 2>/dev/null || true
+}
+
 # Prints this container's marker paths. Uses find instead of a shell glob:
 # zsh aborts the whole calling function on a glob with no matches, and
 # compgen is bash-only. Filters out markers of containers whose name merely
@@ -785,14 +809,11 @@ _cbox_audio_start() {
 
 # Stops PulseAudio if cbox started it and no cbox session is left anywhere.
 _cbox_audio_stop() {
-  local dir f pid
+  local dir
   dir="$(_cbox_audio_socket)"
   dir="${dir%/*}"
   [[ -f "$dir/started-by-cbox" ]] || return 0
-  while IFS= read -r f; do
-    pid="${f##*-}"
-    [[ "$pid" =~ ^[0-9]+$ ]] && ps -p "$pid" >/dev/null 2>&1 && return 0
-  done < <(find "$_CBOX_SESSION_DIR" -maxdepth 1 -name '.cbox-active-*' 2>/dev/null)
+  _cbox_any_session_active && return 0
   echo "Stopping PulseAudio..."
   pulseaudio --kill 2>/dev/null || true
   rm -f "$dir/started-by-cbox"
@@ -5921,10 +5942,7 @@ _cbox_enter() {
     _cbox_warden_end "$name"
     _cbox_git_guard_check "$name" || true
     (( _audio )) && _cbox_audio_stop
-    local _cache_base="${XDG_CACHE_HOME:-$HOME/.cache}"
-    [[ -n "$CBOX_SHARE_DIR" && ( "$CBOX_SHARE_DIR" == /tmp/* || "$CBOX_SHARE_DIR" == "$_cache_base"/* ) ]] && \
-      find "$CBOX_SHARE_DIR" -mindepth 1 -delete 2>/dev/null || true
-    unset _cache_base
+    _cbox_share_clear
   fi
   _cbox_busy_end
 }

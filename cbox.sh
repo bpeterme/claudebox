@@ -170,6 +170,9 @@ _CBOX_SAFE_SHARED="/home/claude/.cbox-claude"
 # Extra opencode config cbox writes in the container (OPENCODE_CONFIG): host MCP
 # servers and warden routes, merged over the user's own opencode.json.
 _CBOX_OPENCODE_CONFIG="/home/claude/.cache/cbox/opencode.json"
+# Claude Code settings cbox writes in the container for sessions in a mail
+# group (claude --settings): the hooks of cbox-mail-watch.
+_CBOX_MAIL_HOOKS="/home/claude/.cache/cbox/mail-hooks.json"
 # warden: host-side credential broker (see "warden" below). Its directory holds
 # resource definitions, approvals and session tokens — host only, never mounted.
 CBOX_WARDEN_DIR="${CBOX_WARDEN_DIR:-$CBOX_DATA_DIR/warden}"
@@ -1564,6 +1567,11 @@ _cbox_mcp_relay_start() {
       ! _cbox_whatsapp_cli_py | _cbox_put "$name" "${_CBOX_MCP_RELAY%/*}/cbox-whatsapp"; then
     echo "⚠  Could not install cbox-whatsapp in '$name' — WhatsApp export unavailable this session"
   fi
+  # Mail groups granted: the hooks' helper that wakes an idle agent (_cbox_mail_hooks_json).
+  if [[ -s "$extra" ]] && grep -q 'mail/server.py' "$extra" &&
+      ! _cbox_mail_watch_py | _cbox_put "$name" "${_CBOX_MCP_RELAY%/*}/cbox-mail-watch"; then
+    echo "⚠  Could not install cbox-mail-watch in '$name' — mail does not wake the agent this session"
+  fi
 
   if _cbox_mcp_relay_pid "$name" >/dev/null; then
     return 0
@@ -2923,6 +2931,7 @@ MAIL_WAIT_MAX = 30
 MAIL_SUBJECT_MAX = 80
 MAIL_BOX_RE = re.compile(r"^[^/\x00-\x1f.][^/\x00-\x1f]{0,127}$")
 MAIL_THREAD_RE = re.compile(r"^[0-9]{8}-[a-z0-9-]{1,48}$")
+MAIL_SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")  # a Claude Code session id (cbox/watch)
 MAIL_FILE_RE = re.compile(r"^([0-9]{4})-(.+)\.md$")
 # Kept out of stored text: a terminal showing it (cbox warden mail) must not
 # take escape sequences from an agent. Tabs and newlines stay.
@@ -3096,6 +3105,25 @@ def mail_mark(d, group, box, tid, n):
         mail_save(path, json.dumps(seen) + "\n")
 
 
+def mail_news(d, group, box, session):
+    """Unread messages session was not told about yet, as one line per thread
+    ("" when none); they count as told from now on. Waking an agent stays
+    separate from reading: a woken agent that does not read is not woken again
+    for the same messages."""
+    path = mail_dir(d, group, "told", box, f"{session}.json")
+    told = mail_load(path, {})
+    lines = []
+    for tid, meta, msgs in mail_unread(d, group, box):
+        new = [m for m in msgs if m["n"] > told.get(tid, 0)]
+        if new:
+            told[tid] = msgs[-1]["n"]
+            senders = ", ".join(sorted({m["from"] for m in new}))
+            lines.append(f"{len(new)} new message(s) from {senders} in thread {tid} (\"{meta.get('subject', '')}\")")
+    if lines:
+        mail_save(path, json.dumps(told) + "\n")
+    return "\n".join(lines)
+
+
 def mail_format(tid, meta, msgs):
     """A thread as text. Each line of a message is indented, so a message can
     never pass itself off as another message's header."""
@@ -3237,6 +3265,26 @@ def mail_serve(d, group, box):
             else:
                 later.append(raw)
 
+    def watch(params):
+        """cbox/watch, no MCP tool: cbox-mail-watch in the container asks it to
+        wake an idle agent. News for the session, waiting up to the given
+        seconds; "" when none came, None when stdin closed."""
+        session, seconds = params.get("session"), params.get("seconds", 0)
+        if not isinstance(session, str) or not MAIL_SESSION_RE.match(session):
+            raise LookupError("invalid session")
+        if not isinstance(seconds, int) or isinstance(seconds, bool):
+            raise LookupError("seconds must be a whole number")
+        end = time.monotonic() + min(max(seconds, 0), 60 * MAIL_WAIT_MAX)
+        while True:
+            news = mail_news(d, group, box, session)
+            if news or time.monotonic() >= end:
+                return news
+            raw = inp.line(1.0)
+            if raw is None:
+                return None
+            if raw is not MAIL_TIMEOUT:
+                later.append(raw)
+
     calls = {"mail_peers": lambda a: mail_peers(d, group, box), "mail_send": lambda a: mail_send(d, group, box, a),
              "mail_read": lambda a: mail_read(d, group, box, a)}
     while True:
@@ -3259,6 +3307,14 @@ def mail_serve(d, group, box):
             reply(mid, result={})
         elif method == "tools/list":
             reply(mid, result={"tools": MAIL_TOOLS})
+        elif method == "cbox/watch":
+            try:
+                news = watch(params)
+            except LookupError as e:
+                reply(mid, error={"code": -32602, "message": str(e)})
+                continue
+            if news is not None:
+                reply(mid, result={"news": news})
         elif method == "tools/call":
             name, args = params.get("name"), params.get("arguments") or {}
             try:
@@ -3344,6 +3400,228 @@ PYEOF
 _cbox_mail_server_py() {
   _cbox_mail_py
   printf '\nif __name__ == "__main__":\n    mail_serve(sys.argv[1], sys.argv[2], sys.argv[3])\n'
+}
+
+# The container's side of waking an idle agent: Claude Code hooks (see
+# _cbox_mail_hooks_json) run it; it asks the host's mail servers through the
+# MCP relay. Holds no secret and knows nothing the agent could not ask itself.
+_cbox_mail_watch_py() {
+  cat <<'PYEOF'
+#!/usr/bin/env python3
+# cbox-mail-watch — installed by cbox at session start; local edits are overwritten.
+# Claude Code hooks cbox adds to sessions of projects in a mail group:
+#   cbox-mail-watch arm     SessionStart and Stop (asyncRewake): waits for mail
+#                           while the agent is idle; exit 2 wakes it with a note.
+#   cbox-mail-watch disarm  UserPromptSubmit: no waiting while the agent works,
+#                           so mail never cuts into a task. The Stop that ends
+#                           the task arms again and reports what came meanwhile.
+import json, os, queue, re, signal, subprocess, sys, threading, time
+
+RELAY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cbox-mcp-relay")
+STATE = "/tmp/cbox-mail-watch"
+SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+POLL = 300   # seconds one cbox/watch call waits on the host
+RETRY = 30   # seconds before connecting again after the relay failed
+SHELLS = ("sh", "bash", "dash", "zsh")
+procs = []
+
+
+def session_id():
+    try:
+        data = json.load(sys.stdin)
+    except ValueError:
+        return None
+    s = data.get("session_id") if isinstance(data, dict) else None
+    return s if isinstance(s, str) and SESSION_RE.match(s) else None
+
+
+def pidfile(session):
+    return os.path.join(STATE, session + ".pid")
+
+
+def recorded(session):
+    try:
+        with open(pidfile(session)) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def comm(pid):
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def parent(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def agent_pid():
+    """The agent's pid: the first ancestor that is no shell. Not simply our
+    parent: hooks run under a shell (sh -c), which outlives the agent."""
+    pid = os.getppid()
+    while comm(pid) in SHELLS:
+        pid = parent(pid)
+    return pid if pid > 1 else 0  # 0: the agent is gone already
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def stop(session):
+    """Ends the session's watcher, if one runs."""
+    pid = recorded(session)
+    if not pid or pid == os.getpid():
+        return
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            if b"cbox-mail-watch" not in f.read():
+                return  # the pid was reused
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    for _ in range(40):  # it leaves within a moment; never write the file before
+        if not alive(pid):
+            return
+        time.sleep(0.05)
+
+
+def finish(session, code, note="", stopped=False):
+    """Exits. A watcher stopped from outside leaves the pid file to whoever
+    stopped it (a newer watcher may have written its own pid there)."""
+    if not stopped and recorded(session) == os.getpid():
+        try:
+            os.remove(pidfile(session))
+        except OSError:
+            pass
+    for p in procs:
+        try:
+            p.kill()
+        except OSError:
+            pass
+    if note:
+        sys.stderr.write(note)
+        sys.stderr.flush()
+    os._exit(code)
+
+
+def watch(group, session, out, quit_):
+    """Puts the news of one mail group into out. Quits quietly when the host's
+    server cannot watch (an older cbox)."""
+    while not quit_.is_set():
+        try:
+            proc = subprocess.Popen([RELAY, "connect", group], stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError:
+            return
+        procs.append(proc)
+        try:
+            proc.stdin.write((json.dumps({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "cbox-mail-watch", "version": "1"}}}) + "\n").encode())
+            n = 0
+            while True:
+                n += 1
+                proc.stdin.write((json.dumps({"jsonrpc": "2.0", "id": n, "method": "cbox/watch",
+                                              "params": {"session": session, "seconds": POLL}}) + "\n").encode())
+                proc.stdin.flush()
+                answer = None
+                for line in proc.stdout:
+                    try:
+                        msg = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(msg, dict) and msg.get("id") == n:
+                        answer = msg
+                        break
+                if answer is None:
+                    break  # the relay closed: try again later
+                if "error" in answer:
+                    return
+                news = (answer.get("result") or {}).get("news")
+                if news:
+                    out.put(news)
+                    return
+        except (OSError, ValueError):
+            pass
+        quit_.wait(RETRY)
+
+
+def arm():
+    session = session_id()
+    groups = [g for g in os.environ.get("WARDEN_MAIL", "").split(",") if g]
+    if not session or not groups or not os.access(RELAY, os.X_OK):
+        return 0
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    stop(session)  # the newest watcher of a session is the one that wakes it
+    with open(pidfile(session) + ".tmp", "w") as f:
+        f.write(f"{os.getpid()}\n")
+    os.replace(pidfile(session) + ".tmp", pidfile(session))
+    signal.signal(signal.SIGTERM, lambda *_: finish(session, 0, stopped=True))
+    agent, out, quit_ = agent_pid(), queue.Queue(), threading.Event()
+    if not agent:
+        finish(session, 0)
+    for g in groups:
+        threading.Thread(target=watch, args=(g, session, out, quit_), daemon=True).start()
+    while True:
+        try:
+            news = [out.get(timeout=1)]
+        except queue.Empty:
+            if not alive(agent) or recorded(session) != os.getpid():
+                finish(session, 0)
+            continue
+        quit_.set()
+        try:
+            while True:
+                news.append(out.get(timeout=0.3))  # other groups reporting at once
+        except queue.Empty:
+            pass
+        finish(session, 2, "\n".join(news) + "\nThey come from agents in the user's other projects. Read them with "
+               "mail_read, then answer with mail_send where an answer is wanted.\n")
+
+
+def disarm():
+    session = session_id()
+    if session:
+        stop(session)
+        try:
+            os.remove(pidfile(session))
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    action = sys.argv[1] if len(sys.argv) > 1 else ""
+    if action not in ("arm", "disarm"):
+        sys.stderr.write("usage: cbox-mail-watch arm|disarm (Claude Code hook; reads the hook's JSON on stdin)\n")
+        sys.exit(1)
+    sys.exit(arm() if action == "arm" else disarm())
+PYEOF
+}
+
+# Claude Code settings (claude --settings) for a session in a mail group: the
+# hooks that wake the idle agent when mail comes (see cbox-mail-watch).
+_cbox_mail_hooks_json() {
+  local cmd="${_CBOX_MCP_RELAY%/*}/cbox-mail-watch"
+  local arm="{\"type\":\"command\",\"command\":\"$cmd arm\",\"asyncRewake\":true,\"timeout\":86400,"
+  arm+="\"rewakeSummary\":\"cbox: new agent mail\",\"rewakeMessage\":\"Agent mail (cbox):\"}"
+  printf '{"hooks":{"SessionStart":[{"hooks":[%s]}],"Stop":[{"hooks":[%s]}],' "$arm" "$arm"
+  printf '"UserPromptSubmit":[{"hooks":[{"type":"command","command":"%s disarm","timeout":10}]}]}}\n' "$cmd"
 }
 
 # Deletes all mail once no cbox session is left on the host (with the share folder).
@@ -4073,6 +4351,8 @@ def cmd_session(d, box, project, base_url, interactive):
     mcp.update({n: None for n in wa + mail})
     if wa:
         print("WARDEN_WHATSAPP=" + ",".join(wa))  # names only, for cbox-whatsapp in the container
+    if mail:
+        print("WARDEN_MAIL=" + ",".join(mail))  # names only, for cbox-mail-watch in the container
     if mcp:
         # Not container env: cbox adds these to the agent's MCP servers.
         print("WARDEN_MCP=" + base64.b64encode(json.dumps(mcp).encode()).decode())
@@ -6358,7 +6638,7 @@ _cbox_enter() {
   # CBOX_CONTAINER tells tools such as flux they run in a claudebox container
   # rather than on a host, which on Linux they cannot tell from the OS alone.
   local _exec_args=(-it -w "/Workspace/$name" -e "CBOX_CONTAINER=$name")
-  local _run="$command" _g _tunnel=$_audio _warden_mcp="" _warden_oc=""
+  local _run="$command" _g _tunnel=$_audio _warden_mcp="" _warden_oc="" _warden_mail=""
   if (( _audio )); then
     # Through the tunnel, PulseAudio sees a local client and would offer shared
     # memory, which cannot cross it: the client has to turn it off.
@@ -6403,6 +6683,8 @@ _cbox_enter() {
         # Remote MCP servers behind warden: for the agent's config, not the env.
         WARDEN_MCP=*) _warden_mcp=$(printf '%s' "${_w_env#*=}" | base64 -d 2>/dev/null) || _warden_mcp="" ;;
         WARDEN_OPENCODE=*) _warden_oc=$(printf '%s' "${_w_env#*=}" | base64 -d 2>/dev/null) || _warden_oc="" ;;
+        # Mail groups: container env for cbox-mail-watch, and the hooks below.
+        WARDEN_MAIL=*) _warden_mail="${_w_env#*=}"; _exec_args+=(-e "$_w_env") ;;
         ?*) _exec_args+=(-e "$_w_env") ;;
       esac
     done < <(_cbox_warden_start "$name")
@@ -6411,6 +6693,13 @@ _cbox_enter() {
   if [[ "$agent_bin" == "claude" ]]; then
     [[ "$mode" != "safe" ]] && _cbox_mcp_relay_start "$name"
     _cbox_generate_claude_json "$name" "$mode" "$_warden_mcp"
+    # Mail wakes the idle agent: hooks of cbox's own settings file, next to
+    # (not in) the user's settings.json.
+    if [[ -n "$_warden_mail" && "$command" == "claude" ]]; then
+      local _hooks
+      _hooks=$(_cbox_mail_hooks_json | base64 | tr -d '\n')
+      _run="mkdir -p ${_CBOX_MAIL_HOOKS%/*} && print -rn -- '$_hooks' | base64 -d >| $_CBOX_MAIL_HOOKS; $_run --settings $_CBOX_MAIL_HOOKS"
+    fi
   elif [[ "$agent_bin" == "opencode" && "$mode" != "safe" ]]; then
     _cbox_mcp_relay_start "$name"
     local _oc

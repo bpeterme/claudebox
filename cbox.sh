@@ -4936,11 +4936,15 @@ _cbox_safe_claude_dir() {
     [[ -L "$dir/$base" && "$(readlink "$dir/$base")" == "$want" ]] && continue
     rm -rf "${dir:?}/$base"
     ln -s "$want" "$dir/$base"
-  done < <(find "$src" -mindepth 1 -maxdepth 1 ! -name .credentials.json ! -name .git 2>/dev/null)
+  done < <(find "$src" -mindepth 1 -maxdepth 1 ! -name .credentials.json ! -name .git ! -name sessions 2>/dev/null)
   # Links to entries the shared folder no longer has.
   while IFS= read -r e; do
     [[ "$(readlink "$e")" == "$_CBOX_SAFE_SHARED/"* && ! -e "$src/${e##*/}" ]] && rm -f "$e"
   done < <(find "$dir" -mindepth 1 -maxdepth 1 -type l)
+  # The session registry is the container's own (see "sessions" in _cbox_create);
+  # an older cbox linked it to the read-only shared one.
+  [[ -L "$dir/sessions" ]] && rm -f "$dir/sessions"
+  mkdir -p -m 700 "$dir/sessions"
 
   local s="$src/.credentials.json" l="$dir/.credentials.json"
   [[ -L "$s" || -L "$l" ]] && return 0  # Claude Code would not open it anyway
@@ -5339,8 +5343,16 @@ _cbox_create() {
       unset _f _fname _key
     fi
     mkdir -p "$CBOX_SHARE_DIR"
+    # sessions: Claude Code's registry of running sessions, one <pid>.json
+    # each. It assumes one pid space per folder, but every container counts
+    # pids from 1 and has the image's /etc/machine-id: in a shared folder,
+    # sessions of different containers overwrite and delete each other's
+    # records. So each container has its own. (The mount point is made here,
+    # or the runtime would make it, root-owned on Linux.)
+    mkdir -p -m 700 "$CBOX_DATA_DIR/sessions/$name" "$CBOX_CLAUDE_DIR/sessions"
     args+=(
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude"
+      -v "$CBOX_DATA_DIR/sessions/$name:/home/claude/.claude/sessions"
       -v "$CBOX_SHARE_DIR:/home/claude/share"
       -v "$CBOX_PLAYWRIGHT_DIR:/opt/ms-playwright"
     )

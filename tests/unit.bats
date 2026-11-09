@@ -2320,7 +2320,7 @@ _guard_repo() {
   grep -qx "$CBOX_HOST_CONFIG_DIR/.git:/home/claude/.config/.git:ro" "$capture"
   rm -rf "$CBOX_CLAUDE_DIR/.git" "$CBOX_HOST_CONFIG_DIR/.git"
   rm -f "$capture"; _cbox_create "cgit" "normal"
-  run grep -c '/.git:/home/claude' "$capture"
+  run grep -cF '/.git:/home/claude' "$capture"
   [ "$output" = "0" ]
 }
 
@@ -3290,6 +3290,35 @@ _safe_setup() {
   mkdir -p "$SD"; echo 'first' > "$SD/.credentials.json"
   _cbox_safe_claude_dir sbox
   [ "$SD/.credentials.json" -ef "$CBOX_CLAUDE_DIR/.credentials.json" ]
+}
+
+@test "_cbox_safe_claude_dir: the session registry is the container's own, also after an older cbox" {
+  _safe_setup
+  mkdir -p "$CBOX_CLAUDE_DIR/sessions"
+  mkdir -p "$SD"; ln -s /home/claude/.cbox-claude/sessions "$SD/sessions"
+  _cbox_safe_claude_dir sbox
+  [ -d "$SD/sessions" ]
+  [ ! -L "$SD/sessions" ]
+  touch "$SD/sessions/20.json"
+  _cbox_safe_claude_dir sbox
+  [ -f "$SD/sessions/20.json" ]
+}
+
+@test "_cbox_create: normal mode gives each container its own session registry" {
+  local capture="$BATS_TMPDIR/create-sessions"
+  cd "$BATS_TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  rm -rf "$CBOX_CLAUDE_DIR/sessions" "$CBOX_DATA_DIR/sessions"
+  rm -f "$capture"; _cbox_create "sesbox" "normal"
+  grep -qx "$CBOX_DATA_DIR/sessions/sesbox:/home/claude/.claude/sessions" "$capture"
+  [ -d "$CBOX_DATA_DIR/sessions/sesbox" ]
+  [ -d "$CBOX_CLAUDE_DIR/sessions" ]
+  # Mounted after the Claude folder it sits in.
+  run grep -nx "$CBOX_CLAUDE_DIR:/home/claude/.claude" "$capture"
+  local claude_line=${output%%:*}
+  run grep -nx "$CBOX_DATA_DIR/sessions/sesbox:/home/claude/.claude/sessions" "$capture"
+  (( claude_line < ${output%%:*} ))
 }
 
 @test "_cbox_create: safe mode mounts the shared Claude folder read-only and its own ~/.claude" {

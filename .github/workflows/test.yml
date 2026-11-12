@@ -6,12 +6,18 @@ on:
   pull_request:
     branches: [main]
 
+# Tests only read the repository.
+permissions:
+  contents: read
+
 jobs:
   shellcheck:
     name: Shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Install shellcheck
         run: sudo apt-get install -y shellcheck
       - name: Run shellcheck
@@ -21,7 +27,9 @@ jobs:
     name: Unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Install bats and zsh (completion tests)
         run: sudo apt-get install -y bats zsh
       - name: Run unit tests
@@ -37,7 +45,9 @@ jobs:
     # a runner for 6 hours.
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Install bats
         run: brew install bats-core
       # The runner image puts Homebrew's bash 5 first on PATH. Put the
@@ -78,7 +88,9 @@ jobs:
     name: Integration tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Install bats
         run: sudo apt-get install -y bats
       - name: Run integration tests

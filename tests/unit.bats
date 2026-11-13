@@ -4692,7 +4692,9 @@ SH
   printf 'FROM claudebox:latest\nRUN true\n' > "$MINE/Dockerfile"
   run _cbox_additions_dockerfile
   [ "$status" -eq 0 ]
-  [ "$output" = "$MINE/Dockerfile" ]
+  # macOS file systems ignore case: there the file is also found as "dockerfile".
+  [ "$output" = "$MINE/Dockerfile" ] || [ "$output" = "$MINE/dockerfile" ]
+  [ -f "$output" ]
   rm "$MINE/Dockerfile"; printf 'from --platform=linux/arm64 claudebox AS mine\n' > "$MINE/dockerfile"
   run _cbox_additions_dockerfile
   [ "$status" -eq 0 ]

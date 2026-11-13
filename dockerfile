@@ -1,5 +1,9 @@
 FROM ubuntu:26.04
 
+# cbox removes old images of its own after a rebuild (and at cbox prune) by
+# this label, so it never touches other images on the machine.
+LABEL cbox.image=true
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \
@@ -27,6 +31,19 @@ RUN apt-get update && apt-get install -y \
     libsox-fmt-pulse \
     pulseaudio-utils \
     libasound2-plugins
+
+# git-crypt writes its own absolute path into .git/config at `git-crypt init`
+# (e.g. /opt/homebrew/bin/git-crypt on a Mac). That config is shared with the
+# host and read-only in here, so point git at the container's git-crypt instead.
+# Environment config outranks the repository's own config, whatever host path
+# it names, and only takes effect in repos whose .gitattributes use the filter.
+ENV GIT_CONFIG_COUNT=3 \
+    GIT_CONFIG_KEY_0=filter.git-crypt.smudge \
+    GIT_CONFIG_VALUE_0="git-crypt smudge" \
+    GIT_CONFIG_KEY_1=filter.git-crypt.clean \
+    GIT_CONFIG_VALUE_1="git-crypt clean" \
+    GIT_CONFIG_KEY_2=diff.git-crypt.textconv \
+    GIT_CONFIG_VALUE_2="git-crypt diff"
 
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs

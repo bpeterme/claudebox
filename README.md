@@ -102,9 +102,9 @@ cbox oc safe   # opencode in safe mode
 |---------|-------------|
 | `cbox stop` | Stop the current project's container |
 | `cbox reset [<name>]` | Remove the current project's container (or a named container) |
-| `cbox rebuild` | Rebuild the container image |
+| `cbox rebuild` | Rebuild the container image; also remove the old images earlier rebuilds left behind (Docker: only cbox's; Apple's runtime: every image without a name) |
 | `cbox list` | List all cbox containers |
-| `cbox prune` | Remove all stopped cbox containers; on macOS also reclaim unused disk space in running ones |
+| `cbox prune` | Remove all stopped cbox containers; on macOS also reclaim unused disk space in running ones, and old images no container uses any more, as `cbox rebuild` does |
 
 **Maintenance**
 
@@ -207,6 +207,7 @@ git on your host runs commands that a repository names: hooks in `.git/hooks`, a
 
 - **Read-only:** the project's `.git/config` and `.git/hooks` are mounted read-only. Git commands that write the config fail inside the container (`git remote add`, `git config`, the upstream part of `git push -u`); run them on the host. A config change made on the Mac may only show up in the container after its next start. `CBOX_PROTECT_GIT=0` turns this off.
 - **Check at the end:** when the last session of a container ends, cbox looks for git settings that run commands and were not there at the start: in nested repositories, submodules, worktrees, or a replaced `.git`. It names each one with its location and offers to put `.git/config` and `.git/hooks` back as they were (the changed files are kept in `$CBOX_DATA_DIR/git-guard/`). Repositories cloned in the container without such settings are not reported.
+- **git-crypt:** `git-crypt init` writes its own path into `.git/config` (on a Mac `/opt/homebrew/bin/git-crypt`), which does not exist in the container. The image overrides the git-crypt filter through git's environment config, so git uses the container's `git-crypt` and `.git/config` stays as the host needs it.
 - **Claude and config folders:** if the folder mounted as `~/.claude` or `~/.config` is a git repository (e.g. claudedot's sync repo), its whole `.git` is read-only in the container, because claudedot runs git there on the host.
 
 ## Configuration
@@ -226,8 +227,8 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_SHARE_DIR` | `~/.cache/claudebox/share` | Share folder, mounted as `~/share` in container; cleared when the last cbox session on this Mac closes (read-write) |
 | `CBOX_PLAYWRIGHT_DIR` | `$CBOX_DATA_DIR/ms-playwright` | Playwright browser cache, mounted as `/opt/ms-playwright` (read-write; read-only in safe mode). Shared by all projects, kept across resets and rebuilds |
 | `CBOX_SSH_DIR` | *(unset)* | SSH dir to mount as `~/.ssh` in container (normal mode, **read-only**); unset = no SSH mount. With a warden ssh resource, only `config`, `known_hosts` and `*.pub` are mounted |
-| `CBOX_ZSHRC` | *(unset)* | `.zshrc` to source as `~/.zshrc.global` inside the container (**read-only**); unset = none |
-| `CBOX_BUILD_DIR` | cbox.sh directory | Build context for `cbox rebuild` |
+| `CBOX_ZSHRC` | *(unset)* | `.zshrc` to source as `~/.zshrc.global` inside the container (**read-only**); unset = none. The container also sources `~/.zshrc.local`, but that file lives in the container only: `cbox reset` (a new container) removes it, so use it for temporary tweaks |
+| `CBOX_BUILD_DIR` | cbox.sh directory | Folder with the dockerfile for `cbox rebuild`; a dockerfile starting `FROM claudebox` adds to claudebox's (see [Your own additions](#your-own-additions-to-the-image)) |
 | `BUILD_PLAYWRIGHT` | `0` | Set to `1` to bake Playwright + Chromium into the image on the next `cbox rebuild` (or pass it inline). Decides whether the browser download happens at build time or on first use |
 | `CBOX_AUDIO` | *(unset)* | Set to `1` to enable Claude Code voice mode (requires PulseAudio on host) |
 | `CBOX_MCP_CONFIG` | `~/.config/claudebox/mcp.json` | MCP servers that run on the host and are relayed into the container (see [Host MCP Servers](#host-mcp-servers)) |
@@ -247,7 +248,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 
 ## Container Image
 
-The image is based on Ubuntu 24.04 and includes:
+The image is based on Ubuntu 26.04 and includes:
 
 - Node.js 22, Claude Code, opencode
 - Python 3, [uv](https://github.com/astral-sh/uv)
@@ -261,6 +262,20 @@ The image is based on Ubuntu 24.04 and includes:
   and survive `cbox reset`, `cbox prune` and image rebuilds
 
 The container user is `claude` (UID matches your host UID to avoid permission issues on mounted volumes).
+
+### Your own additions to the image
+
+Keep a dockerfile with only your changes and let cbox put it on top of claudebox's:
+
+```dockerfile
+FROM claudebox
+
+USER root
+RUN apt-get update && apt-get install -y tmux
+USER claude
+```
+
+Point `CBOX_BUILD_DIR` in `cbox.env` at its folder and run `cbox rebuild`. cbox appends your file (without its `FROM` line) to claudebox's own dockerfile and builds both as one image, with your folder as the build context. Updates to claudebox's image reach yours at the next rebuild, with no copy to keep in step. claudebox's dockerfile ends as `USER claude` in `/Workspace`, so switch to `root` only where needed and back at the end. A dockerfile in `CBOX_BUILD_DIR` that starts from anything else is built as it is.
 
 ## Host MCP Servers
 

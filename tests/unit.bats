@@ -2141,6 +2141,25 @@ SH
   [[ "$output" == *"ENV UV_PROJECT_ENVIRONMENT=.venv-linux" ]]
 }
 
+# git-crypt init on the Mac writes /opt/homebrew/bin/git-crypt into the shared,
+# read-only .git/config. The image's environment config must win over it.
+@test "dockerfile: git-crypt filter uses the container's git-crypt, not the host path in .git/config" {
+  local dockerfile="$BATS_TEST_DIRNAME/../dockerfile" env_block
+  env_block=$(sed -n '/^ENV GIT_CONFIG_COUNT=/,/[^\\]$/p' "$dockerfile" | sed 's/^ENV //; s/\\$//')
+  [ -n "$env_block" ]
+  eval "export $(tr '\n' ' ' <<<"$env_block")"
+
+  local repo="$BATS_TMPDIR/gitcrypt-repo"
+  rm -rf "$repo"; git init -q "$repo"
+  git -C "$repo" config filter.git-crypt.smudge '"/opt/homebrew/bin/git-crypt" smudge'
+  git -C "$repo" config filter.git-crypt.clean '"/opt/homebrew/bin/git-crypt" clean'
+  git -C "$repo" config diff.git-crypt.textconv '"/opt/homebrew/bin/git-crypt" diff'
+
+  [ "$(git -C "$repo" config filter.git-crypt.smudge)" = "git-crypt smudge" ]
+  [ "$(git -C "$repo" config filter.git-crypt.clean)" = "git-crypt clean" ]
+  [ "$(git -C "$repo" config diff.git-crypt.textconv)" = "git-crypt diff" ]
+}
+
 # ---------------------------------------------------------------------------
 # git guard: read-only .git/config and .git/hooks, session-end check
 # ---------------------------------------------------------------------------

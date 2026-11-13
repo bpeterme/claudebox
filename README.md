@@ -207,6 +207,7 @@ git on your host runs commands that a repository names: hooks in `.git/hooks`, a
 
 - **Read-only:** the project's `.git/config` and `.git/hooks` are mounted read-only. Git commands that write the config fail inside the container (`git remote add`, `git config`, the upstream part of `git push -u`); run them on the host. A config change made on the Mac may only show up in the container after its next start. `CBOX_PROTECT_GIT=0` turns this off.
 - **Check at the end:** when the last session of a container ends, cbox looks for git settings that run commands and were not there at the start: in nested repositories, submodules, worktrees, or a replaced `.git`. It names each one with its location and offers to put `.git/config` and `.git/hooks` back as they were (the changed files are kept in `$CBOX_DATA_DIR/git-guard/`). Repositories cloned in the container without such settings are not reported.
+- **git-crypt:** `git-crypt init` writes its own path into `.git/config` (on a Mac `/opt/homebrew/bin/git-crypt`), which does not exist in the container. The image overrides the git-crypt filter through git's environment config, so git uses the container's `git-crypt` and `.git/config` stays as the host needs it.
 - **Claude and config folders:** if the folder mounted as `~/.claude` or `~/.config` is a git repository (e.g. claudedot's sync repo), its whole `.git` is read-only in the container, because claudedot runs git there on the host.
 
 ## Configuration
@@ -226,7 +227,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_SHARE_DIR` | `~/.cache/claudebox/share` | Share folder, mounted as `~/share` in container; cleared when the last cbox session on this Mac closes (read-write) |
 | `CBOX_PLAYWRIGHT_DIR` | `$CBOX_DATA_DIR/ms-playwright` | Playwright browser cache, mounted as `/opt/ms-playwright` (read-write; read-only in safe mode). Shared by all projects, kept across resets and rebuilds |
 | `CBOX_SSH_DIR` | *(unset)* | SSH dir to mount as `~/.ssh` in container (normal mode, **read-only**); unset = no SSH mount. With a warden ssh resource, only `config`, `known_hosts` and `*.pub` are mounted |
-| `CBOX_ZSHRC` | *(unset)* | `.zshrc` to source as `~/.zshrc.global` inside the container (**read-only**); unset = none |
+| `CBOX_ZSHRC` | *(unset)* | `.zshrc` to source as `~/.zshrc.global` inside the container (**read-only**); unset = none. The container also sources `~/.zshrc.local`, but that file lives in the container only: `cbox rebuild` and `cbox reset` remove it, so use it for temporary tweaks |
 | `CBOX_BUILD_DIR` | cbox.sh directory | Build context for `cbox rebuild` |
 | `BUILD_PLAYWRIGHT` | `0` | Set to `1` to bake Playwright + Chromium into the image on the next `cbox rebuild` (or pass it inline). Decides whether the browser download happens at build time or on first use |
 | `CBOX_AUDIO` | *(unset)* | Set to `1` to enable Claude Code voice mode (requires PulseAudio on host) |

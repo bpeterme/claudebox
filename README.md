@@ -228,7 +228,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_PLAYWRIGHT_DIR` | `$CBOX_DATA_DIR/ms-playwright` | Playwright browser cache, mounted as `/opt/ms-playwright` (read-write; read-only in safe mode). Shared by all projects, kept across resets and rebuilds |
 | `CBOX_SSH_DIR` | *(unset)* | SSH dir to mount as `~/.ssh` in container (normal mode, **read-only**); unset = no SSH mount. With a warden ssh resource, only `config`, `known_hosts` and `*.pub` are mounted |
 | `CBOX_ZSHRC` | *(unset)* | `.zshrc` to source as `~/.zshrc.global` inside the container (**read-only**); unset = none. The container also sources `~/.zshrc.local`, but that file lives in the container only: `cbox reset` (a new container) removes it, so use it for temporary tweaks |
-| `CBOX_BUILD_DIR` | cbox.sh directory | Build context for `cbox rebuild` |
+| `CBOX_BUILD_DIR` | cbox.sh directory | Folder with the dockerfile for `cbox rebuild`; a dockerfile starting `FROM claudebox` adds to claudebox's (see [Your own additions](#your-own-additions-to-the-image)) |
 | `BUILD_PLAYWRIGHT` | `0` | Set to `1` to bake Playwright + Chromium into the image on the next `cbox rebuild` (or pass it inline). Decides whether the browser download happens at build time or on first use |
 | `CBOX_AUDIO` | *(unset)* | Set to `1` to enable Claude Code voice mode (requires PulseAudio on host) |
 | `CBOX_MCP_CONFIG` | `~/.config/claudebox/mcp.json` | MCP servers that run on the host and are relayed into the container (see [Host MCP Servers](#host-mcp-servers)) |
@@ -262,6 +262,20 @@ The image is based on Ubuntu 26.04 and includes:
   and survive `cbox reset`, `cbox prune` and image rebuilds
 
 The container user is `claude` (UID matches your host UID to avoid permission issues on mounted volumes).
+
+### Your own additions to the image
+
+Keep a dockerfile with only your changes and let cbox put it on top of claudebox's:
+
+```dockerfile
+FROM claudebox
+
+USER root
+RUN apt-get update && apt-get install -y tmux
+USER claude
+```
+
+Point `CBOX_BUILD_DIR` in `cbox.env` at its folder and run `cbox rebuild`. cbox appends your file (without its `FROM` line) to claudebox's own dockerfile and builds both as one image, with your folder as the build context. Updates to claudebox's image reach yours at the next rebuild, with no copy to keep in step. claudebox's dockerfile ends as `USER claude` in `/Workspace`, so switch to `root` only where needed and back at the end. A dockerfile in `CBOX_BUILD_DIR` that starts from anything else is built as it is.
 
 ## Host MCP Servers
 

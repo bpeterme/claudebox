@@ -4650,6 +4650,79 @@ _image_docker() {
 }
 
 # ---------------------------------------------------------------------------
+# build: a CBOX_BUILD_DIR dockerfile with only additions (FROM claudebox)
+# ---------------------------------------------------------------------------
+
+# Fake runtime for builds: logs the arguments and keeps a copy of the -f file
+# (cbox deletes its generated dockerfile after the build).
+_build_docker() {
+  local d="$BATS_TMPDIR/builddocker"; rm -rf "$d"; mkdir -p "$d"
+  BUILD_LOG="$d/log" BUILD_FILE="$d/dockerfile.seen"
+  cat > "$d/docker" <<SH
+#!/bin/sh
+echo "\$*" >> "$BUILD_LOG"
+[ "\$1 \$2" = "image inspect" ] && exit 1
+while [ \$# -gt 0 ]; do [ "\$1" = "-f" ] && cp "\$2" "$BUILD_FILE"; shift; done
+exit 0
+SH
+  chmod +x "$d/docker"
+  _CBOX_CMD="$d/docker" _CBOX_RUNTIME=docker
+  MINE="$BATS_TMPDIR/mine"; rm -rf "$MINE"; mkdir -p "$MINE"
+  _CBOX_BUILD_DIR="$MINE"
+}
+
+@test "build: a FROM claudebox dockerfile is appended to claudebox's own and built once" {
+  _build_docker; CBOX_IMAGE=claudebox_me
+  printf '%s\n' '# my additions' 'FROM claudebox' 'USER root' 'RUN echo mine' 'USER claude' > "$MINE/dockerfile"
+  run _cbox_build_image
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '^build' "$BUILD_LOG")" = "1" ]
+  grep -q "^build --build-arg HOST_UID=$(id -u) .* -f .* -t claudebox_me $MINE\$" "$BUILD_LOG"
+  # claudebox's dockerfile comes first, unchanged; the additions follow without their FROM.
+  [ "$(grep -m1 '^FROM' "$BUILD_FILE")" = "$(grep -m1 '^FROM' "$_CBOX_OWN_BUILD_DIR/dockerfile")" ]
+  grep -qF "$(tail -1 "$_CBOX_OWN_BUILD_DIR/dockerfile")" "$BUILD_FILE"
+  ! grep -qx 'FROM claudebox' "$BUILD_FILE"
+  [ "$(tail -4 "$BUILD_FILE")" = "$(printf '%s\n' '# my additions' 'USER root' 'RUN echo mine' 'USER claude')" ]
+  # The generated file is removed after the build.
+  [ -z "$(ls "${TMPDIR:-/tmp}"/cbox-dockerfile.* 2>/dev/null)" ]
+}
+
+@test "build: FROM claudebox:latest and FROM --platform=… claudebox count as additions" {
+  _build_docker
+  printf 'FROM claudebox:latest\nRUN true\n' > "$MINE/Dockerfile"
+  run _cbox_additions_dockerfile
+  [ "$status" -eq 0 ]
+  [ "$output" = "$MINE/Dockerfile" ]
+  rm "$MINE/Dockerfile"; printf 'from --platform=linux/arm64 claudebox AS mine\n' > "$MINE/dockerfile"
+  run _cbox_additions_dockerfile
+  [ "$status" -eq 0 ]
+}
+
+@test "build: a full dockerfile in CBOX_BUILD_DIR is built as it is" {
+  _build_docker; CBOX_IMAGE=claudebox
+  printf 'FROM ubuntu:26.04\nRUN true\n' > "$MINE/dockerfile"
+  run _cbox_build_image
+  [ "$status" -eq 0 ]
+  grep -q " -t claudebox $MINE\$" "$BUILD_LOG"
+  ! grep -q -- ' -f ' "$BUILD_LOG"
+}
+
+@test "build: claudebox's own dockerfile is never treated as additions" {
+  _build_docker; _CBOX_BUILD_DIR="$_CBOX_OWN_BUILD_DIR"
+  run _cbox_additions_dockerfile
+  [ "$status" -eq 1 ]
+}
+
+@test "image: a missing image built from additions is built on first use under its own name" {
+  _build_docker; CBOX_IMAGE=claudebox_me
+  printf 'FROM claudebox\nRUN true\n' > "$MINE/dockerfile"
+  run _cbox_ensure_image
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not found — building it once"* ]]
+  grep -q " -t claudebox_me $MINE\$" "$BUILD_LOG"
+}
+
+# ---------------------------------------------------------------------------
 # warden broker address on Docker
 # ---------------------------------------------------------------------------
 

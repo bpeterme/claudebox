@@ -4756,11 +4756,12 @@ SH
   [ -z "$output" ]
 }
 
-@test "prune images: not on Apple's runtime yet" {
+@test "prune images: Apple's runtime removes images without a name (no --all)" {
   _prune_docker 0; _CBOX_RUNTIME=apple
   run _cbox_prune_images
-  [ -z "$output" ]
-  [ ! -s "$PRUNE_LOG" ]
+  [ "$status" -eq 0 ]
+  grep -qx 'image prune' "$PRUNE_LOG"
+  ! grep -q -- '--all\|-a' "$PRUNE_LOG"
 }
 
 @test "cbox rebuild: removes old images after a successful build, keeps them after a failed one" {

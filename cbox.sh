@@ -6068,13 +6068,18 @@ _cbox_build_image() {
 }
 
 # Removes the old images that rebuilds leave behind: a rebuild moves the image
-# name to the new image and keeps the previous one, untagged. Only images built
-# from claudebox's dockerfile (its cbox.image label) are touched, never other
-# images on the machine; one that a container still uses stays until that
-# container is gone (cbox reset, cbox prune). Docker only for now.
+# name to the new image and keeps the previous one, without a name. One that a
+# container still uses stays until that container is gone (cbox reset, prune).
+# Docker: only images built from claudebox's dockerfile (its cbox.image label).
+# Apple's `container image prune` has no label filter: it removes every image
+# without a name, cbox's or not. Such an image can no longer be started by name.
 _cbox_prune_images() {
-  [[ "$_CBOX_RUNTIME" == "docker" ]] || return 0
   local out freed
+  if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
+    out=$($_CBOX_CMD image prune 2>/dev/null) || return 0
+    [[ -n "$out" ]] && echo "$out"
+    return 0
+  fi
   out=$($_CBOX_CMD image prune -f --filter "label=cbox.image=true" 2>/dev/null) || return 0
   grep -q '^Deleted' <<<"$out" || return 0
   freed=$(sed -n 's/^Total reclaimed space: //p' <<<"$out")

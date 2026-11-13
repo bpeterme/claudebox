@@ -6067,6 +6067,20 @@ _cbox_build_image() {
   $_CBOX_CMD build "${args[@]}" -t "$CBOX_IMAGE" "$_CBOX_BUILD_DIR"
 }
 
+# Removes the old images that rebuilds leave behind: a rebuild moves the image
+# name to the new image and keeps the previous one, untagged. Only images built
+# from claudebox's dockerfile (its cbox.image label) are touched, never other
+# images on the machine; one that a container still uses stays until that
+# container is gone (cbox reset, cbox prune). Docker only for now.
+_cbox_prune_images() {
+  [[ "$_CBOX_RUNTIME" == "docker" ]] || return 0
+  local out freed
+  out=$($_CBOX_CMD image prune -f --filter "label=cbox.image=true" 2>/dev/null) || return 0
+  grep -q '^Deleted' <<<"$out" || return 0
+  freed=$(sed -n 's/^Total reclaimed space: //p' <<<"$out")
+  echo "Removed old cbox images${freed:+ ($freed freed)}."
+}
+
 # Docker would try to pull a missing image from Docker Hub, where cbox's is not
 # published: build it instead. Only for cbox's own image name, or one built from
 # additions to it — any other CBOX_IMAGE is the user's and is pulled as usual.
@@ -7140,7 +7154,8 @@ cbox() {
       clear 2>/dev/null || true  # no terminal (scripts, CI): nothing to clear
       _cbox_system_start
       echo "Rebuilding image '$CBOX_IMAGE'..."
-      _cbox_build_image
+      _cbox_build_image || return 1
+      _cbox_prune_images
       ;;
 
     update)
@@ -7207,6 +7222,7 @@ cbox() {
 
       _cbox_busy_begin "reclaiming disk space..."
       _cbox_clean_running
+      _cbox_prune_images
       _cbox_busy_end
       ;;
 

@@ -4713,6 +4713,71 @@ SH
   [ "$status" -eq 1 ]
 }
 
+# ---------------------------------------------------------------------------
+# old images left by rebuilds
+# ---------------------------------------------------------------------------
+
+# Fake docker for image pruning: `build` exits with $1, `image prune` prints
+# Docker's output for one removed old image (or none when $2 is "none").
+_prune_docker() {
+  local d="$BATS_TMPDIR/prunedocker"; rm -rf "$d"; mkdir -p "$d"
+  PRUNE_LOG="$d/log"
+  cat > "$d/docker" <<SH
+#!/bin/sh
+echo "\$*" >> "$PRUNE_LOG"
+case "\$1 \$2" in
+  "build "*) exit $1 ;;
+  "image prune")
+    if [ "$2" = none ]; then echo "Total reclaimed space: 0B"
+    else printf 'Deleted Images:\\ndeleted: sha256:0ld\\n\\nTotal reclaimed space: 1.2GB\\n'; fi ;;
+esac
+exit 0
+SH
+  chmod +x "$d/docker"
+  _CBOX_CMD="$d/docker" _CBOX_RUNTIME=docker
+}
+
+@test "dockerfile: claudebox's image carries the cbox.image label that pruning keys on" {
+  grep -qx 'LABEL cbox.image=true' "$BATS_TEST_DIRNAME/../dockerfile"
+}
+
+@test "prune images: only cbox's own untagged images, and says how much was freed" {
+  _prune_docker 0
+  run _cbox_prune_images
+  [ "$status" -eq 0 ]
+  grep -qx 'image prune -f --filter label=cbox.image=true' "$PRUNE_LOG"
+  [ "$output" = "Removed old cbox images (1.2GB freed)." ]
+}
+
+@test "prune images: silent when there is nothing to remove" {
+  _prune_docker 0 none
+  run _cbox_prune_images
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "prune images: not on Apple's runtime yet" {
+  _prune_docker 0; _CBOX_RUNTIME=apple
+  run _cbox_prune_images
+  [ -z "$output" ]
+  [ ! -s "$PRUNE_LOG" ]
+}
+
+@test "cbox rebuild: removes old images after a successful build, keeps them after a failed one" {
+  _cbox_system_start() { :; }
+  _prune_docker 0
+  run cbox rebuild
+  [ "$status" -eq 0 ]
+  # Build first, then prune.
+  [ "$(grep -E '^(build|image prune)' "$PRUNE_LOG" | cut -d' ' -f1-2 | tr '\n' '|')" = "build --build-arg|image prune|" ]
+  [[ "$output" == *"Removed old cbox images"* ]]
+
+  _prune_docker 1
+  run cbox rebuild
+  [ "$status" -ne 0 ]
+  ! grep -q 'image prune' "$PRUNE_LOG"
+}
+
 @test "image: a missing image built from additions is built on first use under its own name" {
   _build_docker; CBOX_IMAGE=claudebox_me
   printf 'FROM claudebox\nRUN true\n' > "$MINE/dockerfile"

@@ -1,5 +1,9 @@
 FROM ubuntu:26.04
 
+# cbox removes old images of its own after a rebuild (and at cbox prune) by
+# this label, so it never touches other images on the machine.
+LABEL cbox.image=true
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \

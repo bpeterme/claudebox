@@ -248,7 +248,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 
 ## Container Image
 
-The image is based on Ubuntu 24.04 and includes:
+The image is based on Ubuntu 26.04 and includes:
 
 - Node.js 22, Claude Code, opencode
 - Python 3, [uv](https://github.com/astral-sh/uv)

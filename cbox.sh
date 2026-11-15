@@ -416,6 +416,53 @@ _cbox_rt_label() {
   fi
 }
 
+# The host folder container $1 was created for: its cbox.project label, or for
+# containers made before that label, the source of its /Workspace/$1 mount.
+# Empty when the runtime does not tell.
+_cbox_project_dir() {
+  local name="$1"
+  $_CBOX_CMD inspect "$name" 2>/dev/null | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+e = d[0] if isinstance(d, list) and d else d
+if not isinstance(e, dict):
+    sys.exit(0)
+c = e.get("configuration") or e.get("Config") or e
+l = c.get("labels") or c.get("Labels") or {}
+if isinstance(l, dict) and l.get("cbox.project"):
+    print(l["cbox.project"]); sys.exit(0)
+for m in e.get("Mounts") or c.get("mounts") or []:
+    if isinstance(m, dict) and (m.get("Destination") or m.get("destination")) == sys.argv[1]:
+        print(m.get("Source") or m.get("source") or ""); break
+' "/Workspace/$name"
+}
+
+# Two folders can map to the same container name ("m8 systems", "m8-systems"),
+# and a renamed or moved folder leaves its container mounting a path that is
+# gone. Either way the container is not this folder's: say so before starting it.
+_cbox_project_check() {
+  local name="$1" dir
+  dir=$(_cbox_project_dir "$name")
+  [[ -z "$dir" ]] && return 0
+  # -ef: same folder, also when the path differs only in case or a symlink.
+  [[ "$dir" -ef "$PWD" ]] && return 0
+  if [[ -d "$dir" ]]; then
+    echo "ERROR: container '$name' belongs to another folder:"
+    echo "   $dir"
+    echo "   Both folder names turn into the container name '$name'."
+    echo "   Fix: rename this folder, or give the container to it with 'cbox reset'."
+  else
+    echo "ERROR: container '$name' was made for a folder that no longer exists:"
+    echo "   $dir"
+    echo "   (renamed or moved?) This folder cannot use that container."
+    echo "   Fix: 'cbox reset', then 'cbox'. Your project files are not touched."
+  fi
+  return 1
+}
+
 _cbox_exists() {
   local name="$1"
 
@@ -593,6 +640,7 @@ _cbox_force_update() {
     echo "No container found for '$name'."
     return 0
   fi
+  _cbox_project_check "$name" || return 1
 
   if ! _cbox_running "$name"; then
     _cbox_step "Starting container '$name'..."
@@ -6445,6 +6493,7 @@ _cbox_create() {
     --label "$CBOX_LABEL"
     --label "cbox.mode=$mode"
     --label "cbox.agent=$agent_bin"
+    --label "cbox.project=$PWD"
 
     -v "$PWD:/Workspace/$name"
     -w "/Workspace/$name"
@@ -6716,6 +6765,8 @@ _cbox_ensure() {
     echo "Requested mode: '$requested_mode'"
     return 1
   fi
+
+  _cbox_project_check "$name" || return 1
 
   if ! _cbox_running "$name"; then
     _cbox_step "Starting container '$name'..."

@@ -663,7 +663,10 @@ first when it is missing. Claude stays in its container.
 3. Check it from a terminal that is **not** cmux (e.g. Terminal.app):
    `cbox warden test projects`.
 
-In the container, Claude runs `cbox-open owner/name [--color Teal]`. The color
+In the container, Claude runs `cbox-open api [--color Teal]`. A bare name is
+enough when a pattern fixes the owner: with `repos = my-org/*`, `api` means
+`my-org/api`. If two patterns fit, the clone already in your folder decides,
+else Claude asks you for the owner. The color
 is one of cmux's named colors or `#RRGGBB`; without one, the repo's name picks
 it, so a repo keeps its color.
 

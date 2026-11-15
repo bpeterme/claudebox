@@ -1026,7 +1026,6 @@ INI
   got+=$(code -d '{"repo":"my-group/app/"}' "$url/gl/open")
   got+=$(code -d '{"repo":"my-group/sub/../app"}' "$url/gl/open")
   got+=$(code -d '{"repo":"my-group/.hidden"}' "$url/gl/open")
-  got+=$(code -d '{"repo":"app"}' "$url/gl/open")
   got+=$(code -d '{"repo":"other/my-group/app"}' "$url/gl/open")   # * only after the start
   _warden_teardown
   [[ "$env" == *"WARDEN_CMUX=gl,projects"* ]]
@@ -1035,7 +1034,34 @@ INI
   [ "$(git -C "$WT/ws/app" remote get-url origin)" = "$WT/remotes/my-group/sub/app.git" ]
   [ -d "$WT/ws/tool/.git" ]
   grep -q "new-workspace --name app --cwd $WT/ws/app --command cbox" "$WT/cmux.log"
-  [ "$got" = "400 400 400 400 400 400 403 " ]
+  [ "$got" = "400 400 400 400 400 403 " ]
+}
+
+@test "warden cmux: a bare name gets its owner from the patterns; the local clone settles a tie" {
+  _cmux_setup
+  git init -q --bare "$WT/remotes/my-org/notes.git"
+  mkdir -p "$WT/remotes/someone"; git init -q --bare "$WT/remotes/someone/notes.git"
+  cat >> "$CBOX_WARDEN_DIR/resources" <<INI
+[wild]
+type   = cmux
+repos  = */app
+folder = $WT/ws
+clone  = $WT/remotes/{repo}.git
+cmux   = $WT/cmux
+INI
+  url=$(_warden_url)
+  bare=$(_cmux_open "$url" '{"repo":"demo"}')
+  tie=$(_cmux_open "$url" '{"repo":"notes"}')            # my-org/* and someone/notes
+  git clone -q "$WT/remotes/someone/notes.git" "$WT/ws/notes" 2>/dev/null
+  local=$(_cmux_open "$url" '{"repo":"notes"}')
+  wild=$(curl -s -w ' %{http_code}' -d '{"repo":"app"}' "$url/wild/open")
+  odd=$(_cmux_open "$url" '{"repo":"-x"}')
+  _warden_teardown
+  [[ "$bare" == *'"repo": "my-org/demo"'*'"cloned": true'*' 200' ]]
+  [[ "$tie" == *"notes could be my-org/notes or someone/notes"*"give owner/name"*" 409" ]]
+  [[ "$local" == *'"repo": "someone/notes"'*'"cloned": false'*' 200' ]]
+  [[ "$wild" == *"give owner/name: no pattern fixes the owner of app"*" 400" ]]
+  [[ "$odd" == *" 400" ]]
 }
 
 @test "warden cmux: an existing folder that is another repo is left alone" {
@@ -1124,10 +1150,12 @@ INI
   ok=$(WARDEN_URL="$url" WARDEN_CMUX=projects python3 "$WT/cbox-open" my-org/demo --color Navy 2>&1)
   no=$(WARDEN_URL="$url" WARDEN_CMUX=projects python3 "$WT/cbox-open" evil/x 2>&1) || true
   off=$(WARDEN_URL="$url" WARDEN_CMUX= python3 "$WT/cbox-open" my-org/demo 2>&1) || true
+  hint=$(WARDEN_URL="$url" WARDEN_CMUX=projects,other python3 "$WT/cbox-open" nothere 2>&1) || true
   _warden_teardown
   [[ "$ok" == "✔ my-org/demo cloned to $WT/ws/demo — cmux workspace workspace:42 (Navy), cbox starting there" ]]
   [[ "$no" == "cbox-open: warden: evil/x is not among the repos"* ]]
   [[ "$off" == *"no warden resource of type cmux"* ]]
+  [[ "$hint" == "cbox-open: warden: git clone"*"failed"*" — another cmux resource may have it: --via other" ]]
 }
 
 @test "cbox warden: lists resources and what this project gets" {

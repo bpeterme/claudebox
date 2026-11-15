@@ -3652,7 +3652,7 @@ import argparse, json, os, sys, urllib.error, urllib.request
 COLORS = "Red, Crimson, Orange, Amber, Olive, Green, Teal, Aqua, Blue, Navy, Indigo, Purple, Magenta, Rose, Brown, Charcoal"
 
 p = argparse.ArgumentParser(prog="cbox-open", description="Open a repo on the host in a new cmux workspace with cbox.")
-p.add_argument("repo", help="owner/name, e.g. my-org/my-repo")
+p.add_argument("repo", help="owner/name, e.g. my-org/my-repo (GitLab: group/subgroup/name)")
 p.add_argument("--color", help=f"#RRGGBB or one of: {COLORS} (default: picked from the repo name)")
 p.add_argument("--via", help="the warden resource to use (default: the first of $WARDEN_CMUX)")
 a = p.parse_args()
@@ -3685,7 +3685,7 @@ PYEOF
 }
 
 # Tells the agent about cbox-open (claude --append-system-prompt).
-_CBOX_CMUX_PROMPT="To open a repository on the user's Mac in a new cmux workspace with cbox running (cloned into ~/Workspace when missing), run: cbox-open owner/name [--color NAME|#RRGGBB]. Use it when the user asks to open a repo or project."
+_CBOX_CMUX_PROMPT="To open a repository on the user's Mac in a new cmux workspace with cbox running (cloned into ~/Workspace when missing), run: cbox-open owner/name [--color NAME|#RRGGBB] (GitLab subgroups: group/subgroup/name; with several cmux resources (env WARDEN_CMUX), choose one with --via NAME). Use it when the user asks to open a repo or project."
 
 # ---------------------------------------------------------
 # warden
@@ -3728,8 +3728,13 @@ HOP = {"connection", "keep-alive", "proxy-connection", "proxy-authorization", "t
 CHUNK = 1 << 16
 PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 PREFIX_RE = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$")
-REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$")
-REPO_PATTERN_RE = re.compile(r"^[A-Za-z0-9*?][A-Za-z0-9*?-]{0,38}/[A-Za-z0-9_*?][A-Za-z0-9_.*?-]{0,99}$")
+# A repo: owner/name (GitHub) or group/subgroup/.../name (GitLab, up to 20
+# groups deep). Each part as both allow it: letters, digits, '_', '-' and '.',
+# never starting with '-' or '.' (so no option-like names and no "." or "..").
+REPO_PART = r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}"
+REPO_RE = re.compile(rf"^{REPO_PART}(?:/{REPO_PART}){{1,20}}$")
+REPO_PATTERN_PART = r"[A-Za-z0-9_*?][A-Za-z0-9_.*?-]{0,99}"
+REPO_PATTERN_RE = re.compile(rf"^{REPO_PATTERN_PART}(?:/{REPO_PATTERN_PART}){{1,20}}$")
 CMUX_FOLDER = "~/Workspace"
 CMUX_COLORS = ("Red", "Crimson", "Orange", "Amber", "Olive", "Green", "Teal", "Aqua",
                "Blue", "Navy", "Indigo", "Purple", "Magenta", "Rose", "Brown", "Charcoal")
@@ -3794,9 +3799,11 @@ TEMPLATE = """\
 #
 # [projects]
 # type         = cmux                    # opens a repo in a new cmux workspace with cbox running (macOS)
-# repos        = my-org/*, my-user/notes # owner/name patterns the agent may open
+# repos        = my-org/*, my-user/notes # owner/name patterns the agent may open (GitLab:
+#                                        #   group/sub/name; * also covers subgroups)
 # folder       = ~/Workspace             # optional; a repo goes to <folder>/<name> (cloned when missing)
 # clone        = git@github.com:{repo}.git  # optional; the clone URL, {repo} is owner/name
+#                                        #   (GitLab: git@gitlab.com:{repo}.git)
 # secret       = cbox.warden.cmux        # optional: the cmux socket password (cmux's password mode)
 # availability = global                  # the agent runs: cbox-open owner/name
 """
@@ -3955,7 +3962,8 @@ def validate_cmux(r):
         return "repos is missing: the owner/name patterns the agent may open, e.g. repos = my-org/*"
     for pat in pats:
         if not REPO_PATTERN_RE.match(pat):
-            return f"repos entry '{pat}' is not an owner/name pattern (e.g. my-org/* or my-user/notes)"
+            return (f"repos entry '{pat}' is not an owner/name pattern "
+                    "(e.g. my-org/*, my-user/notes or my-group/sub/*)")
     if "{repo}" not in r.get("clone", "{repo}"):
         return "clone must contain {repo}, e.g. clone = git@github.com:{repo}.git"
     if not os.path.isabs(os.path.expanduser(r.get("folder", CMUX_FOLDER))):
@@ -4584,13 +4592,13 @@ def same_remote(a, b):
 def cmux_open(r, repo, color=None):
     """Clones repo when missing and opens it in a new cmux workspace with cbox."""
     if not isinstance(repo, str) or not REPO_RE.match(repo) or repo.lower().endswith(".git"):
-        raise CmuxError(400, "repo must be a plain owner/name, e.g. my-org/my-repo")
+        raise CmuxError(400, "repo must be a plain owner/name (GitLab: group/subgroup/name), e.g. my-org/my-repo")
     if not any(fnmatchcase(repo.lower(), p.lower()) for p in cmux_patterns(r)):
         raise CmuxError(403, f"{repo} is not among the repos this resource opens ({', '.join(cmux_patterns(r))})")
     if color is not None and not isinstance(color, str):
         raise CmuxError(400, "color must be a string")
     color = cmux_color(repo, color)
-    name = repo.split("/", 1)[1]
+    name = repo.rsplit("/", 1)[1]
     folder = cmux_folder(r)
     path = os.path.join(folder, name)
     url = r.get("clone", "git@github.com:{repo}.git").replace("{repo}", repo)

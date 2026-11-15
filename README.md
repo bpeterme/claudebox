@@ -648,6 +648,12 @@ first when it is missing. Claude stays in its container.
    git@github.com:{repo}.git` (the clone URL), `cmux = <path>` (when `cmux` is
    not on the `PATH` of the terminal that starts cbox).
 
+   **GitLab** (or any other host): one more resource with its own clone URL,
+   e.g. `clone = git@gitlab.com:{repo}.git`. Subgroups work
+   (`my-group/sub/app`), and `my-group/*` covers them too. With several cmux
+   resources, Claude picks one with `--via <resource>`. The repo goes to a
+   folder named after its last part (`~/Workspace/app`).
+
 2. Let warden reach cmux. cmux's default socket access, "cmux processes only",
    refuses warden: it runs in the background, outside cmux terminals. In cmux's
    settings, pick a mode that lets local processes in. For a password mode,

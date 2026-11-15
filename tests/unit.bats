@@ -1003,6 +1003,41 @@ except CmuxError as e:
   [ -z "$(ls "$WT/ws")" ]
 }
 
+@test "warden cmux: GitLab names — subgroups, dots and underscores; the folder is the last part" {
+  _cmux_setup
+  mkdir -p "$WT/remotes/my-group/sub"
+  git init -q --bare "$WT/remotes/my-group/sub/app.git"
+  git init -q --bare "$WT/remotes/my.team_x/tool.git"
+  cat >> "$CBOX_WARDEN_DIR/resources" <<INI
+[gl]
+type   = cmux
+repos  = my-group/*, my.team_x/tool
+folder = $WT/ws
+clone  = $WT/remotes/{repo}.git
+cmux   = $WT/cmux
+INI
+  env=$(_warden_env)
+  url=$(printf '%s\n' "$env" | sed -n 's/^WARDEN_URL=//p')
+  sub=$(curl -s -w ' %{http_code}' -d '{"repo":"my-group/sub/app"}' "$url/gl/open")
+  dot=$(curl -s -w ' %{http_code}' -d '{"repo":"my.team_x/tool"}' "$url/gl/open")
+  code() { curl -s -o /dev/null -w '%{http_code} ' "$@"; }
+  got=$(code -d '{"repo":"my-group//app"}' "$url/gl/open")
+  got+=$(code -d '{"repo":"/my-group/app"}' "$url/gl/open")
+  got+=$(code -d '{"repo":"my-group/app/"}' "$url/gl/open")
+  got+=$(code -d '{"repo":"my-group/sub/../app"}' "$url/gl/open")
+  got+=$(code -d '{"repo":"my-group/.hidden"}' "$url/gl/open")
+  got+=$(code -d '{"repo":"app"}' "$url/gl/open")
+  got+=$(code -d '{"repo":"other/my-group/app"}' "$url/gl/open")   # * only after the start
+  _warden_teardown
+  [[ "$env" == *"WARDEN_CMUX=gl,projects"* ]]
+  [[ "$sub" == *'"repo": "my-group/sub/app"'*'"cloned": true'*' 200' ]]
+  [[ "$dot" == *'"cloned": true'*' 200' ]]
+  [ "$(git -C "$WT/ws/app" remote get-url origin)" = "$WT/remotes/my-group/sub/app.git" ]
+  [ -d "$WT/ws/tool/.git" ]
+  grep -q "new-workspace --name app --cwd $WT/ws/app --command cbox" "$WT/cmux.log"
+  [ "$got" = "400 400 400 400 400 400 403 " ]
+}
+
 @test "warden cmux: an existing folder that is another repo is left alone" {
   _cmux_setup
   git clone -q "$WT/remotes/my-org/other.git" "$WT/ws/demo" 2>/dev/null
@@ -1046,6 +1081,9 @@ type = cmux
 [c2]
 type  = cmux
 repos = my-org
+[c5]
+type  = cmux
+repos = my-group//x
 [c3]
 type  = cmux
 repos = my-org/*
@@ -1060,6 +1098,7 @@ INI
   [[ "$env" != *WARDEN_CMUX* ]]
   grep -q "'c1': repos is missing" "$WT/stderr"
   grep -q "'c2': repos entry 'my-org' is not an owner/name pattern" "$WT/stderr"
+  grep -q "'c5': repos entry 'my-group//x' is not an owner/name pattern" "$WT/stderr"
   grep -q "'c3': clone must contain {repo}" "$WT/stderr"
   grep -q "'c4': command is not used by type = cmux" "$WT/stderr"
 }

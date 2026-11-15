@@ -923,6 +923,174 @@ _warden_relocate() {
   [[ "$output" == *"no docker0 bridge"*"CBOX_WARDEN_HOST"* ]]
 }
 
+# cmux resources: a fake cmux CLI and a local "remote" repo, through the broker.
+_cmux_setup() {
+  _warden_setup
+  mkdir -p "$WT/remotes/my-org" "$WT/ws"
+  git init -q --bare "$WT/remotes/my-org/demo.git"
+  git init -q --bare "$WT/remotes/my-org/other.git"
+  cat > "$WT/cmux" <<'SH'
+#!/bin/sh
+echo "$* | ws=${CMUX_WORKSPACE_ID:-} quiet=${CMUX_QUIET:-} pw=${CMUX_SOCKET_PASSWORD:-}" >> "${0%/*}/cmux.log"
+[ -f "${0%/*}/cmux.fail" ] && { echo "Error: access denied"; exit 1; }
+case "$1" in new-workspace) echo "OK workspace:42" ;; *) echo "OK" ;; esac
+SH
+  chmod +x "$WT/cmux"
+  cat >> "$CBOX_WARDEN_DIR/resources" <<INI
+[projects]
+type   = cmux
+repos  = my-org/*, someone/notes
+folder = $WT/ws
+clone  = $WT/remotes/{repo}.git
+cmux   = $WT/cmux
+INI
+}
+
+# POST <resource>/open with body $2; prints "<code> <body>".
+_cmux_open() {
+  curl -s -w ' %{http_code}' -H 'Content-Type: application/json' -d "$2" "$1/projects/open"
+}
+
+@test "warden cmux: clones a missing repo and opens it in a named, colored workspace with cbox" {
+  _cmux_setup
+  export CMUX_WORKSPACE_ID=stale-from-the-starting-terminal
+  env=$(_warden_env)
+  url=$(printf '%s\n' "$env" | sed -n 's/^WARDEN_URL=//p')
+  first=$(_cmux_open "$url" '{"repo":"my-org/demo"}')
+  second=$(_cmux_open "$url" '{"repo":"my-org/demo","color":"teal"}')
+  _warden_teardown
+  unset CMUX_WORKSPACE_ID
+  [[ "$env" == *"WARDEN_CMUX=projects"* ]]
+  [[ "$first" == *'"workspace": "workspace:42"'*'"cloned": true'*' 200' ]]
+  [[ "$second" == *'"cloned": false, "color": "Teal"}'*' 200' ]]
+  [ "$(git -C "$WT/ws/demo" remote get-url origin)" = "$WT/remotes/my-org/demo.git" ]
+  log=$(cat "$WT/cmux.log")
+  [[ "$log" == *"new-workspace --name demo --cwd $WT/ws/demo --command cbox | ws= quiet=1"* ]]
+  [[ "$log" == *"workspace-action --action set-color --color Teal --workspace workspace:42"* ]]
+  [ "$(grep -c new-workspace "$WT/cmux.log")" -eq 2 ]
+}
+
+@test "warden cmux: the default color comes from the repo name and stays the same" {
+  run python3 -c "
+exec(open('$(_warden_lib)').read())
+a, b = cmux_color('my-org/demo'), cmux_color('My-Org/Demo')
+print(a == b, a in CMUX_COLORS, cmux_color('x/y', '#c0392b'), cmux_color('x/y', 'aMbEr'))
+try:
+    cmux_color('x/y', 'red; rm -rf ~')
+except CmuxError as e:
+    print(e.code)"
+  [ "$output" = "True True #C0392B Amber
+400" ]
+}
+
+@test "warden cmux: refuses other repos, odd names, extra fields and other paths; never runs cmux" {
+  _cmux_setup
+  url=$(_warden_url)
+  code() { curl -s -o /dev/null -w '%{http_code} ' --path-as-is "$@"; }
+  got=$(code -d '{"repo":"evil/demo"}' "$url/projects/open")          # not in repos
+  got+=$(code -d '{"repo":"my-org/../x"}' "$url/projects/open")       # not owner/name
+  got+=$(code -d '{"repo":"my-org/-x"}' "$url/projects/open")         # option-like name
+  got+=$(code -d '{"repo":"my-org/demo.git"}' "$url/projects/open")
+  got+=$(code -d '{"repo":"my-org/a b"}' "$url/projects/open")
+  got+=$(code -d '{"repo":"my-org/demo","color":"x"}' "$url/projects/open")
+  got+=$(code -d '{"repo":"my-org/demo","cmd":"x"}' "$url/projects/open")
+  got+=$(code -d 'not json' "$url/projects/open")
+  got+=$(code "$url/projects/open")                                   # GET
+  got+=$(code -d '{"repo":"my-org/demo"}' "$url/projects/send")
+  _warden_teardown
+  [ "$got" = "403 400 400 400 400 400 400 400 404 404 " ]
+  [ ! -e "$WT/cmux.log" ]
+  [ -z "$(ls "$WT/ws")" ]
+}
+
+@test "warden cmux: an existing folder that is another repo is left alone" {
+  _cmux_setup
+  git clone -q "$WT/remotes/my-org/other.git" "$WT/ws/demo" 2>/dev/null
+  mkdir -p "$WT/ws/notes"
+  url=$(_warden_url)
+  got=$(_cmux_open "$url" '{"repo":"my-org/demo"}')
+  plain=$(_cmux_open "$url" '{"repo":"someone/notes"}')
+  _warden_teardown
+  [[ "$got" == *"exists and is not a clone of"*" 409" ]]
+  [[ "$plain" == *" 409" ]]
+  [ ! -e "$WT/cmux.log" ]
+}
+
+@test "warden cmux: a failed clone or a refusing cmux is reported with what to do" {
+  _cmux_setup
+  url=$(_warden_url)
+  missing=$(_cmux_open "$url" '{"repo":"my-org/nothere"}')
+  touch "$WT/cmux.fail"
+  refused=$(_cmux_open "$url" '{"repo":"my-org/demo"}')
+  _warden_teardown
+  [[ "$missing" == *"git clone"*"failed"*" 502" ]]
+  [ ! -e "$WT/ws/nothere" ]
+  [[ "$refused" == *"access denied"*"socket access must let it in"*" 502" ]]
+}
+
+@test "warden cmux: the socket password comes from the secret store" {
+  _cmux_setup
+  echo "secret = cbox.warden.cmux" >> "$CBOX_WARDEN_DIR/resources"
+  url=$(_warden_url)
+  _cmux_open "$url" '{"repo":"my-org/demo"}' >/dev/null
+  _warden_teardown
+  grep -q "pw=sk-test-REDACTED-cbox.warden.cmux" "$WT/cmux.log"
+  ! grep -q "sk-test-REDACTED" "$CBOX_WARDEN_DIR/broker.log"
+}
+
+@test "warden cmux: invalid resources are skipped with a reason" {
+  _warden_setup
+  cat >> "$CBOX_WARDEN_DIR/resources" <<'INI'
+[c1]
+type = cmux
+[c2]
+type  = cmux
+repos = my-org
+[c3]
+type  = cmux
+repos = my-org/*
+clone = git@github.com:fixed.git
+[c4]
+type    = cmux
+repos   = my-org/*
+command = rm
+INI
+  env=$(_warden_env)
+  _warden_teardown
+  [[ "$env" != *WARDEN_CMUX* ]]
+  grep -q "'c1': repos is missing" "$WT/stderr"
+  grep -q "'c2': repos entry 'my-org' is not an owner/name pattern" "$WT/stderr"
+  grep -q "'c3': clone must contain {repo}" "$WT/stderr"
+  grep -q "'c4': command is not used by type = cmux" "$WT/stderr"
+}
+
+@test "cbox warden: lists and tests a cmux resource" {
+  _cmux_setup
+  list=$(_cbox_warden_cmd list)
+  ok=$(CMUX_WORKSPACE_ID=w1 _cbox_warden_cmd test projects 2>&1)
+  touch "$WT/cmux.fail"
+  bad=$(_cbox_warden_cmd test projects 2>&1) || true
+  _warden_teardown
+  [[ "$list" == *"✔ projects"*"cmux: opens my-org/*, someone/notes in $WT/ws"* ]]
+  [[ "$ok" == *"✔ projects: cmux answers"*"This terminal is inside cmux"* ]]
+  [[ "$bad" == *"✖ projects: cmux list-workspaces failed: Error: access denied"* ]]
+  grep -q "^list-workspaces" "$WT/cmux.log"
+}
+
+@test "cbox-open: sends repo and color, prints the result, explains a refusal" {
+  _cmux_setup
+  env=$(_warden_env)
+  url=$(printf '%s\n' "$env" | sed -n 's/^WARDEN_URL=//p')
+  _cbox_cmux_open_py > "$WT/cbox-open"
+  ok=$(WARDEN_URL="$url" WARDEN_CMUX=projects python3 "$WT/cbox-open" my-org/demo --color Navy 2>&1)
+  no=$(WARDEN_URL="$url" WARDEN_CMUX=projects python3 "$WT/cbox-open" evil/x 2>&1) || true
+  off=$(WARDEN_URL="$url" WARDEN_CMUX= python3 "$WT/cbox-open" my-org/demo 2>&1) || true
+  _warden_teardown
+  [[ "$ok" == "✔ my-org/demo cloned to $WT/ws/demo — cmux workspace workspace:42 (Navy), cbox starting there" ]]
+  [[ "$no" == "cbox-open: warden: evil/x is not among the repos"* ]]
+  [[ "$off" == *"no warden resource of type cmux"* ]]
+}
+
 @test "cbox warden: lists resources and what this project gets" {
   _warden_setup
   printf '[proj]\n' > .warden

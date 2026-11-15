@@ -3634,6 +3634,60 @@ _cbox_mail_clear() {
 }
 
 # ---------------------------------------------------------
+# cmux: open a repo on the host (a warden resource type)
+# ---------------------------------------------------------
+#
+# The container's side: a command that asks warden to open a repo in a new
+# cmux workspace with cbox running (see "cmux" in the warden python). It sends
+# only owner/name and a color; warden clones and runs cmux itself.
+_cbox_cmux_open_py() {
+  cat <<'PYEOF'
+#!/usr/bin/env python3
+# cbox-open — installed by cbox at session start; local edits are overwritten.
+#   cbox-open owner/name [--color NAME|#RRGGBB]
+# Opens the repo on the host in a new cmux workspace (named after it, colored)
+# with cbox running in ~/Workspace/<name>; clones it there first when missing.
+import argparse, json, os, sys, urllib.error, urllib.request
+
+COLORS = "Red, Crimson, Orange, Amber, Olive, Green, Teal, Aqua, Blue, Navy, Indigo, Purple, Magenta, Rose, Brown, Charcoal"
+
+p = argparse.ArgumentParser(prog="cbox-open", description="Open a repo on the host in a new cmux workspace with cbox.")
+p.add_argument("repo", help="owner/name, e.g. my-org/my-repo")
+p.add_argument("--color", help=f"#RRGGBB or one of: {COLORS} (default: picked from the repo name)")
+p.add_argument("--via", help="the warden resource to use (default: the first of $WARDEN_CMUX)")
+a = p.parse_args()
+names = [n for n in os.environ.get("WARDEN_CMUX", "").split(",") if n]
+url = os.environ.get("WARDEN_URL")
+if not names or not url:
+    sys.exit("cbox-open: this session cannot open repos on the host (no warden resource of type cmux)")
+via = a.via or names[0]
+if via not in names:
+    sys.exit(f"cbox-open: '{via}' is not one of this session's cmux resources ({', '.join(names)})")
+body = {"repo": a.repo, **({"color": a.color} if a.color else {})}
+req = urllib.request.Request(f"{url}/{via}/open", data=json.dumps(body).encode(), method="POST",
+                             headers={"Content-Type": "application/json"})
+try:
+    with urllib.request.urlopen(req, timeout=960) as resp:
+        r = json.load(resp)
+except urllib.error.HTTPError as e:
+    try:
+        msg = json.load(e)["error"]["message"]
+    except (ValueError, KeyError, TypeError):
+        msg = f"HTTP {e.code}"
+    sys.exit(f"cbox-open: {msg}")
+except (urllib.error.URLError, OSError) as e:
+    sys.exit(f"cbox-open: warden unreachable: {e}")
+print(f"✔ {r['repo']} {'cloned to' if r['cloned'] else 'opened from'} {r['path']} — "
+      f"cmux workspace {r['workspace']} ({r['color']}), cbox starting there")
+if r.get("warning"):
+    print(f"⚠  {r['warning']}")
+PYEOF
+}
+
+# Tells the agent about cbox-open (claude --append-system-prompt).
+_CBOX_CMUX_PROMPT="To open a repository on the user's Mac in a new cmux workspace with cbox running (cloned into ~/Workspace when missing), run: cbox-open owner/name [--color NAME|#RRGGBB]. Use it when the user asks to open a repo or project."
+
+# ---------------------------------------------------------
 # warden
 # ---------------------------------------------------------
 #
@@ -3674,6 +3728,12 @@ HOP = {"connection", "keep-alive", "proxy-connection", "proxy-authorization", "t
 CHUNK = 1 << 16
 PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 PREFIX_RE = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$")
+REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$")
+REPO_PATTERN_RE = re.compile(r"^[A-Za-z0-9*?][A-Za-z0-9*?-]{0,38}/[A-Za-z0-9_*?][A-Za-z0-9_.*?-]{0,99}$")
+CMUX_FOLDER = "~/Workspace"
+CMUX_COLORS = ("Red", "Crimson", "Orange", "Amber", "Olive", "Green", "Teal", "Aqua",
+               "Blue", "Navy", "Indigo", "Purple", "Magenta", "Rose", "Brown", "Charcoal")
+HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 PROJECT_KEYS = {"prefix"}  # settings a project's .warden may add to a resource; approval covers them
 AWS_CONFIG = "/home/claude/.aws/warden-config"  # container path; written by cbox at session start
 TUNNEL_DIR = os.environ.get("CBOX_TUNNEL_DIR", "/tmp/cbox-tunnel")  # container path; = _CBOX_TUNNEL_DIR
@@ -3731,6 +3791,14 @@ TEMPLATE = """\
 # [team]
 # type         = mail                    # the agents of the projects that list it can message each other
 # availability = project                 # a project joins by listing it in its .warden (you approve that)
+#
+# [projects]
+# type         = cmux                    # opens a repo in a new cmux workspace with cbox running (macOS)
+# repos        = my-org/*, my-user/notes # owner/name patterns the agent may open
+# folder       = ~/Workspace             # optional; a repo goes to <folder>/<name> (cloned when missing)
+# clone        = git@github.com:{repo}.git  # optional; the clone URL, {repo} is owner/name
+# secret       = cbox.warden.cmux        # optional: the cmux socket password (cmux's password mode)
+# availability = global                  # the agent runs: cbox-open owner/name
 """
 
 
@@ -3831,11 +3899,13 @@ def validate(name, r):
         return validate_ssh(r)
     if kind == "mcp":
         return validate_mcp(r)
+    if kind == "cmux":
+        return validate_cmux(r)
     if kind in ("whatsapp", "mail"):
         extra = set(r) - {"type", "availability"}
         return f"{', '.join(sorted(extra))} is not used by type = {kind} (it takes availability)" if extra else None
     if kind != "http":
-        return f"type '{kind}' is unknown (known: http, ssh, mcp, whatsapp, mail)"
+        return f"type '{kind}' is unknown (known: http, ssh, mcp, whatsapp, mail, cmux)"
     up = urlsplit(r.get("upstream", ""))
     if up.scheme not in ("http", "https") or not up.netloc:
         return "upstream must be an http(s) URL"
@@ -3872,6 +3942,24 @@ def validate_mcp(r):
         return "auth must be bearer, basic, header:<Name> or query:<param>"
     if not r.get("secret"):
         return "secret (Keychain item name) is missing"
+    return None
+
+
+def validate_cmux(r):
+    extra = set(r) - {"type", "repos", "folder", "clone", "secret", "secret-account", "cmux", "availability"}
+    if extra:
+        return (f"{', '.join(sorted(extra))} is not used by type = cmux "
+                "(it takes repos, folder, clone, secret, cmux, availability)")
+    pats = cmux_patterns(r)
+    if not pats:
+        return "repos is missing: the owner/name patterns the agent may open, e.g. repos = my-org/*"
+    for pat in pats:
+        if not REPO_PATTERN_RE.match(pat):
+            return f"repos entry '{pat}' is not an owner/name pattern (e.g. my-org/* or my-user/notes)"
+    if "{repo}" not in r.get("clone", "{repo}"):
+        return "clone must contain {repo}, e.g. clone = git@github.com:{repo}.git"
+    if not os.path.isabs(os.path.expanduser(r.get("folder", CMUX_FOLDER))):
+        return "folder must be an absolute path, e.g. folder = ~/Workspace"
     return None
 
 
@@ -4086,6 +4174,8 @@ def describe(r):
         return f"WhatsApp, {len(wa_list(r['list'])['chats'])} chosen chats, read-only ({r.get('availability', 'global')})"
     if r.get("type") == "mail":
         return f"mail between the agents of the projects that list it ({r.get('availability', 'global')})"
+    if r.get("type") == "cmux":
+        return f"opens repos {', '.join(cmux_patterns(r))} in cmux with cbox ({r.get('availability', 'global')})"
     scope = f", bucket {r['bucket']}" if r.get("bucket") else ""
     scope += f", prefix {r['prefix']}" if r.get("prefix") else ""
     return f"{r['upstream']} ({r.get('availability', 'global')}{scope})"
@@ -4355,6 +4445,9 @@ def cmd_session(d, box, project, base_url, interactive):
         print("WARDEN_WHATSAPP=" + ",".join(wa))  # names only, for cbox-whatsapp in the container
     if mail:
         print("WARDEN_MAIL=" + ",".join(mail))  # names only, for cbox-mail-watch in the container
+    cmux = [n for n in sorted(granted) if resources[n].get("type") == "cmux"]
+    if cmux:
+        print("WARDEN_CMUX=" + ",".join(cmux))  # names only, for cbox-open in the container
     if mcp:
         # Not container env: cbox adds these to the agent's MCP servers.
         print("WARDEN_MCP=" + base64.b64encode(json.dumps(mcp).encode()).decode())
@@ -4403,6 +4496,134 @@ def cmd_end(d, box):
             pass
     left = [f for f in os.listdir(s)] if os.path.isdir(s) else []
     sys.exit(0 if not any(f.endswith(".json") for f in left) else 1)
+
+
+# --- cmux: open a repo in a new cmux workspace ---------------------------------
+#
+# The container names a repo (owner/name) and optionally a color, nothing else.
+# warden checks the repo against the resource's patterns, clones it into
+# <folder>/<name> when it is missing, and runs cmux itself: a new workspace
+# named after the repo, in its folder, with "cbox" as the terminal's first
+# command. That fixed word is the only text typed into a host shell; the
+# container never reaches the cmux socket and gets no send-text or send-key.
+
+CMUX_LOCK = threading.Lock()  # one open at a time: no two clones into one folder
+
+
+class CmuxError(Exception):
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code = code
+
+
+def cmux_patterns(r):
+    return [p for p in r.get("repos", "").replace(",", " ").split() if p]
+
+
+def cmux_color(repo, asked=None):
+    """The color asked for (a cmux color name or #RRGGBB), else one of cmux's
+    named colors picked by the repo's name: the same repo always gets the same."""
+    if asked:
+        named = {c.lower(): c for c in CMUX_COLORS}
+        if asked.lower() in named:
+            return named[asked.lower()]
+        if HEX_COLOR_RE.match(asked):
+            return asked.upper()
+        raise CmuxError(400, f"color must be #RRGGBB or one of {', '.join(CMUX_COLORS)}")
+    return CMUX_COLORS[hashlib.sha256(repo.lower().encode()).digest()[0] % len(CMUX_COLORS)]
+
+
+def cmux_folder(r):
+    return os.path.realpath(os.path.expanduser(r.get("folder", CMUX_FOLDER)))
+
+
+def tilde(path):
+    home = os.path.realpath(os.path.expanduser("~"))
+    return "~" + path[len(home):] if path == home or path.startswith(home + os.sep) else path
+
+
+def cmux_run(r, args):
+    """Output of the cmux CLI with args. warden runs outside cmux terminals, so
+    the workspace and surface of whichever terminal started it are dropped."""
+    exe = os.path.expanduser(r.get("cmux", "")) or shutil.which("cmux")
+    if not exe:
+        raise CmuxError(502, "cmux command not found on the host — set its path in the resource: "
+                             "cmux = <path> (in a cmux terminal: command -v cmux)")
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("CMUX_") or k in ("CMUX_SOCKET_PATH", "CMUX_SOCKET", "CMUX_SOCKET_PASSWORD")}
+    env["CMUX_QUIET"] = "1"
+    if r.get("secret"):
+        try:
+            env["CMUX_SOCKET_PASSWORD"] = read_secret(r)
+        except (LookupError, OSError, subprocess.SubprocessError) as e:
+            raise CmuxError(502, str(e))
+    try:
+        p = subprocess.run([exe] + args, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise CmuxError(502, f"cmux did not run: {e.__class__.__name__}")
+    out = p.stdout.decode(errors="replace").strip()
+    if p.returncode != 0:
+        raise CmuxError(502, f"cmux {args[0]} failed: {out[-300:] or 'no output'} — warden runs outside "
+                             "cmux terminals: cmux's socket access must let it in (cmux settings; with "
+                             "password mode, put the password's Keychain item in the resource as secret =)")
+    return out
+
+
+def git_origin(path):
+    p = subprocess.run(["git", "-C", path, "remote", "get-url", "origin"], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+    return p.stdout.decode(errors="replace").strip() if p.returncode == 0 else None
+
+
+def same_remote(a, b):
+    norm = lambda u: re.sub(r"(\.git)?/*$", "", (u or "").strip()).lower()
+    return bool(a) and norm(a) == norm(b)
+
+
+def cmux_open(r, repo, color=None):
+    """Clones repo when missing and opens it in a new cmux workspace with cbox."""
+    if not isinstance(repo, str) or not REPO_RE.match(repo) or repo.lower().endswith(".git"):
+        raise CmuxError(400, "repo must be a plain owner/name, e.g. my-org/my-repo")
+    if not any(fnmatchcase(repo.lower(), p.lower()) for p in cmux_patterns(r)):
+        raise CmuxError(403, f"{repo} is not among the repos this resource opens ({', '.join(cmux_patterns(r))})")
+    if color is not None and not isinstance(color, str):
+        raise CmuxError(400, "color must be a string")
+    color = cmux_color(repo, color)
+    name = repo.split("/", 1)[1]
+    folder = cmux_folder(r)
+    path = os.path.join(folder, name)
+    url = r.get("clone", "git@github.com:{repo}.git").replace("{repo}", repo)
+    with CMUX_LOCK:
+        if os.path.lexists(path):
+            if not os.path.isdir(path) or not same_remote(git_origin(path), url):
+                raise CmuxError(409, f"{tilde(path)} exists and is not a clone of {url} — "
+                                     "move it away or open that repo by hand")
+            cloned = False
+        else:
+            os.makedirs(folder, exist_ok=True)
+            env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+            env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+            try:
+                p = subprocess.run(["git", "clone", "--quiet", "--", url, path], env=env, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
+            except (OSError, subprocess.SubprocessError) as e:
+                raise CmuxError(502, f"git clone {url} did not finish: {e.__class__.__name__}")
+            if p.returncode != 0:
+                last = (p.stdout.decode(errors="replace").strip().splitlines() or ["no output"])[-1]
+                raise CmuxError(502, f"git clone {url} failed: {last[:300]}")
+            cloned = True
+        out = cmux_run(r, ["new-workspace", "--name", name, "--cwd", path, "--command", "cbox"])
+        m = re.search(r"\bworkspace:\d+\b", out) or re.search(
+            r"\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\b", out)
+        if not m:
+            raise CmuxError(502, f"cmux new-workspace gave no workspace id: {out[-300:] or 'no output'}")
+        result = {"repo": repo, "workspace": m.group(0), "path": tilde(path), "cloned": cloned, "color": color}
+        try:
+            cmux_run(r, ["workspace-action", "--action", "set-color", "--color", color, "--workspace", m.group(0)])
+        except CmuxError as e:
+            result["warning"] = f"the workspace is open, but its color is not set: {e}"
+        return result
 
 
 # --- broker -------------------------------------------------------------------
@@ -4541,6 +4762,8 @@ class Broker(http.server.BaseHTTPRequestHandler):
         resources = load_resources(self.d)
         if name not in sess.get("resources", []) or name not in resources:
             return self.fail(403, f"resource '{name}' is not available to this container", who)
+        if resources[name].get("type") == "cmux":
+            return self.cmux(name, resources[name], rest, who)
         if resources[name].get("type", "http") not in ("http", "mcp"):
             return self.fail(404, f"'{name}' is not an http resource", who)
         r, problem = with_project(name, resources[name], sess.get("settings", {}).get(name, {}))
@@ -4606,6 +4829,32 @@ class Broker(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
         finally:
             conn.close()
+
+    def cmux(self, name, r, rest, who):
+        """POST <resource>/open {"repo": "owner/name", "color": optional}."""
+        if self.command != "POST" or rest != "/open":
+            return self.fail(404, f"'{name}' takes only: POST {name}/open {{\"repo\": \"owner/name\"}}", who)
+        size = int(self.headers.get("Content-Length") or 0)
+        if not 0 < size <= 4096:
+            return self.fail(400, "send a JSON body with a Content-Length up to 4096 bytes", who)
+        try:
+            req = json.loads(self.rfile.read(size))
+            if not isinstance(req, dict) or set(req) - {"repo", "color"}:
+                raise ValueError
+        except ValueError:
+            return self.fail(400, 'body must be JSON: {"repo": "owner/name", "color": optional}', who)
+        try:
+            result = cmux_open(r, req.get("repo"), req.get("color"))
+        except CmuxError as e:
+            return self.fail(e.code, str(e), who)
+        log_line(self.d, f"{who} POST {name}/open {result['repo']} -> 200 {result['workspace']}"
+                         f"{' (cloned)' if result['cloned'] else ''}")
+        body = json.dumps(result).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = handle_any
 
@@ -5205,6 +5454,10 @@ def cmd_list(d, project):
             print(f"{'✔' if here else '·'} {n:<16} mail between agents"
                   f"{' — ' + ', '.join(members) if members else ''}  [{note}]")
             continue
+        if r.get("type") == "cmux":
+            print(f"{'✔' if here else '·'} {n:<16} cmux: opens {', '.join(cmux_patterns(r))} "
+                  f"in {tilde(cmux_folder(r))}  [{note}]")
+            continue
         scope = "".join(f", {k} {r[k]}" for k in ("bucket", "prefix") if r.get(k))
         print(f"{'✔' if here else '·'} {n:<16} {r['upstream']}  [{r['auth'].split(':')[0]}{scope}; {note}]")
     if names is None:
@@ -5242,6 +5495,17 @@ def cmd_test(d, name):
             sys.exit(1)
         chosen = wa_list(r["list"])["chats"]
         print(f"✔ {name}: WhatsApp readable — {len(set(chosen) & known)} of {len(chosen)} chosen chats found")
+        return
+    if r.get("type") == "cmux":
+        try:
+            cmux_run(r, ["list-workspaces"])
+        except CmuxError as e:
+            err(f"✖ {name}: {e}")
+            sys.exit(1)
+        print(f"✔ {name}: cmux answers; repos {', '.join(cmux_patterns(r))} open in {tilde(cmux_folder(r))}")
+        if os.environ.get("CMUX_WORKSPACE_ID"):
+            print("ℹ  This terminal is inside cmux, which cmux lets in anyway. The broker runs outside it:\n"
+                  "   test from another terminal app, or open a repo from a container (cbox-open).")
         return
     if r.get("type") == "mail":
         members = mail_members(d, name)
@@ -6695,7 +6959,7 @@ _cbox_enter() {
   # CBOX_CONTAINER tells tools such as flux they run in a claudebox container
   # rather than on a host, which on Linux they cannot tell from the OS alone.
   local _exec_args=(-it -w "/Workspace/$name" -e "CBOX_CONTAINER=$name")
-  local _run="$command" _g _tunnel=$_audio _warden_mcp="" _warden_oc="" _warden_mail=""
+  local _run="$command" _g _tunnel=$_audio _warden_mcp="" _warden_oc="" _warden_mail="" _warden_cmux=""
   if (( _audio )); then
     # Through the tunnel, PulseAudio sees a local client and would offer shared
     # memory, which cannot cross it: the client has to turn it off.
@@ -6742,9 +7006,19 @@ _cbox_enter() {
         WARDEN_OPENCODE=*) _warden_oc=$(printf '%s' "${_w_env#*=}" | base64 -d 2>/dev/null) || _warden_oc="" ;;
         # Mail groups: container env for cbox-mail-watch, and the hooks below.
         WARDEN_MAIL=*) _warden_mail="${_w_env#*=}"; _exec_args+=(-e "$_w_env") ;;
+        # cmux resources: container env for cbox-open, installed below.
+        WARDEN_CMUX=*) _warden_cmux=1; _exec_args+=(-e "$_w_env") ;;
         ?*) _exec_args+=(-e "$_w_env") ;;
       esac
     done < <(_cbox_warden_start "$name")
+  fi
+
+  if [[ -n "$_warden_cmux" ]]; then
+    if ! _cbox_cmux_open_py | _cbox_put "$name" "${_CBOX_MCP_RELAY%/*}/cbox-open"; then
+      echo "⚠  Could not install cbox-open in '$name' — opening repos in cmux unavailable this session"
+    elif [[ "$command" == "claude" ]]; then
+      _run+=" --append-system-prompt $(printf '%q' "$_CBOX_CMUX_PROMPT")"
+    fi
   fi
 
   if [[ "$agent_bin" == "claude" ]]; then

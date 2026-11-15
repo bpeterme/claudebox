@@ -369,6 +369,7 @@ credential on the way out. Inside the container, requests go to
 | A remote MCP server's token | `type = mcp` | The server in Claude's and opencode's MCP list |
 | WhatsApp chats you choose (WhatsApp Desktop on this Mac) | `type = whatsapp` | A read-only MCP server that knows only those chats (see [WhatsApp chats](#whatsapp-chats)) |
 | Messages between the agents of your projects | `type = mail` | An MCP server to message the other projects in the group (see [Agent mail](#agent-mail)) |
+| Open repos in new cmux workspaces with cbox | `type = cmux` | The `cbox-open` command (see [Opening repos in cmux](#opening-repos-in-cmux)) |
 
 ```sh
 cbox warden secret set openrouter   # paste the key; stored in the Keychain (Linux: keyring)
@@ -624,6 +625,50 @@ messages as they arrive.
   group with. The messages stay on the host in `$CBOX_WARDEN_DIR/mail/`,
   never in a container.
 - Not available in safe mode.
+
+### Opening repos in cmux
+
+Tell Claude "open repo my-org/api" in any session: a new
+[cmux](https://cmux.com) workspace opens on your Mac, named `api` and colored,
+with `cbox` already starting in `~/Workspace/api`. The repo is cloned there
+first when it is missing. Claude stays in its container.
+
+**Set up (once):**
+
+1. `cbox warden edit` and add:
+
+   ```ini
+   [projects]
+   type         = cmux
+   repos        = my-org/*, my-user/notes   # what Claude may open (owner/name patterns)
+   availability = global
+   ```
+
+   Optional: `folder = ~/Workspace` (where repos go), `clone =
+   git@github.com:{repo}.git` (the clone URL), `cmux = <path>` (when `cmux` is
+   not on the `PATH` of the terminal that starts cbox).
+
+2. Let warden reach cmux. cmux's default socket access, "cmux processes only",
+   refuses warden: it runs in the background, outside cmux terminals. In cmux's
+   settings, pick a mode that lets local processes in. For a password mode,
+   store the password with `cbox warden secret set projects` and add
+   `secret = cbox.warden.projects` to the resource.
+
+3. Check it from a terminal that is **not** cmux (e.g. Terminal.app):
+   `cbox warden test projects`.
+
+In the container, Claude runs `cbox-open owner/name [--color Teal]`. The color
+is one of cmux's named colors or `#RRGGBB`; without one, the repo's name picks
+it, so a repo keeps its color.
+
+**What the container can do:** name a repo that matches `repos`, and a color.
+warden checks both, clones over SSH with your host's git, and runs cmux
+itself. The only text typed into the new terminal is `cbox`. The container
+never reaches the cmux socket, so it cannot send keys or commands to your
+terminals. A folder that already exists is opened only when its `origin` is
+that repo.
+
+Not available in safe mode.
 
 ## macOS: Screenshot Script
 

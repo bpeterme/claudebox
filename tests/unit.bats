@@ -2943,6 +2943,20 @@ print(sorted(set(g.values())), g.get(hub), lab in g)" "$CBOX_WARDEN_DIR" "$(_fak
   done
 }
 
+@test "_cbox_create: labels its folder without replacing the cbox label (prune, list)" {
+  local capture="$BATS_TMPDIR/create-folder-args"
+  rm -f "$capture"
+  cd "$BATS_TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  _cbox_create "cbox-unit-folder" normal
+  run cat "$capture"
+  [[ "$output" == *$'\n--label\n'"$CBOX_LABEL"$'\n'* ]]
+  [[ "$output" == *$'\n--label\ncbox.folder='"$BATS_TMPDIR"$'\n'* ]]
+  # No other label may reuse the key prune and list filter on.
+  [ "$(grep -c "^${CBOX_LABEL%%=*}=" "$capture")" -eq 1 ]
+}
+
 @test "_cbox_old_init: recognises containers created with tail as PID 1" {
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { echo '[{"configuration": {"initProcess": {"executable": "tail", "arguments": ["-f", "/dev/null"]}}}]'; }
@@ -3381,6 +3395,54 @@ _safe_setup() {
   _cbox_exists() { return 1; }
   run _cbox_ensure box existing
   [ "$output" = "create box normal" ]
+}
+
+@test "_cbox_project_dir: label first, else the /Workspace mount (docker and apple)" {
+  _CBOX_CMD=fake_rt
+  fake_rt() { printf '%s' "$FAKE_JSON"; }
+  FAKE_JSON='[{"Config":{"Labels":{"cbox.project":"true","cbox.folder":"/p/new"}},"Mounts":[{"Source":"/p/old","Destination":"/Workspace/box"}]}]'
+  [ "$(_cbox_project_dir box)" = "/p/new" ]
+  FAKE_JSON='[{"Config":{"Labels":{"cbox.project":"true"}},"Mounts":[{"Source":"/x","Destination":"/home/claude/share"},{"Source":"/p/m8 systems","Destination":"/Workspace/box"}]}]'
+  [ "$(_cbox_project_dir box)" = "/p/m8 systems" ]
+  FAKE_JSON='[{"configuration":{"labels":{},"mounts":[{"source":"/p/apple","destination":"/Workspace/box"}]}}]'
+  [ "$(_cbox_project_dir box)" = "/p/apple" ]
+  FAKE_JSON='not json'
+  [ -z "$(_cbox_project_dir box)" ]
+}
+
+@test "_cbox_ensure: refuses a container made for a renamed or a different folder" {
+  _CBOX_RUNTIME=docker
+  _cbox_system_start() { :; }
+  _cbox_exists() { return 0; }
+  _cbox_mode() { echo normal; }
+  _cbox_running() { return 1; }
+  _CBOX_CMD=fake_rt
+  fake_rt() { [[ "$1" == inspect ]] && printf '[{"Config":{"Labels":{"cbox.project":"true","cbox.folder":"%s"}}}]' "$DIR" || echo started >> "$BATS_TMPDIR/started"; }
+  rm -f "$BATS_TMPDIR/started"
+  mkdir -p "$BATS_TMPDIR/m8-systems" "$BATS_TMPDIR/m8 systems"
+  cd "$BATS_TMPDIR/m8-systems"
+  # Folder renamed: the old path is gone.
+  DIR="$BATS_TMPDIR/gone systems"
+  run _cbox_ensure m8-systems normal
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no longer exists"*"gone systems"*"cbox reset"* ]]
+  [ ! -e "$BATS_TMPDIR/started" ]
+  # Another folder with the same container name.
+  DIR="$BATS_TMPDIR/m8 systems"
+  run _cbox_ensure m8-systems normal
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"belongs to another folder"*"m8 systems"* ]]
+  # Its own folder, also through a symlink: starts as before.
+  DIR="$BATS_TMPDIR/m8-systems"
+  ln -sfn "$BATS_TMPDIR/m8-systems" "$BATS_TMPDIR/m8-link"
+  cd "$BATS_TMPDIR/m8-link"
+  run _cbox_ensure m8-systems normal
+  [ "$status" -eq 0 ]
+  [ -e "$BATS_TMPDIR/started" ]
+  # Runtime does not tell: no check.
+  DIR=""
+  run _cbox_ensure m8-systems normal
+  [ "$status" -eq 0 ]
 }
 
 @test "cbox shell: opens zsh in an existing safe container" {

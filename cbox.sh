@@ -416,7 +416,7 @@ _cbox_rt_label() {
   fi
 }
 
-# The host folder container $1 was created for: its cbox.project label, or for
+# The host folder container $1 was created for: its cbox.folder label, or for
 # containers made before that label, the source of its /Workspace/$1 mount.
 # Empty when the runtime does not tell.
 _cbox_project_dir() {
@@ -432,8 +432,8 @@ if not isinstance(e, dict):
     sys.exit(0)
 c = e.get("configuration") or e.get("Config") or e
 l = c.get("labels") or c.get("Labels") or {}
-if isinstance(l, dict) and l.get("cbox.project"):
-    print(l["cbox.project"]); sys.exit(0)
+if isinstance(l, dict) and l.get("cbox.folder"):
+    print(l["cbox.folder"]); sys.exit(0)
 for m in e.get("Mounts") or c.get("mounts") or []:
     if isinstance(m, dict) and (m.get("Destination") or m.get("destination")) == sys.argv[1]:
         print(m.get("Source") or m.get("source") or ""); break
@@ -6493,7 +6493,7 @@ _cbox_create() {
     --label "$CBOX_LABEL"
     --label "cbox.mode=$mode"
     --label "cbox.agent=$agent_bin"
-    --label "cbox.project=$PWD"
+    --label "cbox.folder=$PWD"
 
     -v "$PWD:/Workspace/$name"
     -w "/Workspace/$name"

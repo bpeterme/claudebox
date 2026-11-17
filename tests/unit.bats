@@ -3,9 +3,16 @@
 CBOX_SH="$(cd "$BATS_TEST_DIRNAME/.." && pwd)/cbox.sh"
 
 setup() {
-  # On macOS the temp dir (/var/folders/…) is itself behind a symlink
-  # (/var → /private/var); cbox resolves paths, so compare against the real one.
-  BATS_TMPDIR=$(cd "$BATS_TMPDIR" && pwd -P)
+  # In Linux, the run's own temp dir: agents running the suite at the same time
+  # in one container would otherwise share HOME, CBOX_DATA_DIR, relay pid files
+  # and mail groups, kill each other's servers and leave bats waiting forever.
+  # Not on macOS: its temp dir is already long (/var/folders/…), and the run dir
+  # pushes socket paths past the 104-character limit; agents run in containers.
+  # On macOS the temp dir is itself behind a symlink (/var → /private/var);
+  # cbox resolves paths, so compare against the real one.
+  local tmp="$BATS_TMPDIR"
+  [[ "$(/usr/bin/uname)" == "Darwin" ]] || tmp="${BATS_RUN_TMPDIR:-$BATS_TMPDIR}"
+  BATS_TMPDIR=$(cd "$tmp" && pwd -P)
   # macOS has no `timeout`; the relay tests use it to bound a hanging client.
   if ! command -v timeout >/dev/null 2>&1; then
     mkdir -p "$BATS_TMPDIR/bin"
@@ -1400,6 +1407,39 @@ _share_setup() {
 # ---------------------------------------------------------------------------
 # _cbox_container_has_sessions
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# _cbox_session_hangup
+# ---------------------------------------------------------------------------
+
+@test "_cbox_session_hangup: ends the whole session in the container, even what ignores HUP" {
+  [[ "$(/usr/bin/uname)" != "Darwin" ]] || skip "runs in the Linux container (setsid, ps -s)"
+  printf '#!/bin/sh\nshift 2\nexec "$@"\n' > "$BATS_TMPDIR/rt"; chmod +x "$BATS_TMPDIR/rt"
+  _CBOX_CMD="$BATS_TMPDIR/rt"
+  local f; f=$(_cbox_session_pidfile "bats-$$")
+  # A session like an exec'd agent: its leader writes the PID; a child ignores HUP.
+  setsid sh -c 'echo $$ > "$1"; trap "" HUP; sleep 300 & sleep 300' sh "$f" </dev/null >/dev/null 2>&1 &
+  for _ in $(seq 50); do [ -s "$f" ] && break; sleep 0.1; done
+  local sid; sid=$(cat "$f")
+  [ "$(ps -o pid= -s "$sid" | wc -l)" -ge 2 ]
+  ( _cbox_session_hangup box "bats-$$" )
+  [ "$(ps -o pid= -s "$sid" | wc -l)" -eq 0 ]
+  [ ! -e "$f" ]
+}
+
+@test "_cbox_session_hangup: a missing or broken PID file ends nothing" {
+  printf '#!/bin/sh\nshift 2\nexec "$@"\n' > "$BATS_TMPDIR/rt"; chmod +x "$BATS_TMPDIR/rt"
+  _CBOX_CMD="$BATS_TMPDIR/rt"
+  run bash -c "$(declare -f _cbox_session_pidfile _cbox_session_hangup); _CBOX_CMD=$_CBOX_CMD; _cbox_session_hangup box bats-none-$$; echo rc=\$?"
+  [ "$output" = "" ]  # its output goes nowhere: the terminal is gone
+  local f; f=$(_cbox_session_pidfile "bats-bad-$$")
+  echo "1; touch $BATS_TMPDIR/ran" > "$f"
+  SECONDS=0
+  ( _cbox_session_hangup box "bats-bad-$$" )
+  [ "$SECONDS" -lt 2 ]  # stopped at the check, before pkill and its wait
+  [ ! -e "$f" ]
+  [ ! -e "$BATS_TMPDIR/ran" ]
+}
 
 @test "_cbox_container_has_sessions: returns 1 when only PID 1 and the probe run with PPID 0" {
   _CBOX_CMD=_fake_runtime
@@ -3177,7 +3217,12 @@ _enter_safe() {
   capture="$BATS_TMPDIR/enter-egress"; rm -f "$capture"
   cd "$BATS_TMPDIR"
   _CBOX_CMD=_fake_runtime
-  _fake_runtime() { echo "$*" >> "$capture"; }
+  _fake_runtime() {
+    echo "$*" >> "$capture"
+    # HUP=1: the terminal closes under the session (e.g. its cmux pane is closed).
+    # (No $BASHPID in macOS's bash 3.2: a child signals its parent, this shell.)
+    if [[ -n "${HUP:-}" && "$1 $2" == "exec -it" ]]; then sh -c 'kill -HUP $PPID'; fi
+  }
   _cbox_mode() { echo "$MODE"; }
   _cbox_rt_label() { case "$2" in cbox.egress) echo "$EGRESS" ;; cbox.safe-login) echo "$LOGIN" ;;
                                   cbox.sessions) echo "${SESSIONS-local}" ;; esac; }
@@ -3291,8 +3336,17 @@ _update() {
   run _enter_safe
   [[ "$output" != *"created by an older cbox"* ]]
   run cat "$BATS_TMPDIR/enter-egress"
-  [[ "$output" == *"zsh -ic mkdir -p -m 700 $_CBOX_SESSIONS_LOCAL; "* ]]
+  [[ "$output" == *"zsh -ic print \$\$ >| /tmp/cbox-session-"*".pid; mkdir -p -m 700 $_CBOX_SESSIONS_LOCAL; "* ]]
   [ "$(readlink "$CBOX_CLAUDE_DIR/sessions")" = "$_CBOX_SESSIONS_LOCAL" ]
+}
+
+@test "_cbox_enter: a closed terminal ends the session's processes in the container" {
+  MODE=normal EGRESS="" LOGIN="" HUP=1
+  run _enter_safe
+  run cat "$BATS_TMPDIR/enter-egress"
+  local pidfile; pidfile=$(grep -o '/tmp/cbox-session-[0-9]*-[0-9]*\.pid' <<<"$output" | head -1)
+  [ -n "$pidfile" ]
+  [[ "$output" == *"exec -it "*"zsh -ic print \$\$ >| $pidfile; "*$'\n'"exec ebox sh -c "*" sh $pidfile"* ]]
 }
 
 @test "_cbox_enter: a normal container made with a sessions mount gets a reset hint" {
@@ -4429,6 +4483,8 @@ _mail_watch_setup() {
     "$MD/mail/server.py" "$MD" > "$CBOX_WARDEN_DIR/sessions/rbox.mcp"
   _relay_setup
   MW="${_CBOX_MCP_RELAY%/*}/cbox-mail-watch"
+  # Watchers share /tmp/cbox-mail-watch with other runs and the container's own agents.
+  MW_SESSION="bats-arm-$$"
 }
 
 _mail_watch_teardown() {
@@ -4438,7 +4494,7 @@ _mail_watch_teardown() {
 
 @test "cbox-mail-watch: arm wakes the agent (exit 2) when mail comes, once; disarm ends the waiting" {
   _mail_watch_setup
-  hook='{"session_id":"bats-arm-1","hook_event_name":"Stop"}'
+  hook="{\"session_id\":\"$MW_SESSION-1\",\"hook_event_name\":\"Stop\"}"
   run env -u WARDEN_MAIL python3 "$MW" arm <<<"$hook"
   no_group=$status
   ( sleep 2; _mail_serve alpha '{"name":"mail_send","arguments":{"to":"rbox","subject":"q","text":"hi"}}' >/dev/null ) &
@@ -4458,12 +4514,12 @@ _mail_watch_teardown() {
   [[ "$woke_out" == "1 new message(s) from alpha in thread "*' ("q")'$'\n'*"Read them with mail_read"* ]]
   [ "$waited" = yes ]
   [ "$ended" = yes ]
-  [ ! -e /tmp/cbox-mail-watch/bats-arm-1.pid ]
+  [ ! -e "/tmp/cbox-mail-watch/$MW_SESSION-1.pid" ]
 }
 
 @test "cbox-mail-watch: a newer arm replaces the older; a watcher ends when its agent is gone" {
   _mail_watch_setup
-  hook='{"session_id":"bats-arm-2","hook_event_name":"Stop"}'
+  hook="{\"session_id\":\"$MW_SESSION-2\",\"hook_event_name\":\"Stop\"}"
   echo "$hook" > "$BATS_TMPDIR/hook.json"
   WARDEN_MAIL=team python3 "$MW" arm <<<"$hook" & first=$!
   sleep 1
@@ -4477,7 +4533,7 @@ _mail_watch_teardown() {
 subprocess.Popen(["sh", "-c", sys.argv[1] + " arm < " + sys.argv[2]])
 time.sleep(1)' "python3 $MW" "$BATS_TMPDIR/hook.json"
   sleep 3
-  left=$(ps -eo args | grep -c "[c]box-mail-watch arm" || true)
+  left=$(ps -eo args | grep -c "${MW%/*}/[c]box-mail-watch arm" || true)  # this test's watchers only
   _mail_watch_teardown
   [ "$replaced" = yes ]
   [ "$kept" = yes ]

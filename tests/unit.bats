@@ -1408,6 +1408,38 @@ _share_setup() {
 # _cbox_container_has_sessions
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# _cbox_session_hangup
+# ---------------------------------------------------------------------------
+
+@test "_cbox_session_hangup: ends the whole session in the container, even what ignores HUP" {
+  printf '#!/bin/sh\nshift 2\nexec "$@"\n' > "$BATS_TMPDIR/rt"; chmod +x "$BATS_TMPDIR/rt"
+  _CBOX_CMD="$BATS_TMPDIR/rt"
+  local f; f=$(_cbox_session_pidfile "bats-$$")
+  # A session like an exec'd agent: its leader writes the PID; a child ignores HUP.
+  setsid sh -c 'echo $$ > "$1"; trap "" HUP; sleep 300 & sleep 300' sh "$f" </dev/null >/dev/null 2>&1 &
+  for _ in $(seq 50); do [ -s "$f" ] && break; sleep 0.1; done
+  local sid; sid=$(cat "$f")
+  [ "$(ps -o pid= -s "$sid" | wc -l)" -ge 2 ]
+  ( _cbox_session_hangup box "bats-$$" )
+  [ "$(ps -o pid= -s "$sid" | wc -l)" -eq 0 ]
+  [ ! -e "$f" ]
+}
+
+@test "_cbox_session_hangup: a missing or broken PID file ends nothing" {
+  printf '#!/bin/sh\nshift 2\nexec "$@"\n' > "$BATS_TMPDIR/rt"; chmod +x "$BATS_TMPDIR/rt"
+  _CBOX_CMD="$BATS_TMPDIR/rt"
+  run bash -c "$(declare -f _cbox_session_pidfile _cbox_session_hangup); _CBOX_CMD=$_CBOX_CMD; _cbox_session_hangup box bats-none-$$; echo rc=\$?"
+  [ "$output" = "" ]  # its output goes nowhere: the terminal is gone
+  local f; f=$(_cbox_session_pidfile "bats-bad-$$")
+  echo "1; touch $BATS_TMPDIR/ran" > "$f"
+  SECONDS=0
+  ( _cbox_session_hangup box "bats-bad-$$" )
+  [ "$SECONDS" -lt 2 ]  # stopped at the check, before pkill and its wait
+  [ ! -e "$f" ]
+  [ ! -e "$BATS_TMPDIR/ran" ]
+}
+
 @test "_cbox_container_has_sessions: returns 1 when only PID 1 and the probe run with PPID 0" {
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { printf '    1     0 tail\n   61     1 dbus-daemon\n  900     0 ps\n'; }
@@ -3184,7 +3216,11 @@ _enter_safe() {
   capture="$BATS_TMPDIR/enter-egress"; rm -f "$capture"
   cd "$BATS_TMPDIR"
   _CBOX_CMD=_fake_runtime
-  _fake_runtime() { echo "$*" >> "$capture"; }
+  _fake_runtime() {
+    echo "$*" >> "$capture"
+    # HUP=1: the terminal closes under the session (e.g. its cmux pane is closed).
+    if [[ -n "${HUP:-}" && "$1 $2" == "exec -it" ]]; then kill -HUP "$BASHPID"; fi
+  }
   _cbox_mode() { echo "$MODE"; }
   _cbox_rt_label() { case "$2" in cbox.egress) echo "$EGRESS" ;; cbox.safe-login) echo "$LOGIN" ;;
                                   cbox.sessions) echo "${SESSIONS-local}" ;; esac; }
@@ -3298,8 +3334,17 @@ _update() {
   run _enter_safe
   [[ "$output" != *"created by an older cbox"* ]]
   run cat "$BATS_TMPDIR/enter-egress"
-  [[ "$output" == *"zsh -ic mkdir -p -m 700 $_CBOX_SESSIONS_LOCAL; "* ]]
+  [[ "$output" == *"zsh -ic print \$\$ >| /tmp/cbox-session-"*".pid; mkdir -p -m 700 $_CBOX_SESSIONS_LOCAL; "* ]]
   [ "$(readlink "$CBOX_CLAUDE_DIR/sessions")" = "$_CBOX_SESSIONS_LOCAL" ]
+}
+
+@test "_cbox_enter: a closed terminal ends the session's processes in the container" {
+  MODE=normal EGRESS="" LOGIN="" HUP=1
+  run _enter_safe
+  run cat "$BATS_TMPDIR/enter-egress"
+  local pidfile; pidfile=$(grep -o '/tmp/cbox-session-[0-9]*-[0-9]*\.pid' <<<"$output" | head -1)
+  [ -n "$pidfile" ]
+  [[ "$output" == *"exec -it "*"zsh -ic print \$\$ >| $pidfile; "*$'\n'"exec ebox sh -c "*" sh $pidfile"* ]]
 }
 
 @test "_cbox_enter: a normal container made with a sessions mount gets a reset hint" {

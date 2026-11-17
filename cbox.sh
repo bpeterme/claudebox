@@ -782,6 +782,25 @@ _cbox_session_markers() {
   return 0
 }
 
+# The session's first process in the container writes its PID here, so cbox
+# can end the session when its terminal closes under it.
+_cbox_session_pidfile() {
+  echo "/tmp/cbox-session-$1.pid"
+}
+
+# A closed terminal (e.g. a closed cmux pane) ends cbox and the runtime's exec
+# client, but the runtime keeps the exec'd process running in the container:
+# an agent left behind, holding memory. Ends the session's processes there
+# (HUP, then KILL what is left after 2 seconds) and lets the rest of the
+# teardown run without a terminal to write to.
+_cbox_session_hangup() {
+  exec >/dev/null 2>&1 </dev/null
+  # shellcheck disable=SC2016  # expanded by the container's sh
+  $_CBOX_CMD exec "$1" sh -c 'p=$(cat "$1" 2>/dev/null) || exit 0; rm -f "$1"
+    case $p in ""|*[!0-9]*) exit 0 ;; esac
+    pkill -HUP -s "$p"; sleep 2; pkill -KILL -s "$p"; exit 0' sh "$(_cbox_session_pidfile "$2")" || true
+}
+
 # Asks the container itself whether any exec session is still attached.
 # Exec'd processes run with PPID 0 (PID 1 is the runtime's init); the probe's
 # own `ps` and the command that keeps the container running (`tail`, also
@@ -7173,10 +7192,19 @@ _cbox_enter() {
   _cbox_session_start "$name"
   _cbox_busy_end
 
+  # The session's PID, for _cbox_session_hangup when the terminal closes. It
+  # is also the session's id in the container: the runtime starts each exec in
+  # a session of its own. Nothing runs after $_run, so zsh still execs into
+  # the agent; the hangup removes the file, the container's restart the rest.
+  local _sid="$$-$RANDOM"
+  _run="print \$\$ >| $(_cbox_session_pidfile "$_sid"); $_run"
+  trap '_cbox_session_hangup "$name" "$_sid"' HUP TERM
+
   # The agent's exit status is irrelevant here, but under the script's
   # `set -e` a non-zero one would skip every teardown step below —
   # including stopping the container.
   $_CBOX_CMD exec "${_exec_args[@]}" "$name" zsh -ic "$_run" || true
+  trap - HUP TERM
 
   _cbox_busy_begin "closing session..."
 

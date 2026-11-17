@@ -115,6 +115,10 @@ USER claude
 
 RUN mkdir -p /home/claude/.ssh && chmod 700 /home/claude/.ssh
 
+# Claude Code's session registry on the container's own disk; ~/.claude/sessions
+# links here (see _cbox_sessions_link in cbox.sh). Sessions recreate it too.
+RUN mkdir -p -m 700 /home/claude/.local/state/claude-sessions
+
 # .zshrc loader
 RUN printf '[ -f /home/claude/.zshrc.global ] && . /home/claude/.zshrc.global\n[ -f /home/claude/.zshrc.local ] && . /home/claude/.zshrc.local\n' \
     > /home/claude/.zshrc

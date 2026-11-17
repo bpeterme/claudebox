@@ -86,7 +86,10 @@ Container Management:
   cbox rebuild                        Rebuild container image
 
 Project file .cbox:
-  ports = 47821 3000                  Reach servers in the container at http://localhost:<port>
+  [container]
+    ports = 47821 3000                Reach servers in the container at http://localhost:<port>
+    memory = 8g                       Container memory (default CBOX_MEMORY), e.g. for several agents
+  [warden "<resource>"]               Ask warden for a resource (you approve it once)
 
 MCP servers on the host ($(_cbox_shown "$CBOX_MCP_CONFIG")):
   cbox mcp                            Show configured host MCP servers and relay status
@@ -96,7 +99,7 @@ Credentials without exposing them (warden):
   cbox warden                         List resources and what this project gets
   cbox warden edit                    Define resources (APIs, storage, ssh keys, MCP servers)
   cbox warden secret set <resource>   Store a secret in the Keychain (Linux: keyring)
-  cbox warden approve                 Approve this project's .warden file
+  cbox warden approve                 Approve what this project's .cbox asks warden for
   cbox warden test <resource>         Check a resource from the host
   cbox warden whatsapp pick <name>    Choose WhatsApp chats Claude may read
   cbox warden mail                    Messages agents sent each other (show <thread>, -f to follow,
@@ -173,6 +176,9 @@ _CBOX_OPENCODE_CONFIG="/home/claude/.cache/cbox/opencode.json"
 # Claude Code settings cbox writes in the container for sessions in a mail
 # group (claude --settings): the hooks of cbox-mail-watch.
 _CBOX_MAIL_HOOKS="/home/claude/.cache/cbox/mail-hooks.json"
+# Claude Code's registry of running sessions, on each container's own disk;
+# the shared folder's sessions entry links here (see _cbox_sessions_link).
+_CBOX_SESSIONS_LOCAL="/home/claude/.local/state/claude-sessions"
 # warden: host-side credential broker (see "warden" below). Its directory holds
 # resource definitions, approvals and session tokens — host only, never mounted.
 CBOX_WARDEN_DIR="${CBOX_WARDEN_DIR:-$CBOX_DATA_DIR/warden}"
@@ -181,6 +187,12 @@ CBOX_WARDEN_PORT="${CBOX_WARDEN_PORT:-47100}"
 # Claude Code (~400 MB) plus a test suite or a large file can exhaust; the VM
 # then dies with the session. Applies when a container is created (cbox reset).
 CBOX_MEMORY="${CBOX_MEMORY:-4g}"
+# Terminal identity (names of variables your terminal sets) that a session
+# passes to the host MCP servers it calls, so a server such as a terminal
+# integration acts on that session's own window or tab. Several sessions of a
+# container share one relay; without this, every server would see the terminal
+# of the session that started it. Only names listed here ever reach a server.
+CBOX_SESSION_ENV="${CBOX_SESSION_ENV-TERM_PROGRAM TERM_SESSION_ID ITERM_SESSION_ID KITTY_WINDOW_ID WEZTERM_PANE TMUX_PANE CMUX_WORKSPACE_ID CMUX_SURFACE_ID}"
 # Mount the project's .git/config and .git/hooks read-only (see _cbox_create).
 # 0 lets the container change them again. Applies when a container is created.
 CBOX_PROTECT_GIT="${CBOX_PROTECT_GIT:-1}"
@@ -891,7 +903,13 @@ _cbox_audio_stop() {
 # The supervisor keeps $_CBOX_MCP_SLOTS pending `accept`s per server, so that
 # many concurrent clients (sessions) per container are served. Each connection
 # gets a fresh server process, exactly like a native stdio MCP server. Bytes are
-# passed through untouched — there is no protocol translation.
+# passed through untouched — there is no protocol translation. Before them,
+# `connect` sends one line: the session's terminal identity (CBOX_SESSION_TERM,
+# see CBOX_SESSION_ENV), which the host gives that server as environment, with
+# only the names CBOX_SESSION_ENV lists. Every server also gets CBOX_CONTAINER
+# (the container's name) and MCP_PROJECT_DIR (the project's folder on the host),
+# set by the host, never by the container. Its working folder stays the home
+# folder: the project folder can be written from the container.
 #
 # Servers that work on file paths (filesystem, git, …) do not belong here: they
 # would see host paths, not /Workspace. Run those inside the container instead
@@ -902,12 +920,14 @@ _cbox_audio_stop() {
 # same in bash 3.2 and zsh. Run as: python3 -c "$(_cbox_mcp_py)" <command> ...
 _cbox_mcp_py() {
   cat <<'PYEOF'
-import json, os, re, select, signal, subprocess, sys, threading, time
+import base64, json, os, re, select, shutil, signal, subprocess, sys, threading, time
 from urllib.parse import urlsplit
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1", "0.0.0.0")
-MARKER = b"\x01"  # sent by `accept` once a client has connected
+MARKER_ID = b"\x02"  # sent by `accept` once a client has connected; its identity line follows
+ID_MAX = 4096  # bytes of an identity line
+VALUE_RE = re.compile(r"^[\x20-\x7e]{1,256}$")
 
 
 def load_servers(path, warn=True):
@@ -1118,11 +1138,34 @@ def close(f):
         pass
 
 
-def serve(sname, cfg, ex, hint_after):
+def session_env(line, allowed):
+    """The variables of a client's identity line (base64 JSON) whose names the
+    host allows, with plain printable values; anything else is dropped."""
+    try:
+        data = json.loads(base64.b64decode(line.strip() or b"e30=", validate=True))
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items()
+            if k in allowed and isinstance(v, str) and VALUE_RE.match(v)}
+
+
+def server_env(cfg, box, folder, allowed, ident):
+    """The server's environment: the supervisor's, without the identity names
+    (those of the session that started it), plus the client's own identity,
+    the server's configured env, and what the host knows: container and folder."""
+    env = {k: v for k, v in os.environ.items() if k not in allowed}
+    env.update(ident)
+    env.update({str(k): str(v) for k, v in (cfg.get("env") or {}).items()})
+    env["CBOX_CONTAINER"] = box
+    env["MCP_PROJECT_DIR"] = folder
+    return env
+
+
+def serve(sname, cfg, ex, hint_after, env):
     """One client connection. Ends — and takes the server with it — as soon as
     either the exec process (the client's side) or the server exits."""
-    env = dict(os.environ)
-    env.update({str(k): str(v) for k, v in (cfg.get("env") or {}).items()})
     argv = [os.path.expanduser(str(cfg["command"]))] + [str(a) for a in (cfg.get("args") or [])]
     try:
         srv = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1172,7 +1215,23 @@ def serve(sname, cfg, ex, hint_after):
     down.join(1)
 
 
-def slot(stop, runtime, box, config, extra, relay, sname, hint_after):
+def read_line(fd, limit):
+    """Bytes up to a newline (not included), at most limit; None when cut off."""
+    out = b""
+    while len(out) <= limit:
+        try:
+            c = os.read(fd, 1)
+        except OSError:
+            return None
+        if not c:
+            return None
+        if c == b"\n":
+            return out
+        out += c
+    return None
+
+
+def slot(stop, runtime, box, config, extra, relay, sname, hint_after, folder, allowed):
     """Keeps one `accept` pending in the container. Each connection is handed
     to its own thread, so the slot is ready again right away."""
     fails = 0
@@ -1193,7 +1252,8 @@ def slot(stop, runtime, box, config, extra, relay, sname, hint_after):
             marker = os.read(ex.stdout.fileno(), 1)
         except OSError:
             marker = b""
-        if marker != MARKER:
+        line = read_line(ex.stdout.fileno(), ID_MAX) if marker == MARKER_ID else None
+        if line is None:
             # Container stopped, relay missing, or exec failed: back off.
             close(ex.stdin)
             finish(ex, grace=1)
@@ -1203,10 +1263,13 @@ def slot(stop, runtime, box, config, extra, relay, sname, hint_after):
             stop.wait(min(30, 2 ** min(fails, 5)))
             continue
         fails = 0
-        threading.Thread(target=serve, args=(sname, cfg, ex, hint_after), daemon=True).start()
+        env = server_env(cfg, box, folder, allowed, session_env(line, allowed))
+        threading.Thread(target=serve, args=(sname, cfg, ex, hint_after, env), daemon=True).start()
 
 
-def cmd_supervise(runtime, box, config, relay, slots, hint_after, pidfile, extra=""):
+def cmd_supervise(runtime, box, config, relay, slots, hint_after, pidfile, extra="", folder="",
+                  session_names=""):
+    allowed = set(session_names.split())
     try:
         os.setsid()  # own process group, so stop can kill every child at once
     except OSError:
@@ -1226,7 +1289,7 @@ def cmd_supervise(runtime, box, config, relay, slots, hint_after, pidfile, extra
                 while len(alive) < int(slots):
                     t = threading.Thread(target=slot, daemon=True,
                                          args=(stop, runtime, box, config, extra, relay, sname,
-                                               float(hint_after)))
+                                               float(hint_after), folder, allowed))
                     t.start()
                     alive.append(t)
                 workers[sname] = alive
@@ -1255,6 +1318,15 @@ def describe(cfg):
     if k == "stdio":
         return " ".join([str(cfg["command"])] + [str(a) for a in (cfg.get("args") or [])])
     return str(cfg.get("url", "")) if isinstance(cfg, dict) else ""
+
+
+def command_found(cmd):
+    """Whether a server's command exists on this host: a path (~ expanded) to an
+    executable file, or a name on the PATH."""
+    cmd = os.path.expanduser(str(cmd))
+    if os.sep in cmd:
+        return os.path.isfile(cmd) and os.access(cmd, os.X_OK)
+    return shutil.which(cmd) is not None
 
 
 def shown(path):
@@ -1302,6 +1374,8 @@ def cmd_list(config, logfile=""):
         k = kind(cfg)
         if not NAME_RE.match(sname):
             mark, label = "✘", "invalid name"
+        elif k == "stdio" and not command_found(cfg["command"]):
+            mark, label = "✘", "not found"
         elif k == "stdio":
             mark, label = "✔", "host  "
         elif k == "remote":
@@ -1311,6 +1385,8 @@ def cmd_list(config, logfile=""):
         else:
             mark, label = "✘", "needs \"command\" or \"url\""
         print(f"  {mark} {sname.ljust(width)}  {label}  {describe(cfg)}")
+        if label == "not found":
+            print(f"      ⚠ no such command on this machine — fix its path in {shown_config}")
         for problem in problems.get(sname, [])[-2:]:
             print(f"      ⚠ {problem}")
 
@@ -1438,11 +1514,15 @@ _cbox_mcp_relay_py() {
 # cbox-mcp-relay — installed by cbox at session start; local edits are overwritten.
 #   connect NAME  stdio command for Claude: reach host MCP server NAME
 #   accept NAME   run by the host over `container exec -i`; serves one client
-import glob, os, select, signal, socket, sys, time
+# connect first sends one line: the session's terminal identity
+# (CBOX_SESSION_TERM, base64 JSON). The host decides which of it a server sees.
+import glob, os, re, select, signal, socket, sys, time
 
 BASE = os.environ.get("CBOX_MCP_SOCKET_DIR", "/tmp/cbox-mcp")
 ACK = b"\x06"     # accept → client: this slot is yours
-MARKER = b"\x01"  # accept → host: a client connected, start the server
+MARKER_ID = b"\x02"  # accept → host: a client connected, its identity line follows
+ID_MAX = 4096  # bytes of an identity line
+ID_RE = re.compile(rb"^[A-Za-z0-9+/=]*$")
 DRAIN_SECONDS = 2  # accept: server output still forwarded after the client stops sending
 
 
@@ -1516,9 +1596,20 @@ def accept(name):
             pass
     try:
         conn.sendall(ACK)
+        line = b""
+        conn.settimeout(5)
+        while not line.endswith(b"\n") and len(line) <= ID_MAX:
+            c = conn.recv(1)
+            if not c:
+                return 0
+            line += c
+        conn.settimeout(None)
     except OSError:
         return 0
-    write_all(1, MARKER)
+    line = line.strip()
+    if len(line) > ID_MAX or not ID_RE.match(line):
+        line = b""
+    write_all(1, MARKER_ID + line + b"\n")
     pump(0, 1, conn, half_close=False)
     return 0
 
@@ -1542,6 +1633,14 @@ def connect(name):
             except OSError:
                 ok = False
             if ok:
+                ident = os.environ.get("CBOX_SESSION_TERM", "").encode()
+                if len(ident) > ID_MAX or not ID_RE.match(ident):
+                    ident = b""
+                try:
+                    s.sendall(ident + b"\n")
+                except OSError:
+                    s.close()
+                    continue
                 s.settimeout(None)
                 pump(0, 1, s, half_close=True)
                 return 0
@@ -1598,7 +1697,7 @@ _cbox_mcp_relay_pid() {
 # container, unless it is already running (it re-reads the config by itself).
 # Failures are reported, never fatal: the session works without host MCP.
 _cbox_mcp_relay_start() {
-  local name="$1"
+  local name="$1" _i
   local pidfile="$CBOX_DATA_DIR/.mcp-relay-$name.pid"
   local logfile="$CBOX_DATA_DIR/.mcp-relay-$name.log"
   # Host servers warden grants this container (written by its session).
@@ -1623,20 +1722,30 @@ _cbox_mcp_relay_start() {
     echo "⚠  Could not install cbox-mail-watch in '$name' — mail does not wake the agent this session"
   fi
 
+  local idfile="$CBOX_DATA_DIR/.mcp-relay-$name.id" id
+  id=$(_cbox_mcp_relay_id)
   if _cbox_mcp_relay_pid "$name" >/dev/null; then
-    return 0
+    [[ "$(cat "$idfile" 2>/dev/null)" == "$id" ]] && return 0
+    # Ends the host MCP connections of this container's running sessions too;
+    # their servers reconnect on the next use.
+    _cbox_log "ℹ  restarting the MCP relay (cbox or CBOX_SESSION_ENV changed)"
+    _cbox_mcp_relay_stop "$name"
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+      _cbox_mcp_relay_pid "$name" >/dev/null || break
+      sleep 0.2
+    done
   fi
 
   mkdir -p "$CBOX_DATA_DIR"
   rm -f "$pidfile"
+  printf '%s\n' "$id" > "$idfile"
   # Subshell: no job-control noise in interactive shells, and the supervisor
   # detaches into its own session so it survives the terminal.
   ( python3 -c "$(_cbox_mcp_py)" supervise \
       "$_CBOX_CMD" "$name" "$CBOX_MCP_CONFIG" "$_CBOX_MCP_RELAY" "$_CBOX_MCP_SLOTS" \
-      "$_CBOX_MCP_HINT_SECONDS" "$pidfile" "$extra" \
+      "$_CBOX_MCP_HINT_SECONDS" "$pidfile" "$extra" "$PWD" "$CBOX_SESSION_ENV" \
       </dev/null >"$logfile" 2>&1 & )
 
-  local _i
   for _i in 1 2 3 4 5 6 7 8 9 10; do
     [[ -f "$pidfile" ]] && break
     sleep 0.2
@@ -1646,6 +1755,24 @@ _cbox_mcp_relay_start() {
   else
     echo "⚠  MCP relay did not start — check $logfile"
   fi
+}
+
+# Identifies the code at both ends and what the supervisor was started with: a
+# supervisor started by another cbox version, or for other identity names, is
+# replaced, so host and container always speak the same protocol.
+_cbox_mcp_relay_id() {
+  { _cbox_mcp_py; _cbox_mcp_relay_py; echo "$PWD:$CBOX_SESSION_ENV"; } | cksum | cut -d' ' -f1
+}
+
+# The session's terminal identity, for the host MCP servers it calls: the
+# variables CBOX_SESSION_ENV names that are set, as base64 JSON (one token,
+# safe to pass as an environment value).
+_cbox_session_term() {
+  CBOX_SESSION_ENV="$CBOX_SESSION_ENV" python3 -c '
+import base64, json, os
+names = os.environ["CBOX_SESSION_ENV"].split()
+vals = {n: os.environ[n] for n in names if os.environ.get(n)}
+print(base64.b64encode(json.dumps(vals, sort_keys=True).encode()).decode())'
 }
 
 _cbox_mcp_relay_stop() {
@@ -2822,7 +2949,7 @@ _cbox_whatsapp_cli_py() {
 #!/usr/bin/env python3
 # cbox-whatsapp — installed by cbox at session start; local edits are overwritten.
 #   cbox-whatsapp export --out DIR [--since YYYY-MM-DD] [--server NAME]
-# Writes the WhatsApp chats shared with this project (its .warden) as files for
+# Writes the WhatsApp chats shared with this project (its .cbox) as files for
 # scripts; format: docs/whatsapp-export.md in claudebox. Exit 0: written,
 # 1: not set up here, 2: the host could not read WhatsApp.
 import argparse, json, os, re, subprocess, sys
@@ -2889,7 +3016,7 @@ def export(a):
     server = a.server or (granted[0] if len(granted) == 1 else None)
     if not server:
         fail("no WhatsApp chats are shared with this project — on the host: cbox warden whatsapp pick "
-             "<resource>, then list [<resource>] in the project's .warden" if not granted else
+             "<resource>, then add [warden \"<resource>\"] to the project's .cbox" if not granted else
              f"several WhatsApp resources are shared here ({', '.join(granted)}) — choose one with --server")
     files = ask(server, a.since)
     out = os.path.abspath(a.out)
@@ -2963,7 +3090,7 @@ _cbox_whatsapp_server_py() {
 #                                       read/<container>.json
 #
 # A group is a resource of type mail; its members are the projects whose
-# approved .warden lists it, once they had a session. Threads are between two
+# approved .cbox lists it, once they had a session. Threads are between two
 # members. The folder is host-only and deleted when the last cbox session on
 # the host closes (like the share folder), so mail lasts while cbox is in use.
 
@@ -3188,7 +3315,7 @@ def mail_peers(d, group, box):
     others = [m for m in mail_members(d, group) if m != box]
     if not others:
         return (f"You are {box}. No other project is in mail group '{group}' yet: a project joins when its "
-                f"approved .warden lists '{group}' and it starts a cbox session.")
+                f"approved .cbox has [warden \"{group}\"] and it starts a cbox session.")
     lines = [f"You are {box}. Projects in mail group '{group}':"]
     lines += [f"- {m} ({'cbox session open' if mail_live(d, group, m) else 'no cbox session open'})" for m in others]
     return "\n".join(lines)
@@ -3695,9 +3822,10 @@ _cbox_mail_clear() {
 #
 # Resources are defined on the host only ($CBOX_WARDEN_DIR/resources, never
 # mounted). `availability = global` gives a resource to every container;
-# `project` only to repos whose tracked .warden file lists it AND whose
-# current .warden the user approved on the host (approval is tied to the file's
-# hash, so an edit made inside the container needs a fresh approval).
+# `project` only to repos whose tracked .cbox lists it in a [warden "<name>"]
+# section AND whose current request the user approved on the host (approval is
+# tied to those sections' hash, so an edit made inside the container needs a
+# fresh approval).
 #
 # The per-container token in $WARDEN_URL is not a secret from Claude: it only
 # unlocks what the user already granted to this container, and it dies with the
@@ -3722,7 +3850,7 @@ HOP = {"connection", "keep-alive", "proxy-connection", "proxy-authorization", "t
 CHUNK = 1 << 16
 PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 PREFIX_RE = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$")
-PROJECT_KEYS = {"prefix"}  # settings a project's .warden may add to a resource; approval covers them
+PROJECT_KEYS = {"prefix"}  # settings a project's .cbox may add to a resource; approval covers them
 AWS_CONFIG = "/home/claude/.aws/warden-config"  # container path; written by cbox at session start
 TUNNEL_DIR = os.environ.get("CBOX_TUNNEL_DIR", "/tmp/cbox-tunnel")  # container path; = _CBOX_TUNNEL_DIR
 EGRESS_PORT = int(os.environ.get("CBOX_EGRESS_PORT", "3128"))  # on the container's 127.0.0.1; = _CBOX_EGRESS_PORT
@@ -3740,7 +3868,7 @@ TEMPLATE = """\
 # upstream     = https://openrouter.ai/api/v1
 # auth         = bearer                  # bearer | basic | header:<Name> | query:<param>
 # secret       = cbox.warden.openrouter  # Keychain item (service name); set with: cbox warden secret set openrouter
-# availability = global                  # global: every container | project: only repos whose .warden lists it
+# availability = global                  # global: every container | project: only repos whose .cbox lists it
 # allow        = POST /chat/completions, GET /models   # optional; default: everything under upstream
 # env          = OPENROUTER_BASE_URL={url} OPENROUTER_API_KEY=warden
 # opencode     = openrouter              # optional: opencode's provider of this id goes through warden
@@ -3755,7 +3883,7 @@ TEMPLATE = """\
 # region       = auto                    # optional; default: auto
 # policy       = dvc                     # optional: only DVC's data layout in one bucket/prefix, no deletes
 # bucket       = my-bucket               # needed by policy = dvc
-# availability = project                 # the project's .warden sets the prefix:  [storage] prefix = my-project
+# availability = project                 # the project's .cbox sets the prefix:  [warden "storage"] prefix = my-project
 # profile      = storage                 # AWS profile created in the container (default: the resource name)
 #
 # [github]
@@ -3778,7 +3906,7 @@ TEMPLATE = """\
 #
 # [team]
 # type         = mail                    # the agents of the projects that list it can message each other
-# availability = project                 # a project joins by listing it in its .warden (you approve that)
+# availability = project                 # a project joins with [warden "team"] in its .cbox (you approve that)
 """
 
 
@@ -4086,22 +4214,41 @@ def read_secret(r, field="secret"):
 
 
 def project_file(project):
-    return os.path.join(project, ".warden")
+    return os.path.join(project, ".cbox")
+
+
+WARDEN_SECTION_RE = re.compile(r'^warden\s+"([^"]+)"$')
+
+
+def request_digest(names):
+    """What an approval is tied to: the requested resources and their settings
+    as parsed, so [container] changes, comments and layout need no new one."""
+    return hashlib.sha256(json.dumps(names, sort_keys=True).encode()).hexdigest()
 
 
 def project_request(project):
-    """({resource name: project settings}, sha256) from the project's .warden, or ({}, None)."""
+    """({resource name: project settings}, digest) from the [warden "<name>"]
+    sections of the project's .cbox; ({}, None) without any; (None, digest of the
+    file) when it cannot be read."""
     try:
         with open(project_file(project), "rb") as f:
             raw = f.read()
     except FileNotFoundError:
         return {}, None
-    cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#",))
+    cp = configparser.ConfigParser(interpolation=None, comment_prefixes=("#", ";"),
+                                   inline_comment_prefixes=("#", ";"))
     try:
         cp.read_string(raw.decode())
     except (configparser.Error, UnicodeDecodeError):
         return None, hashlib.sha256(raw).hexdigest()
-    return {n: dict(cp[n]) for n in cp.sections()}, hashlib.sha256(raw).hexdigest()
+    names = {}
+    for sec in cp.sections():
+        m = WARDEN_SECTION_RE.match(sec.strip())
+        if m:
+            names[m.group(1)] = dict(cp[sec])
+    if not names:
+        return {}, None
+    return names, request_digest(names)
 
 
 def with_project(name, r, settings):
@@ -4109,18 +4256,18 @@ def with_project(name, r, settings):
     may only add PROJECT_KEYS; a prefix must stay inside the resource's own prefix."""
     extra = set(settings) - PROJECT_KEYS
     if extra:
-        return None, f".warden sets {', '.join(sorted(extra))} for '{name}' — only {', '.join(sorted(PROJECT_KEYS))} is allowed"
+        return None, f".cbox sets {', '.join(sorted(extra))} for '{name}' — only {', '.join(sorted(PROJECT_KEYS))} is allowed"
     out = dict(r)
     want = settings.get("prefix", "").strip("/")
     if want:
         base = r.get("prefix", "").strip("/")
         if not PREFIX_RE.match(want) or ".." in want.split("/") or "." in want.split("/"):
-            return None, f".warden prefix for '{name}' is not a plain path"
+            return None, f".cbox prefix for '{name}' is not a plain path"
         if base and want != base and not want.startswith(base + "/"):
-            return None, f".warden prefix for '{name}' is outside the resource's prefix '{base}'"
+            return None, f".cbox prefix for '{name}' is outside the resource's prefix '{base}'"
         out["prefix"] = want
     if out.get("policy") == "dvc" and not out.get("prefix", "").strip("/"):
-        return None, f"'{name}' needs a prefix (set it in .warden:  [{name}] prefix = <folder>)"
+        return None, f"'{name}' needs a prefix (set it in .cbox:  [warden \"{name}\"] prefix = <folder>)"
     return out, None
 
 
@@ -4286,7 +4433,7 @@ def cmd_whatsapp_pick(d, name, everything=""):
     write_private(r["list"], json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     print(f"✔ '{name}' shares {len(chosen)} chat(s), read-only" + (": " + ", ".join(c["name"] for c in chosen) if chosen else ""))
     if r.get("availability", "global") == "project":
-        print(f"  A project gets them with a .warden file in its folder containing the line  [{name}]")
+        print(f"  A project gets them with the line  [warden \"{name}\"]  in its .cbox")
         print("  (and your approval at its next cbox start). New groups: cbox start asks you.")
     else:
         print("  Every container gets them from its next session on. New groups: cbox start asks you.")
@@ -4316,7 +4463,7 @@ def spinner_hold():
     return d
 
 
-def ask(question):
+def ask(question, default=False):
     if not sys.stdin.isatty():
         return False
     held = spinner_hold()
@@ -4330,7 +4477,8 @@ def ask(question):
         out.flush()
         if out is not sys.stderr:
             out.close()
-        return sys.stdin.readline().strip().lower() in ("y", "yes")
+        answer = sys.stdin.readline().strip().lower()
+        return default if not answer else answer in ("y", "yes")
     finally:
         if held:
             try:
@@ -4340,12 +4488,12 @@ def ask(question):
 
 
 def approve(d, project, interactive):
-    """True if the project's current .warden is approved (asking if allowed)."""
+    """True if the project's current request (.cbox) is approved (asking if allowed)."""
     names, digest = project_request(project)
     if digest is None:
         return True
     if names is None:
-        err(f"⚠  {project_file(project)} is not valid INI — project resources skipped")
+        err(f"⚠  {project_file(project)} cannot be read (every setting belongs under [container] or [warden \"<resource>\"]) — project resources skipped")
         return False
     approvals = load_json(paths(d)["approvals"], {})
     if approvals.get(project) == digest:
@@ -4370,14 +4518,14 @@ def cmd_session(d, box, project, base_url, interactive):
         err("⚠  " + exposure_message(hit))
         return
     resources = load_resources(d, warn=err)
-    # A global resource that still needs a project setting (a dvc prefix) waits for a .warden.
+    # A global resource that still needs a project setting (a dvc prefix) waits for the .cbox.
     granted = {n: {} for n, r in resources.items()
                if r.get("availability", "global") == "global" and not with_project(n, r, {})[1]}
     names, _ = project_request(project)
     if names and approve(d, project, interactive == "1"):
         for n, settings in names.items():
             if n not in resources:
-                err(f"⚠  .warden asks for '{n}', which is not configured in {p['resources']}")
+                err(f"⚠  .cbox asks for '{n}', which is not configured in {p['resources']}")
                 continue
             r, problem = with_project(n, resources[n], settings)
             if problem:
@@ -5229,8 +5377,8 @@ def cmd_list(d, project):
         avail = r.get("availability", "global")
         here = avail == "global" or (names and n in names and approved)
         note = "every container" if avail == "global" else (
-            "this project (approved)" if here else "this project: listed in .warden, not approved" if names and n in names
-            else "projects whose .warden lists it")
+            "this project (approved)" if here else "this project: listed in .cbox, not approved" if names and n in names
+            else "projects whose .cbox lists it")
         if names and n in names:
             r = with_project(n, r, names[n])[0] or r
         if r.get("type") == "ssh":
@@ -5256,15 +5404,71 @@ def cmd_list(d, project):
         scope = "".join(f", {k} {r[k]}" for k in ("bucket", "prefix") if r.get(k))
         print(f"{'✔' if here else '·'} {n:<16} {r['upstream']}  [{r['auth'].split(':')[0]}{scope}; {note}]")
     if names is None:
-        print(f"⚠  {project_file(project)} is not valid INI")
+        print(f"⚠  {project_file(project)} cannot be read (every setting belongs under [container] or [warden \"<resource>\"])")
     elif names and not approved:
-        print("ℹ  This project's .warden is not approved yet: cbox warden approve")
+        print("ℹ  This project's warden request (.cbox) is not approved yet: cbox warden approve")
+
+
+# Compat, remove after 2026-12-31 (with its call in _cbox_ensure): projects of
+# an older cbox kept warden's request in .warden and container settings as
+# loose lines at the top of .cbox. Moves both into the sectioned .cbox, once,
+# after asking; an approval of the old .warden carries over.
+def cmd_upgrade_project(d, project, interactive):
+    cbox, old = project_file(project), os.path.join(project, ".warden")
+    try:
+        with open(cbox, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    first_key = next((i for i, l in enumerate(lines)
+                      if l.split("#")[0].split(";")[0].strip()
+                      and not l.strip().startswith("[")), None)
+    first_sec = next((i for i, l in enumerate(lines) if l.strip().startswith("[")), len(lines))
+    loose = first_key is not None and first_key < first_sec
+    if not loose and not os.path.exists(old):
+        return
+    print("ℹ  This project's claudebox settings use an older layout. The new .cbox has")
+    print("   [container] for ports and memory, and [warden \"<resource>\"] for what .warden listed.")
+    if interactive != "1" or not ask("   Update .cbox now (and remove .warden)? [Y/n] ", default=True):
+        print("   Not changed: ports, memory and warden resources of this project stay off until it is.")
+        return
+    if loose:
+        lines.insert(first_key, "[container]")
+    old_names, old_raw = {}, None
+    if os.path.exists(old):
+        with open(old, "rb") as f:
+            old_raw = f.read()
+        cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#",))
+        try:
+            cp.read_string(old_raw.decode())
+        except (configparser.Error, UnicodeDecodeError):
+            print(f"✖ {old} cannot be read — fix or remove it, then start cbox again")
+            return
+        have = set((project_request(project)[0] or {}) if not loose else {})
+        for n in cp.sections():
+            old_names[n] = dict(cp[n])
+            if n in have:
+                continue
+            lines += ["", f'[warden "{n}"]'] + [f"\t{k} = {v}" for k, v in cp[n].items()]
+    tmp = cbox + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines).lstrip("\n") + "\n")
+    os.replace(tmp, cbox)
+    if old_raw is not None:
+        os.remove(old)
+        approvals = load_json(paths(d)["approvals"], {})
+        names, digest = project_request(project)
+        if approvals.get(project) == hashlib.sha256(old_raw).hexdigest() and names == old_names:
+            approvals[project] = digest
+            write_private(paths(d)["approvals"], json.dumps(approvals, indent=2, sort_keys=True) + "\n")
+    print("✔ .cbox updated" + (" and .warden removed" if old_raw is not None else "") +
+          ". Commit it:  git add .cbox" + (" .warden" if old_raw is not None else ""))
 
 
 def cmd_approve(d, project):
     names, digest = project_request(project)
     if digest is None:
-        print(f"No .warden file in {project}")
+        print(f"This project asks warden for nothing (no [warden \"<resource>\"] in {project_file(project)})")
         return
     approvals = load_json(paths(d)["approvals"], {})
     if approvals.get(project) == digest:
@@ -5406,6 +5610,7 @@ COMMANDS = {
     "serve": lambda a: cmd_serve(*a),
     "list": lambda a: cmd_list(*a),
     "approve": lambda a: cmd_approve(*a),
+    "upgrade-project": lambda a: cmd_upgrade_project(*a),  # compat, remove after 2026-12-31
     "test": lambda a: cmd_test(*a),
     "template": lambda a: cmd_template(*a),
     "whatsapp-pick": lambda a: cmd_whatsapp_pick(*a),
@@ -5781,6 +5986,39 @@ _cbox_seed_claude_dir() {
   return 0
 }
 
+# Normal mode's session registry. Claude Code keeps one <pid>.json per running
+# session in ~/.claude/sessions; ListAgents, SendMessage and `claude agents`
+# find sessions there. Each container needs its own: every container counts
+# pids from 1 and has the image's /etc/machine-id, so in one shared folder
+# sessions of different containers overwrite each other's records. A mount
+# per container does not work on Apple's runtime: Claude Code chmods the
+# folder first, the root of a mount refuses that (EPERM), and the session is
+# never registered. So the shared folder's entry is a link to a folder on each
+# container's own disk; nothing on the host uses it. A non-empty folder found
+# there (from an older cbox) is moved aside, never deleted.
+_cbox_sessions_link() {
+  local link="$CBOX_CLAUDE_DIR/sessions" old
+  [[ -L "$link" && "$(readlink "$link")" == "$_CBOX_SESSIONS_LOCAL" ]] && return 0
+  if [[ -L "$link" ]]; then
+    rm -f "$link"
+  elif [[ -d "$link" ]]; then
+    # Compat, remove after 2026-12-31: the folder an older cbox mounted over.
+    if ! rmdir "$link" 2>/dev/null; then
+      old="$link.old-$(date +%Y%m%d-%H%M%S)"
+      if ! mv "$link" "$old"; then
+        echo "⚠  Could not replace $(_cbox_shown "$link") — sessions in this container cannot find each other (Claude Code's agent list and messages)"
+        return 0
+      fi
+      _cbox_log "ℹ  Old session records moved to $(_cbox_shown "$old") (safe to delete)"
+    fi
+  elif [[ -e "$link" ]]; then
+    echo "⚠  $(_cbox_shown "$link") is not a folder — sessions in this container cannot find each other. Move it away, then start cbox again."
+    return 0
+  fi
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  ln -s "$_CBOX_SESSIONS_LOCAL" "$link"
+}
+
 # Safe mode's ~/.claude: a folder per container whose entries are symlinks
 # into the shared Claude folder, which the container sees read-only at
 # $_CBOX_SAFE_SHARED. The one exception is the login, .credentials.json: it is
@@ -5991,36 +6229,62 @@ _cbox_mask_check() {
 }
 
 # ---------------------------------------------------------
-# published ports (the project's .cbox)
+# project settings (the project's .cbox)
 # ---------------------------------------------------------
 #
-# A project's .cbox file lists ports of servers in its container that the
-# host reaches at http://localhost:<port>:
+# A project's .cbox (git-config format, tracked in the project) holds its
+# claudebox settings, in two kinds of sections:
 #
-#   ports = 47821 3000
+#   [container]                applied when the container is created (cbox reset)
+#   	ports  = 47821 3000    servers in the container the host reaches at
+#                              http://localhost:<port> (127.0.0.1 only, never the
+#                              network; normal containers only)
+#   	memory = 8g            the container's memory (both modes), instead of
+#                              CBOX_MEMORY; for several agents in one container
 #
-# They are published on the host's 127.0.0.1 only, never to the network, and
-# only for normal containers. A runtime publishes ports when it creates a
-# container, so a changed list applies after cbox reset.
+#   [warden "storage"]         a resource the project asks warden for; read and
+#   	prefix = my-project    approved by warden (see project_request)
+#
+# The container can write .cbox: everything in it takes effect only through
+# the user (cbox reset, or warden's approval). Limits that must hold against
+# the agent never go here.
 
 _cbox_project_file() { echo "$PWD/.cbox"; }
 
-# Prints the ports the project's .cbox lists, sorted and space-separated;
-# nothing without a .cbox. Fails, saying why on stderr, for a line or port it
-# cannot use.
-_cbox_project_ports() {
-  local file shown line key value p ports=() list=()
+# Prints the project's [container] settings, one "key value" line each:
+# "ports" with the ports sorted and space-separated, "memory" with the size in
+# lowercase (e.g. 8g). Nothing without a .cbox. [warden "…"] sections are
+# warden's. Fails, saying why on stderr, for a line or value it cannot use.
+_cbox_project_settings() {
+  local file shown line key value p section="" ports=() list=() memory=""
   file=$(_cbox_project_file)
   [[ -f "$file" ]] || return 0
   shown=$(_cbox_shown "$file")
   while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line%%#*}"
+    line="${line%%[#;]*}"
     [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    if [[ "$line" =~ ^[[:space:]]*\[([^]]*)\][[:space:]]*$ ]]; then
+      section="${BASH_REMATCH[1]}"
+      if [[ "$(printf '%s' "$section" | tr '[:upper:]' '[:lower:]')" == "container" ]]; then
+        section=container
+      elif [[ "$section" =~ ^warden[[:space:]]+\"[^\"]+\"$ ]]; then
+        section=warden
+      else
+        echo "⚠  $shown: unknown section [$section] ignored (known: [container], [warden \"<resource>\"])" >&2
+        section=unknown
+      fi
+      continue
+    fi
+    [[ "$section" == warden || "$section" == unknown ]] && continue
     if [[ ! "$line" =~ ^[[:space:]]*([A-Za-z_-]+)[[:space:]]*=(.*)$ ]]; then
       echo "✖ $shown: '$line' is not a 'name = value' line, e.g.  ports = 3000" >&2
       return 1
     fi
     key="${BASH_REMATCH[1]}" value="${BASH_REMATCH[2]}"
+    if [[ -z "$section" ]]; then
+      echo "✖ $shown: '$key' must be in a section — add the line [container] above it" >&2
+      return 1
+    fi
     case "$key" in
       ports)
         IFS=', ' read -r -a list <<<"$value"
@@ -6031,11 +6295,48 @@ _cbox_project_ports() {
           fi
           ports+=("$((10#$p))")
         done ;;
-      *) echo "⚠  $shown: unknown setting '$key' ignored (known: ports)" >&2 ;;
+      memory)
+        value="${value//[[:space:]]/}"
+        if ! _cbox_memory_ok "$value"; then
+          echo "✖ $shown: memory = '$value' is not a size cbox can give a container — use e.g. 8g (1g to 64g, or m for megabytes)" >&2
+          return 1
+        fi
+        memory=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]') ;;
+      *) echo "⚠  $shown: unknown setting '$key' in [container] ignored (known: ports, memory)" >&2 ;;
     esac
   done <"$file"
-  [[ ${#ports[@]} -gt 0 ]] || return 0
-  printf '%s\n' "${ports[@]}" | sort -nu | paste -s -d ' ' -
+  if [[ ${#ports[@]} -gt 0 ]]; then
+    echo "ports $(printf '%s\n' "${ports[@]}" | sort -nu | paste -s -d ' ' -)"
+  fi
+  [[ -z "$memory" ]] || echo "memory $memory"
+}
+
+# Whether $1 is a container memory size cbox accepts: 1g to 64g, or the same
+# range in megabytes (1024m to 65536m).
+_cbox_memory_ok() {
+  [[ "$1" =~ ^([0-9]{1,6})([gGmM])$ ]] || return 1
+  local n=$((10#${BASH_REMATCH[1]})) u="${BASH_REMATCH[2]}"
+  case "$u" in
+    g|G) (( n >= 1 && n <= 64 )) ;;
+    *)   (( n >= 1024 && n <= 65536 )) ;;
+  esac
+}
+
+# Prints the ports the project's .cbox lists, sorted and space-separated;
+# nothing without them. Fails like _cbox_project_settings.
+_cbox_project_ports() {
+  local out
+  out=$(_cbox_project_settings) || return 1
+  awk '$1 == "ports" { $1 = ""; sub(/^ /, ""); print }' <<<"$out"
+}
+
+# The memory a new container of this project gets: the .cbox's memory, else
+# CBOX_MEMORY. Fails like _cbox_project_settings.
+_cbox_project_memory() {
+  local out want
+  out=$(_cbox_project_settings) || return 1
+  want=$(awk '$1 == "memory" { print $2 }' <<<"$out")
+  echo "${want:-$CBOX_MEMORY}"
 }
 
 # Runtime arguments, one per line, that publish ports $1 (space-separated) on
@@ -6070,6 +6371,29 @@ _cbox_ports_check() {
   [[ "$want" == "$have" ]] && return 0
   echo "⚠  .cbox lists ports ${want:-(none)}, but this container publishes ${have:-none}."
   echo "   Ports are set when a container is created: cbox reset"
+}
+
+# At session start: a note when the memory the container would get today
+# (.cbox memory, else CBOX_MEMORY) differs from the memory it was created
+# with (cbox.memory label; containers without it are not checked).
+_cbox_memory_check() {
+  local name="$1" want have from=CBOX_MEMORY
+  have=$(_cbox_rt_label "$name" cbox.memory)
+  [[ -n "$have" ]] || return 0
+  want=$(_cbox_project_memory 2>/dev/null) || return 0
+  [[ "$want" == "$have" ]] && return 0
+  _cbox_project_settings 2>/dev/null | grep -q '^memory ' && from=.cbox
+  echo "⚠  This container has $have of memory, but $from asks for $want."
+  echo "   Memory is set when a container is created: cbox reset"
+}
+
+# Below this many MB free, a session start warns (a Claude session needs ~400).
+_CBOX_LOW_MEMORY_MB=600
+
+# zsh code the session runs in the container before the agent: a warning when
+# the container has little memory left, e.g. with several agents in it.
+_cbox_low_memory_note() {
+  printf '%s' "_f=\$(awk '/MemAvailable/ { print int(\$2 / 1024) }' /proc/meminfo 2>/dev/null); (( _f > 0 && _f < $_CBOX_LOW_MEMORY_MB )) && print -r -- \"⚠  Only \$_f MB of memory free in this container; a Claude session needs about 400 MB. Close a session, or give the project more: [container] memory = 8g in .cbox, then cbox reset\"; unset _f"
 }
 
 # The dockerfile in CBOX_BUILD_DIR, if that one starts with `FROM claudebox`:
@@ -6172,10 +6496,12 @@ _cbox_create() {
   _cbox_ensure_image || return 1
 
   # Before anything is created: a broken .cbox stops here with its reason.
-  local _ports=""
+  local _ports="" _memory
   if [[ "$mode" == "normal" ]]; then
     _ports=$(_cbox_project_ports) || return 1
   fi
+  # Warnings about the .cbox came with the ports (normal mode); its errors once.
+  _memory=$(_cbox_project_memory 2>/dev/null) || { _cbox_project_settings >/dev/null; return 1; }
 
   _cbox_step "Creating $mode container '$name' ($agent_bin)..."
 
@@ -6192,7 +6518,8 @@ _cbox_create() {
     -w "/Workspace/$name"
 
     -e ZDOTDIR=/home/claude
-    --memory="$CBOX_MEMORY"
+    --memory="$_memory"
+    --label "cbox.memory=$_memory"
   )
 
   if [[ "$agent_bin" == "claude" ]]; then
@@ -6262,17 +6589,12 @@ _cbox_create() {
       unset _f _fname _key
     fi
     mkdir -p "$CBOX_SHARE_DIR"
-    # sessions: Claude Code's registry of running sessions, one <pid>.json
-    # each. It assumes one pid space per folder, but every container counts
-    # pids from 1 and has the image's /etc/machine-id: in a shared folder,
-    # sessions of different containers overwrite and delete each other's
-    # records. So each container has its own. (The mount point is made here,
-    # or the runtime would make it, root-owned on Linux.)
-    mkdir -p "$CBOX_DATA_DIR/sessions/$name" "$CBOX_CLAUDE_DIR/sessions"
-    chmod 700 "$CBOX_DATA_DIR/sessions/$name" "$CBOX_CLAUDE_DIR/sessions"
+    # Each container's own session registry, through a link (see
+    # _cbox_sessions_link); the label tells containers made with a mount there.
+    _cbox_sessions_link
     args+=(
+      --label "cbox.sessions=local"
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude"
-      -v "$CBOX_DATA_DIR/sessions/$name:/home/claude/.claude/sessions"
       -v "$CBOX_SHARE_DIR:/home/claude/share"
       -v "$CBOX_PLAYWRIGHT_DIR:/opt/ms-playwright"
     )
@@ -6440,6 +6762,11 @@ _cbox_ensure() {
   local requested_mode="$2"
 
   _cbox_system_start
+  # Compat, remove after 2026-12-31 (with cmd_upgrade_project): older layouts.
+  if [[ -f "$PWD/.warden" ]] || { [[ -f "$PWD/.cbox" ]] &&
+      [[ "$(sed -e 's/[#;].*//' -e '/^[[:space:]]*$/d' "$PWD/.cbox" | head -n 1)" != *"["* ]]; }; then
+    _cbox_warden_python upgrade-project "$CBOX_WARDEN_DIR" "$PWD" "$([[ -t 0 ]] && echo 1 || echo 0)"
+  fi
 
   # "existing": whatever mode the container has; a new one is normal.
   if ! _cbox_exists "$name"; then
@@ -6746,6 +7073,8 @@ _cbox_enter() {
   # CBOX_CONTAINER tells tools such as flux they run in a claudebox container
   # rather than on a host, which on Linux they cannot tell from the OS alone.
   local _exec_args=(-it -w "/Workspace/$name" -e "CBOX_CONTAINER=$name")
+  # Which terminal window this session runs in, for host MCP servers (relay).
+  _exec_args+=(-e "CBOX_SESSION_TERM=$(_cbox_session_term)")
   local _run="$command" _g _tunnel=$_audio _warden_mcp="" _warden_oc="" _warden_mail=""
   if (( _audio )); then
     # Through the tunnel, PulseAudio sees a local client and would offer shared
@@ -6757,6 +7086,9 @@ _cbox_enter() {
   while IFS= read -r _g; do _exec_args+=(-e "$_g"); done < <(_cbox_git_identity)
   _cbox_mask_check "$name" "$mode"
   _cbox_ports_check "$name" "$mode"
+  _cbox_memory_check "$name"
+  # Several agents can share a container: say so before one more would not fit.
+  _run="$(_cbox_low_memory_note); $_run"
   local _egress=""
   if [[ "$mode" == "safe" ]]; then
     # The container's only way out: the tunnel's proxy, which lets through
@@ -6776,6 +7108,15 @@ _cbox_enter() {
       echo "   Recreate it: cbox reset"
     fi
   else
+    # The session registry's folder on the container's own disk, before the
+    # agent starts (the shared folder links there).
+    _cbox_sessions_link
+    _run="mkdir -p -m 700 $_CBOX_SESSIONS_LOCAL; $_run"
+    # Compat, remove after 2026-12-31: containers made with a sessions mount.
+    if [[ "$(_cbox_rt_label "$name" cbox.sessions)" != "local" ]]; then
+      echo "ℹ  This container was created by an older cbox: its sessions cannot find each other"
+      echo "   (Claude Code's agent list, messages between sessions). Recreate it when convenient: cbox reset"
+    fi
     local _w_env
     while IFS= read -r _w_env; do
       case "$_w_env" in

@@ -392,6 +392,53 @@ _wait_procs() {
   [ -z "$socks" ]
 }
 
+@test "mcp relay: each server sees the terminal identity of the session that called it" {
+  _relay_setup
+  printf '#!/bin/bash\necho "ws=${CMUX_WORKSPACE_ID:-none} sf=${CMUX_SURFACE_ID:-none} c=$CBOX_CONTAINER d=$MCP_PROJECT_DIR x=${EVIL:-none} p=${PATH:+set}"\n' > "$RELAY_TMP/who"
+  chmod +x "$RELAY_TMP/who"
+  jq --arg w "$RELAY_TMP/who" '.mcpServers.who = {command: $w}' "$CBOX_MCP_CONFIG" > "$RELAY_TMP/c" && mv "$RELAY_TMP/c" "$CBOX_MCP_CONFIG"
+  sleep 3  # the supervisor re-reads the config
+  a=$(CMUX_WORKSPACE_ID=w1 CMUX_SURFACE_ID=s1 EVIL=1 _cbox_session_term)
+  b=$(CMUX_WORKSPACE_ID=w2 _cbox_session_term)
+  forged=$(printf '{"EVIL":"1","CBOX_CONTAINER":"other","CMUX_SURFACE_ID":"bad\\nline"}' | base64 | tr -d '\n')
+  run bash -c "
+    CBOX_SESSION_TERM='$a' timeout 10 '$_CBOX_MCP_RELAY' connect who </dev/null
+    CBOX_SESSION_TERM='$b' timeout 10 '$_CBOX_MCP_RELAY' connect who </dev/null
+    CBOX_SESSION_TERM='$forged' timeout 10 '$_CBOX_MCP_RELAY' connect who </dev/null
+    CBOX_SESSION_TERM='not base64!' timeout 10 '$_CBOX_MCP_RELAY' connect who </dev/null"
+  _relay_teardown
+  [ "${lines[0]}" = "ws=w1 sf=s1 c=rbox d=$PWD x=none p=set" ]
+  [ "${lines[1]}" = "ws=w2 sf=none c=rbox d=$PWD x=none p=set" ]
+  [ "${lines[2]}" = "ws=none sf=none c=rbox d=$PWD x=none p=set" ]
+  [ "${lines[3]}" = "ws=none sf=none c=rbox d=$PWD x=none p=set" ]
+}
+
+@test "mcp relay: the identity of the session that started the relay does not leak to others" {
+  CMUX_WORKSPACE_ID=first _relay_setup
+  printf '#!/bin/bash\necho "ws=${CMUX_WORKSPACE_ID:-none}"\n' > "$RELAY_TMP/who"
+  chmod +x "$RELAY_TMP/who"
+  jq --arg w "$RELAY_TMP/who" '.mcpServers.who = {command: $w}' "$CBOX_MCP_CONFIG" > "$RELAY_TMP/c" && mv "$RELAY_TMP/c" "$CBOX_MCP_CONFIG"
+  sleep 3
+  run bash -c "CBOX_SESSION_TERM='' timeout 10 '$_CBOX_MCP_RELAY' connect who </dev/null"
+  _relay_teardown
+  [ "$output" = "ws=none" ]
+}
+
+@test "mcp relay: a supervisor started by another cbox version or other identity names is replaced" {
+  _relay_setup
+  old=$(_cbox_mcp_relay_pid rbox)
+  run _cbox_mcp_relay_start rbox
+  [ "$(_cbox_mcp_relay_pid rbox)" = "$old" ]
+  CBOX_SESSION_ENV="CMUX_WORKSPACE_ID"
+  run _cbox_mcp_relay_start rbox
+  new=$(_cbox_mcp_relay_pid rbox)
+  run bash -c "echo hi | timeout 10 '$_CBOX_MCP_RELAY' connect echo"
+  _relay_teardown
+  [ -n "$new" ]
+  [ "$new" != "$old" ]
+  [ "$output" = "hi" ]
+}
+
 @test "mcp relay: not started when no host stdio servers are configured" {
   echo '{"mcpServers":{"r":{"url":"https://r.example.com/mcp"}}}' > "$CBOX_MCP_CONFIG"
   _CBOX_CMD=false
@@ -419,16 +466,16 @@ _wait_procs() {
 }
 
 @test "cbox mcp: lists servers with their kind" {
-  echo '{"mcpServers":{"imcp":{"command":"/x/imcp"},"r":{"url":"https://r.example.com/mcp"},"l":{"url":"http://localhost:1/mcp"}}}' > "$CBOX_MCP_CONFIG"
+  echo '{"mcpServers":{"imcp":{"command":"/bin/sh"},"r":{"url":"https://r.example.com/mcp"},"l":{"url":"http://localhost:1/mcp"}}}' > "$CBOX_MCP_CONFIG"
   run _cbox_mcp_status "myapp"
-  [[ "$output" == *"✔ imcp"*"host"*"/x/imcp"* ]]
+  [[ "$output" == *"✔ imcp"*"host"*"/bin/sh"* ]]
   [[ "$output" == *"✔ r"*"remote"* ]]
   [[ "$output" == *"✘ l"*"not supported"* ]]
   [[ "$output" == *"relay for 'myapp' not running"* ]]
 }
 
 @test "cbox mcp: shows the latest relay problem under its server" {
-  echo '{"mcpServers":{"iMCP":{"command":"/x/imcp-server"},"other":{"command":"/x/o"}}}' > "$CBOX_MCP_CONFIG"
+  echo '{"mcpServers":{"iMCP":{"command":"sh"},"other":{"command":"sh"}}}' > "$CBOX_MCP_CONFIG"
   cat > "$CBOX_DATA_DIR/.mcp-relay-myapp.log" <<'LOG'
 2026-10-04 09:00:00 INFO iMCP: client connected — server started (pid 1)
 2026-10-04 09:00:25 WARN iMCP: no response from the server 25s after a client connected. Local Network ...
@@ -440,8 +487,21 @@ LOG
   [[ "$output" != *"other"*"⚠"* ]]
 }
 
+@test "cbox mcp: marks a host server whose command does not exist" {
+  printf '#!/bin/sh\n' > "$BATS_TEST_TMPDIR/srv"; chmod +x "$BATS_TEST_TMPDIR/srv"
+  cat > "$CBOX_MCP_CONFIG" <<JSON
+{"mcpServers":{"gone":{"command":"~/Applications/Nope.app/Contents/MacOS/x"},
+ "here":{"command":"$BATS_TEST_TMPDIR/srv"},"onpath":{"command":"sh"},"nopath":{"command":"no-such-cmd-xyz"}}}
+JSON
+  run _cbox_mcp_status "myapp"
+  [[ "$output" == *"✘ gone    not found"*"no such command on this machine — fix its path in"* ]]
+  [[ "$output" == *"✔ here    host"* ]]
+  [[ "$output" == *"✔ onpath  host"* ]]
+  [[ "$output" == *"✘ nopath  not found"* ]]
+}
+
 @test "cbox mcp: a later successful connection clears the problem" {
-  echo '{"mcpServers":{"iMCP":{"command":"/x/imcp-server"}}}' > "$CBOX_MCP_CONFIG"
+  echo '{"mcpServers":{"iMCP":{"command":"sh"}}}' > "$CBOX_MCP_CONFIG"
   cat > "$CBOX_DATA_DIR/.mcp-relay-myapp.log" <<'LOG'
 2026-10-04 09:00:30 WARN iMCP: client gave up before the server answered — server stopped
 2026-10-04 09:05:00 INFO iMCP: client connected — server started (pid 3)
@@ -568,7 +628,7 @@ _warden_lib() {
   echo "$BATS_TMPDIR/warden_lib.py"
 }
 
-# Approve the project's current .warden as if the user typed "y".
+# Approve the project's current .cbox request as if the user typed "y".
 _warden_approve_yes() {
   python3 -c "
 import sys, io
@@ -687,9 +747,9 @@ INI
   [ "$(grep -c "REDACTED" "$CBOX_WARDEN_DIR/broker.log")" = 0 ]
 }
 
-@test "warden: project resource needs an approved .warden" {
+@test "warden: project resource needs an approved .cbox request" {
   _warden_setup
-  printf '[proj]\n' > .warden
+  printf '[warden "proj"]\n' > .cbox
   _warden_env >/dev/null
   before=$(cat "$CBOX_WARDEN_DIR/sessions/wbox.json")
   hint=$(cat "$WT/stderr")
@@ -702,21 +762,44 @@ INI
   [[ "$output" == *'"authorization": "Bearer sk-test-REDACTED-cbox.warden.proj"'* ]]
 }
 
-@test "warden: editing .warden after approval needs a new approval" {
+@test "warden: editing the .cbox request after approval needs a new approval" {
   _warden_setup
-  printf '[proj]\n' > .warden
+  printf '[warden "proj"]\n' > .cbox
   _warden_approve_yes
-  printf '[proj]\n[hdr]\n' > .warden
+  printf '[warden "proj"]\n[warden "hdr"]\n' > .cbox
   _warden_env >/dev/null
   run cat "$CBOX_WARDEN_DIR/sessions/wbox.json"
   _warden_teardown
   [[ "$output" != *'"proj"'* ]]
 }
 
+@test "warden: [container] changes, comments and layout keep the approval" {
+  _warden_setup
+  printf '[container]\n\tports = 3000\n[warden "proj"]\n' > .cbox
+  _warden_approve_yes
+  printf '# settings\n[container]\n\tports = 4000   ; dev\n\tmemory = 8g\n\n[warden "proj"]   # the API\n' > .cbox
+  _warden_env >/dev/null
+  run cat "$CBOX_WARDEN_DIR/sessions/wbox.json"
+  _warden_teardown
+  [[ "$output" == *'"proj"'* ]]
+}
+
+@test "warden: only [warden \"…\"] sections are a request; [container] is not a resource" {
+  run python3 -c "exec(open('$(_warden_lib)').read())
+import os
+os.makedirs('$BATS_TMPDIR/req', exist_ok=True)
+open('$BATS_TMPDIR/req/.cbox', 'w').write('[container]\n\tports = 3000\n')
+print(project_request('$BATS_TMPDIR/req'))
+open('$BATS_TMPDIR/req/.cbox', 'w').write('[container]\nports = 3000\n[warden \"store\"]\n\tprefix = p1\n[warden \"team\"]\n')
+print(project_request('$BATS_TMPDIR/req')[0])"
+  [ "${lines[0]}" = "({}, None)" ]
+  [ "${lines[1]}" = "{'store': {'prefix': 'p1'}, 'team': {}}" ]
+}
+
 @test "warden: unknown and invalid resources are reported, not fatal" {
   _warden_setup
   printf '[bad name]\nupstream = ftp://x\n' >> "$CBOX_WARDEN_DIR/resources"
-  printf '[ghost]\n' > .warden
+  printf '[warden "ghost"]\n' > .cbox
   _warden_approve_yes
   _warden_env >/dev/null
   run cat "$WT/stderr"
@@ -925,11 +1008,11 @@ _warden_relocate() {
 
 @test "cbox warden: lists resources and what this project gets" {
   _warden_setup
-  printf '[proj]\n' > .warden
+  printf '[warden "proj"]\n' > .cbox
   run _cbox_warden_cmd list
   _warden_teardown
   [[ "$output" == *"✔ llm"*"every container"* ]]
-  [[ "$output" == *"· proj"*"listed in .warden, not approved"* ]]
+  [[ "$output" == *"· proj"*"listed in .cbox, not approved"* ]]
   [[ "$output" == *"cbox warden approve"* ]]
 }
 
@@ -984,7 +1067,7 @@ SH
   [[ "$output" == *"Usage: cbox warden"* ]]
 }
 
-# S3-style resource with the dvc policy (bucket bkt); the project's .warden sets the prefix.
+# S3-style resource with the dvc policy (bucket bkt); the project's .cbox sets the prefix.
 _warden_add_store() {
   cat >> "$CBOX_WARDEN_DIR/resources" <<INI
 [store]
@@ -1014,7 +1097,7 @@ print(h['authorization'].split('Signature=')[1])"
 @test "warden sigv4: container gets an AWS profile with dummy keys pointing at the broker" {
   _warden_setup
   _warden_add_store "profile = flux-dvc-bkt"
-  printf '[store]\nprefix = proj1\n' > .warden
+  printf '[warden "store"]\nprefix = proj1\n' > .cbox
   _warden_approve_yes
   env=$(_warden_env)
   _warden_teardown
@@ -1031,7 +1114,7 @@ print(h['authorization'].split('Signature=')[1])"
 @test "warden sigv4: re-signs with the real keys and drops the client's signature" {
   _warden_setup
   _warden_add_store
-  printf '[store]\nprefix = proj1\n' > .warden
+  printf '[warden "store"]\nprefix = proj1\n' > .cbox
   _warden_approve_yes
   url=$(_warden_url)
   out=$(curl -s -H 'Authorization: AWS4-HMAC-SHA256 Credential=warden/x' -H 'X-Amz-Security-Token: t' \
@@ -1046,7 +1129,7 @@ print(h['authorization'].split('Signature=')[1])"
 @test "warden sigv4: the dvc policy allows only the project's DVC tree, never deletes" {
   _warden_setup
   _warden_add_store
-  printf '[store]\nprefix = proj1\n' > .warden
+  printf '[warden "store"]\nprefix = proj1\n' > .cbox
   _warden_approve_yes
   url=$(_warden_url)/store
   code() { curl -s -o /dev/null -w '%{http_code}' -X "$1" "$url/$2"; }
@@ -1060,13 +1143,13 @@ print(h['authorization'].split('Signature=')[1])"
   [ "$got" = "200 200 200 200 | 403 403 403 403 403 403 403" ]
 }
 
-@test "warden sigv4: no grant without a prefix, or when .warden sets anything else" {
+@test "warden sigv4: no grant without a prefix, or when .cbox sets anything else" {
   _warden_setup
   _warden_add_store
   # Global availability alone does not do: the dvc policy needs a project prefix.
   sed -i.bak 's/^availability = project$/availability = global/' "$CBOX_WARDEN_DIR/resources"
   no_prefix=$(_warden_env)
-  printf '[store]\nprefix = proj1\nupstream = http://127.0.0.1:1\n' > .warden
+  printf '[warden "store"]\nprefix = proj1\nupstream = http://127.0.0.1:1\n' > .cbox
   _warden_approve_yes
   extra_key=$(_warden_env)
   extra_err=$(cat "$WT/stderr")
@@ -1076,14 +1159,14 @@ print(h['authorization'].split('Signature=')[1])"
   [[ "$extra_err" == *"only prefix is allowed"* ]]
 }
 
-@test "warden sigv4: a .warden prefix must stay inside the resource's own prefix" {
+@test "warden sigv4: a .cbox prefix must stay inside the resource's own prefix" {
   _warden_setup
   _warden_add_store "prefix = team"
-  printf '[store]\nprefix = other\n' > .warden
+  printf '[warden "store"]\nprefix = other\n' > .cbox
   _warden_approve_yes
   outside=$(_warden_env)
   outside_err=$(cat "$WT/stderr")
-  printf '[store]\nprefix = team/proj1\n' > .warden
+  printf '[warden "store"]\nprefix = team/proj1\n' > .cbox
   _warden_approve_yes
   inside=$(_warden_env)
   _warden_teardown
@@ -2957,6 +3040,61 @@ print(sorted(set(g.values())), g.get(hub), lab in g)" "$CBOX_WARDEN_DIR" "$(_fak
   [ "$(grep -c "^${CBOX_LABEL%%=*}=" "$capture")" -eq 1 ]
 }
 
+@test "_cbox_create: normal containers link the session registry instead of mounting it, and say so in a label" {
+  local capture="$BATS_TMPDIR/create-sessions-args"
+  cd "$BATS_TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  rm -f "$capture"; rm -rf "$CBOX_CLAUDE_DIR/sessions"
+  _cbox_create "cbox-unit-sessions" normal
+  run cat "$capture"
+  [[ "$output" == *$'\n--label\ncbox.sessions=local\n'* ]]
+  [[ "$output" != *"/home/claude/.claude/sessions"* ]]
+  [ "$(readlink "$CBOX_CLAUDE_DIR/sessions")" = "$_CBOX_SESSIONS_LOCAL" ]
+  rm -f "$capture"
+  _cbox_create "cbox-unit-sessions" safe
+  run cat "$capture"
+  [[ "$output" != *"cbox.sessions"* ]]
+}
+
+@test "_cbox_sessions_link: makes the link, or replaces an empty folder or a wrong link" {
+  local l="$CBOX_CLAUDE_DIR/sessions"
+  rm -rf "$l"
+  _cbox_sessions_link
+  [ "$(readlink "$l")" = "$_CBOX_SESSIONS_LOCAL" ]
+  rm -f "$l"; mkdir "$l"
+  _cbox_sessions_link
+  [ "$(readlink "$l")" = "$_CBOX_SESSIONS_LOCAL" ]
+  rm -f "$l"; ln -s /somewhere/else "$l"
+  _cbox_sessions_link
+  [ "$(readlink "$l")" = "$_CBOX_SESSIONS_LOCAL" ]
+  run _cbox_sessions_link
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "_cbox_sessions_link: moves a folder with old records aside, never deletes it" {
+  local l="$CBOX_CLAUDE_DIR/sessions"
+  rm -rf "$l" "$l".old-*
+  mkdir "$l"; echo '{}' > "$l/123.json"
+  CBOX_VERBOSE=1 run _cbox_sessions_link
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Old session records moved to"*"safe to delete"* ]]
+  [ "$(readlink "$l")" = "$_CBOX_SESSIONS_LOCAL" ]
+  [ "$(cat "$l".old-*/123.json)" = "{}" ]
+  rm -rf "$l".old-*
+}
+
+@test "_cbox_sessions_link: leaves a file in the way alone and says what to do" {
+  local l="$CBOX_CLAUDE_DIR/sessions"
+  rm -rf "$l"; echo keep > "$l"
+  run _cbox_sessions_link
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"is not a folder"*"Move it away"* ]]
+  [ "$(cat "$l")" = "keep" ]
+  rm -f "$l"
+}
+
 @test "_cbox_old_init: recognises containers created with tail as PID 1" {
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { echo '[{"configuration": {"initProcess": {"executable": "tail", "arguments": ["-f", "/dev/null"]}}}]'; }
@@ -3058,7 +3196,8 @@ _enter_safe() {
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { echo "$*" >> "$capture"; }
   _cbox_mode() { echo "$MODE"; }
-  _cbox_rt_label() { case "$2" in cbox.egress) echo "$EGRESS" ;; cbox.safe-login) echo "$LOGIN" ;; esac; }
+  _cbox_rt_label() { case "$2" in cbox.egress) echo "$EGRESS" ;; cbox.safe-login) echo "$LOGIN" ;;
+                                  cbox.sessions) echo "${SESSIONS-local}" ;; esac; }
   _cbox_safe_claude_dir() { echo "safe-claude $*" >> "$capture"; }
   _cbox_tunnel_start() { echo "tunnel $*" >> "$capture"; }
   _cbox_tunnel_stop() { :; }
@@ -3162,6 +3301,32 @@ _update() {
   run cat "$BATS_TMPDIR/enter-egress"
   [[ "$output" != *"HTTPS_PROXY"* ]]
   [[ "$output" != *"tunnel ebox on"* ]]
+}
+
+@test "_cbox_enter: normal sessions make the local session registry folder before the agent starts" {
+  MODE=normal EGRESS="" LOGIN=""
+  run _enter_safe
+  [[ "$output" != *"created by an older cbox"* ]]
+  run cat "$BATS_TMPDIR/enter-egress"
+  [[ "$output" == *"zsh -ic mkdir -p -m 700 $_CBOX_SESSIONS_LOCAL; "* ]]
+  [ "$(readlink "$CBOX_CLAUDE_DIR/sessions")" = "$_CBOX_SESSIONS_LOCAL" ]
+}
+
+@test "_cbox_enter: a normal container made with a sessions mount gets a reset hint" {
+  MODE=normal EGRESS="" LOGIN="" SESSIONS=""
+  run _enter_safe
+  [[ "$output" == *"created by an older cbox: its sessions cannot find each other"* ]]
+  [[ "$output" == *"cbox reset"* ]]
+}
+
+@test "_cbox_enter: safe sessions keep their own registry folder (no link, no hint)" {
+  MODE=safe EGRESS=allowlist LOGIN=shared SESSIONS=""
+  rm -rf "$CBOX_CLAUDE_DIR/sessions"
+  run _enter_safe
+  [[ "$output" != *"sessions cannot find each other"* ]]
+  run cat "$BATS_TMPDIR/enter-egress"
+  [[ "$output" != *"$_CBOX_SESSIONS_LOCAL"* ]]
+  [ ! -e "$CBOX_CLAUDE_DIR/sessions" ]
 }
 
 _egress_py() {  # runs python with the warden functions loaded
@@ -3344,23 +3509,6 @@ _safe_setup() {
   touch "$SD/sessions/20.json"
   _cbox_safe_claude_dir sbox
   [ -f "$SD/sessions/20.json" ]
-}
-
-@test "_cbox_create: normal mode gives each container its own session registry" {
-  local capture="$BATS_TMPDIR/create-sessions"
-  cd "$BATS_TMPDIR"
-  _CBOX_CMD=_fake_runtime
-  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
-  rm -rf "$CBOX_CLAUDE_DIR/sessions" "$CBOX_DATA_DIR/sessions"
-  rm -f "$capture"; _cbox_create "sesbox" "normal"
-  grep -qx "$CBOX_DATA_DIR/sessions/sesbox:/home/claude/.claude/sessions" "$capture"
-  [ -d "$CBOX_DATA_DIR/sessions/sesbox" ]
-  [ -d "$CBOX_CLAUDE_DIR/sessions" ]
-  # Mounted after the Claude folder it sits in.
-  run grep -nx "$CBOX_CLAUDE_DIR:/home/claude/.claude" "$capture"
-  local claude_line=${output%%:*}
-  run grep -nx "$CBOX_DATA_DIR/sessions/sesbox:/home/claude/.claude/sessions" "$capture"
-  (( claude_line < ${output%%:*} ))
 }
 
 @test "_cbox_create: safe mode mounts the shared Claude folder read-only and its own ~/.claude" {
@@ -3762,7 +3910,7 @@ _wa_text() {
   [[ "$output" == *"1  Robots Lab  (group"*"2  Robots Two"*"3  Private Family"*"4  Evil [31mRed Group"*"5  Fake Community  (community"* ]]
   [[ "$output" != *$'\e'* ]]
   [[ "$output" != *"Alice"* ]]
-  [[ "$output" == *"'fake' shares 1 chat(s), read-only: Robots Lab"*".warden"*"[fake]"* ]]
+  [[ "$output" == *"'fake' shares 1 chat(s), read-only: Robots Lab"*'[warden "fake"]'*".cbox"* ]]
   grep -q '^type *= whatsapp' "$CBOX_WARDEN_DIR/resources"
   grep -q '^availability = project' "$CBOX_WARDEN_DIR/resources"
   [ "$(stat -c %a "$CBOX_WARDEN_DIR/whatsapp/fake.json" 2>/dev/null || stat -f %Lp "$CBOX_WARDEN_DIR/whatsapp/fake.json")" = "600" ]
@@ -3809,7 +3957,7 @@ _wa_text() {
   echo '{"chats": {"100@g.us": "Robots Lab"}, "seen": ["c1@g.us", "100@g.us", "200@g.us", "300@g.us", "600@g.us"]}' > "$CBOX_WARDEN_DIR/whatsapp/fake.json"
   _warden_env >/dev/null
   [ ! -e "$CBOX_WARDEN_DIR/sessions/wbox.mcp" ]
-  printf '[fake]\n' > .warden
+  printf '[warden "fake"]\n' > .cbox
   _warden_approve_yes
   run _warden_env
   mcp=$(sed -n 's/^WARDEN_MCP=//p' <<<"$output" | base64 -d)
@@ -4368,7 +4516,7 @@ for ev in ("SessionStart", "Stop", "UserPromptSubmit"):
   printf '[team]\ntype = mail\navailability = project\n' >> "$CBOX_WARDEN_DIR/resources"
   _warden_env >/dev/null
   [ ! -e "$CBOX_WARDEN_DIR/sessions/wbox.mcp" ]
-  printf '[team]\n' > .warden
+  printf '[warden "team"]\n' > .cbox
   _warden_approve_yes
   run _warden_env
   mcp=$(sed -n 's/^WARDEN_MCP=//p' <<<"$output" | base64 -d)
@@ -4920,7 +5068,7 @@ SH
 
 @test "_cbox_project_ports: reads spaces, commas and comments, sorted without duplicates" {
   mkdir -p "$BATS_TMPDIR/ports-ok" && cd "$BATS_TMPDIR/ports-ok"
-  printf '# servers the Mac opens\n\n  ports = 47821, 3000 3000  # dev\n' > .cbox
+  printf '# servers the Mac opens\n[container]\n\n  ports = 47821, 3000 3000  # dev\n' > .cbox
   run _cbox_project_ports
   [ "$status" -eq 0 ]
   [ "$output" = "3000 47821" ]
@@ -4928,7 +5076,7 @@ SH
 
 @test "_cbox_project_ports: a last line without newline counts" {
   mkdir -p "$BATS_TMPDIR/ports-nonl" && cd "$BATS_TMPDIR/ports-nonl"
-  printf 'ports = 8080' > .cbox
+  printf '[container]\nports = 8080' > .cbox
   run _cbox_project_ports
   [ "$output" = "8080" ]
 }
@@ -4936,7 +5084,7 @@ SH
 @test "_cbox_project_ports: refuses privileged, out-of-range and non-numeric ports" {
   mkdir -p "$BATS_TMPDIR/ports-bad" && cd "$BATS_TMPDIR/ports-bad"
   for bad in 80 65536 0 abc 3000x 99999999999; do
-    printf 'ports = 3000 %s\n' "$bad" > .cbox
+    printf '[container]\nports = 3000 %s\n' "$bad" > .cbox
     run _cbox_project_ports
     [ "$status" -eq 1 ]
     [[ "$output" == *"'$bad' is not a port cbox publishes"* ]]
@@ -4950,17 +5098,147 @@ SH
   [ "$status" -eq 1 ]
   [[ "$output" == *"is not a 'name = value' line"* ]]
 
-  printf 'colour = blue\nports = 3000\n' > .cbox
+  printf '[container]\ncolour = blue\nports = 3000\n' > .cbox
   run _cbox_project_ports
   [ "$status" -eq 0 ]
-  [[ "$output" == *"unknown setting 'colour' ignored"* ]]
+  [[ "$output" == *"unknown setting 'colour' in [container] ignored (known: ports, memory)"* ]]
   [[ "$output" == *"3000"* ]]
+}
+
+@test "_cbox_project_settings: reads [container] only; warden sections are skipped, others warned" {
+  mkdir -p "$BATS_TMPDIR/sec-ok" && cd "$BATS_TMPDIR/sec-ok"
+  printf '; project\n[Container]\n\tports = 3000 ; web\n[warden "store"]\n\tprefix = p1\n\tports = 9999\n[later]\n\tports = 1234\n' > .cbox
+  run _cbox_project_ports
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"unknown section [later] ignored (known: [container], [warden \"<resource>\"])"* ]]
+  [ "${lines[${#lines[@]}-1]}" = "3000" ]
+}
+
+@test "_cbox_project_settings: a setting outside a section says to add [container]" {
+  mkdir -p "$BATS_TMPDIR/sec-loose" && cd "$BATS_TMPDIR/sec-loose"
+  printf 'ports = 3000\n' > .cbox
+  run _cbox_project_ports
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"'ports' must be in a section — add the line [container] above it"* ]]
+}
+
+# Compat, remove after 2026-12-31 (with cmd_upgrade_project).
+_upgrade() {  # $1: the answer typed, "" for none; runs in $PWD
+  printf '%s\n' "$1" | python3 -c "
+import sys
+sys.stdin.isatty = lambda: True
+exec(open(sys.argv[1]).read())
+cmd_upgrade_project(sys.argv[2], sys.argv[3], '1')
+" "$(_warden_lib)" "$CBOX_WARDEN_DIR" "$PWD"
+}
+
+@test "upgrade-project: moves .warden and loose .cbox lines into the sectioned .cbox, keeping the approval" {
+  mkdir -p "$BATS_TMPDIR/upg" && cd "$BATS_TMPDIR/upg"
+  rm -f .warden .cbox; mkdir -p "$CBOX_WARDEN_DIR"
+  printf '# web\nports = 3000\n' > .cbox
+  printf '[store]\nprefix = p1\n[team]\n' > .warden
+  python3 -c "import hashlib, json; print(json.dumps({'$PWD': hashlib.sha256(open('.warden', 'rb').read()).hexdigest()}))" \
+    > "$CBOX_WARDEN_DIR/approvals.json"
+  run _upgrade ""
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Update .cbox now (and remove .warden)? [Y/n]"* ]]
+  [[ "$output" == *"✔ .cbox updated and .warden removed"* ]]
+  [ ! -e .warden ]
+  run cat .cbox
+  [ "$output" = $'# web\n[container]\nports = 3000\n\n[warden "store"]\n\tprefix = p1\n\n[warden "team"]' ]
+  [ "$(_cbox_project_ports)" = "3000" ]
+  run python3 -c "exec(open('$(_warden_lib)').read())
+import json
+print(json.load(open('$CBOX_WARDEN_DIR/approvals.json'))['$PWD'] == project_request('$PWD')[1])"
+  [ "$output" = "True" ]
+}
+
+@test "upgrade-project: a no leaves both files; new-layout projects are not asked" {
+  mkdir -p "$BATS_TMPDIR/upg-no" && cd "$BATS_TMPDIR/upg-no"
+  rm -f .warden .cbox
+  printf '[team]\n' > .warden
+  run _upgrade "n"
+  [[ "$output" == *"Not changed"* ]]
+  [ -f .warden ]
+  [ ! -e .cbox ]
+  rm -f .warden
+  printf '[container]\nports = 3000\n' > .cbox
+  run _upgrade ""
+  [ -z "$output" ]
+}
+
+@test "_cbox_project_memory: the .cbox's memory in lowercase, else CBOX_MEMORY" {
+  mkdir -p "$BATS_TMPDIR/mem-ok" && cd "$BATS_TMPDIR/mem-ok"
+  rm -f .cbox
+  [ "$(CBOX_MEMORY=4g _cbox_project_memory)" = "4g" ]
+  printf '[container]\nports = 3000\n' > .cbox
+  [ "$(CBOX_MEMORY=4g _cbox_project_memory)" = "4g" ]
+  printf '[container]\nmemory = 8G  # several agents\nports = 3000\n' > .cbox
+  [ "$(CBOX_MEMORY=4g _cbox_project_memory)" = "8g" ]
+  [ "$(_cbox_project_ports)" = "3000" ]
+  printf '[container]\nmemory = 1536m' > .cbox
+  [ "$(_cbox_project_memory)" = "1536m" ]
+}
+
+@test "_cbox_project_memory: refuses sizes a container cannot get" {
+  mkdir -p "$BATS_TMPDIR/mem-bad" && cd "$BATS_TMPDIR/mem-bad"
+  for bad in 0g 65g 512m 8gb 8 abc -4g; do
+    printf '[container]\nmemory = %s\n' "$bad" > .cbox
+    run _cbox_project_memory
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"memory = '$bad' is not a size"*"e.g. 8g"* ]]
+  done
+}
+
+@test "_cbox_create: both modes get the .cbox's memory, labelled; a bad one creates nothing" {
+  local capture="$BATS_TMPDIR/create-cboxmem-args"
+  mkdir -p "$BATS_TMPDIR/mem-create" && cd "$BATS_TMPDIR/mem-create"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  printf '[container]\nmemory = 8g\n' > .cbox
+  local mode
+  for mode in normal safe; do
+    rm -f "$capture"; _cbox_create "cbox-unit-cboxmem" "$mode"
+    run cat "$capture"
+    [[ "$output" == *$'\n--memory=8g\n'* ]]
+    [[ "$output" == *$'\n--label\ncbox.memory=8g\n'* ]]
+  done
+  printf '[container]\nmemory = 100g\n' > .cbox
+  rm -f "$capture"
+  run _cbox_create "cbox-unit-cboxmem" safe
+  [ "$status" -eq 1 ]
+  [ "$(grep -c "is not a size" <<<"$output")" -eq 1 ]
+  [[ "$output" != *"Creating"* ]]
+}
+
+@test "_cbox_memory_check: quiet when it matches or the container predates the label; names what asks for more" {
+  mkdir -p "$BATS_TMPDIR/mem-check" && cd "$BATS_TMPDIR/mem-check"
+  rm -f .cbox
+  HAVE=4g; _cbox_rt_label() { [[ "$2" == cbox.memory ]] && echo "$HAVE"; }
+  CBOX_MEMORY=4g run _cbox_memory_check proj
+  [ -z "$output" ]
+  HAVE=""; CBOX_MEMORY=8g run _cbox_memory_check proj
+  [ -z "$output" ]
+  HAVE=4g; CBOX_MEMORY=8g run _cbox_memory_check proj
+  [[ "$output" == *"has 4g of memory, but CBOX_MEMORY asks for 8g"*"cbox reset"* ]]
+  printf '[container]\nmemory = 16g\n' > .cbox
+  CBOX_MEMORY=4g run _cbox_memory_check proj
+  [[ "$output" == *"has 4g of memory, but .cbox asks for 16g"* ]]
+}
+
+@test "_cbox_enter: every session warns in the container when memory runs low" {
+  for MODE in normal safe; do
+    EGRESS=allowlist LOGIN=shared
+    run _enter_safe
+    run cat "$BATS_TMPDIR/enter-egress"
+    [[ "$output" == *"MemAvailable"*"Only \$_f MB of memory free"*"memory = 8g in .cbox"* ]]
+  done
 }
 
 @test "_cbox_create: publishes .cbox ports on 127.0.0.1 with a label, normal mode only" {
   local capture="$BATS_TMPDIR/create-ports-args"
   mkdir -p "$BATS_TMPDIR/ports-create" && cd "$BATS_TMPDIR/ports-create"
-  printf 'ports = 47821 3000\n' > .cbox
+  printf '[container]\nports = 47821 3000\n' > .cbox
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
 
@@ -4990,7 +5268,7 @@ SH
 @test "_cbox_create: a broken .cbox creates nothing" {
   local capture="$BATS_TMPDIR/create-badports-args"
   mkdir -p "$BATS_TMPDIR/ports-create-bad" && cd "$BATS_TMPDIR/ports-create-bad"
-  printf 'ports = 80\n' > .cbox
+  printf '[container]\nports = 80\n' > .cbox
   rm -f "$capture"
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
@@ -5005,7 +5283,7 @@ SH
 
 @test "_cbox_ports_check: shows published ports; quiet when .cbox matches" {
   mkdir -p "$BATS_TMPDIR/ports-check" && cd "$BATS_TMPDIR/ports-check"
-  printf 'ports = 47821\n' > .cbox
+  printf '[container]\nports = 47821\n' > .cbox
   _cbox_rt_label() { [[ "$2" == cbox.ports ]] && echo "47821"; }
   run _cbox_ports_check proj normal
   [ "$status" -eq 0 ]
@@ -5014,7 +5292,7 @@ SH
 
 @test "_cbox_ports_check: a changed .cbox suggests cbox reset" {
   mkdir -p "$BATS_TMPDIR/ports-changed" && cd "$BATS_TMPDIR/ports-changed"
-  printf 'ports = 3000 47821\n' > .cbox
+  printf '[container]\nports = 3000 47821\n' > .cbox
   _cbox_rt_label() { [[ "$2" == cbox.ports ]] && echo "47821"; }
   run _cbox_ports_check proj normal
   [[ "$output" == *".cbox lists ports 3000 47821, but this container publishes 47821."* ]]
@@ -5041,7 +5319,7 @@ SH
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 
-  printf 'ports = 3000\n' > .cbox
+  printf '[container]\nports = 3000\n' > .cbox
   run _cbox_ports_check proj safe
   [ "$status" -eq 0 ]
   [[ "$output" == *"not published for safe containers"* ]]
@@ -5049,7 +5327,7 @@ SH
 
 @test "_cbox_ports_check: a broken .cbox says so and does not fail the session" {
   mkdir -p "$BATS_TMPDIR/ports-broken" && cd "$BATS_TMPDIR/ports-broken"
-  printf 'ports = 22\n' > .cbox
+  printf '[container]\nports = 22\n' > .cbox
   _cbox_rt_label() { echo ""; }
   run _cbox_ports_check proj normal
   [ "$status" -eq 0 ]

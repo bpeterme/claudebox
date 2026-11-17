@@ -1476,6 +1476,41 @@ _share_setup() {
   [ "$status" -eq 2 ]
 }
 
+@test "_cbox_reset_ask: a stopped container or one without sessions is reset without asking" {
+  _cbox_running() { return 1; }
+  run _cbox_reset_ask "myproject" </dev/null
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  _cbox_running() { return 0; }
+  _cbox_container_has_sessions() { return 1; }
+  run _cbox_reset_ask "myproject" </dev/null
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "_cbox_reset_ask: an open session elsewhere keeps the container without a terminal to confirm" {
+  _cbox_running() { return 0; }
+  _cbox_container_has_sessions() { return 0; }
+  run _cbox_reset_ask "myproject" </dev/null
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"'myproject' is still in use in another terminal"*"run cbox reset in a terminal"* ]]
+}
+
+@test "cbox reset: does not remove a container that is open in another terminal" {
+  _cbox_system_start() { :; }
+  _cbox_exists() { return 0; }
+  _cbox_running() { return 0; }
+  _cbox_container_has_sessions() { return 0; }
+  _cbox_mcp_relay_stop() { echo "relay stopped" >> "$BATS_TMPDIR/reset-calls"; }
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { [[ "$1" != rm ]] || echo "$*" >> "$BATS_TMPDIR/reset-calls"; }
+  rm -f "$BATS_TMPDIR/reset-calls"
+  run cbox reset myproject </dev/null
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"still in use in another terminal"* ]]
+  [ ! -e "$BATS_TMPDIR/reset-calls" ]
+}
+
 @test "_cbox_container_has_sessions: returns 2 when the probe prints nothing" {
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { true; }

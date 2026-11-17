@@ -101,7 +101,7 @@ cbox oc safe   # opencode in safe mode
 | Command | Description |
 |---------|-------------|
 | `cbox stop` | Stop the current project's container |
-| `cbox reset [<name>]` | Remove the current project's container (or a named container) |
+| `cbox reset [<name>]` | Remove the current project's container (or a named container); asks first while it is open in another terminal |
 | `cbox rebuild` | Rebuild the container image; also remove the old images earlier rebuilds left behind (Docker: only cbox's; Apple's runtime: every image without a name) |
 | `cbox list` | List all cbox containers |
 | `cbox prune` | Remove all stopped cbox containers; on macOS also reclaim unused disk space in running ones, and old images no container uses any more, as `cbox rebuild` does |

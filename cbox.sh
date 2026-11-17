@@ -6944,6 +6944,25 @@ _cbox_git_guard_start() {
   mv "$dir/scan.tmp" "$dir/scan"
 }
 
+# Before a reset: a container with an open session (another terminal) is only
+# removed after a yes on a terminal; anything else keeps it.
+_cbox_reset_ask() {
+  local name="$1" answer="" out=/dev/stdout
+  _cbox_running "$name" || return 0
+  _cbox_container_has_sessions "$name" || return 0
+  _cbox_busy_hold && out=/dev/tty
+  echo "⚠  Container '$name' is still in use in another terminal. A reset ends that session." > "$out"
+  if [[ ! -t 0 ]]; then
+    echo "   Close it first, or run cbox reset in a terminal to confirm." > "$out"
+    _cbox_busy_release
+    return 1
+  fi
+  printf '   Reset anyway? [y/N] ' > "$out"
+  read -r answer || answer=""
+  _cbox_busy_release
+  [[ "$answer" == [yY]* ]]
+}
+
 # Asks on a terminal only; anything else means no.
 _cbox_git_guard_ask() {
   [[ -t 0 ]] || return 1
@@ -7555,6 +7574,10 @@ cbox() {
       if ! _cbox_exists "$reset_target"; then
         echo "No container found for '$reset_target'."
         return 0
+      fi
+      if ! _cbox_reset_ask "$reset_target"; then
+        _cbox_busy_end
+        return 1
       fi
       _cbox_step "Removing container '$reset_target'..."
       _cbox_mcp_relay_stop "$reset_target"

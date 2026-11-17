@@ -187,6 +187,12 @@ CBOX_WARDEN_PORT="${CBOX_WARDEN_PORT:-47100}"
 # Claude Code (~400 MB) plus a test suite or a large file can exhaust; the VM
 # then dies with the session. Applies when a container is created (cbox reset).
 CBOX_MEMORY="${CBOX_MEMORY:-4g}"
+# Terminal identity (names of variables your terminal sets) that a session
+# passes to the host MCP servers it calls, so a server such as a terminal
+# integration acts on that session's own window or tab. Several sessions of a
+# container share one relay; without this, every server would see the terminal
+# of the session that started it. Only names listed here ever reach a server.
+CBOX_SESSION_ENV="${CBOX_SESSION_ENV-TERM_PROGRAM TERM_SESSION_ID ITERM_SESSION_ID KITTY_WINDOW_ID WEZTERM_PANE TMUX_PANE CMUX_WORKSPACE_ID CMUX_SURFACE_ID}"
 # Mount the project's .git/config and .git/hooks read-only (see _cbox_create).
 # 0 lets the container change them again. Applies when a container is created.
 CBOX_PROTECT_GIT="${CBOX_PROTECT_GIT:-1}"
@@ -897,7 +903,13 @@ _cbox_audio_stop() {
 # The supervisor keeps $_CBOX_MCP_SLOTS pending `accept`s per server, so that
 # many concurrent clients (sessions) per container are served. Each connection
 # gets a fresh server process, exactly like a native stdio MCP server. Bytes are
-# passed through untouched — there is no protocol translation.
+# passed through untouched — there is no protocol translation. Before them,
+# `connect` sends one line: the session's terminal identity (CBOX_SESSION_TERM,
+# see CBOX_SESSION_ENV), which the host gives that server as environment, with
+# only the names CBOX_SESSION_ENV lists. Every server also gets CBOX_CONTAINER
+# (the container's name) and MCP_PROJECT_DIR (the project's folder on the host),
+# set by the host, never by the container. Its working folder stays the home
+# folder: the project folder can be written from the container.
 #
 # Servers that work on file paths (filesystem, git, …) do not belong here: they
 # would see host paths, not /Workspace. Run those inside the container instead
@@ -908,12 +920,14 @@ _cbox_audio_stop() {
 # same in bash 3.2 and zsh. Run as: python3 -c "$(_cbox_mcp_py)" <command> ...
 _cbox_mcp_py() {
   cat <<'PYEOF'
-import json, os, re, select, signal, subprocess, sys, threading, time
+import base64, json, os, re, select, signal, subprocess, sys, threading, time
 from urllib.parse import urlsplit
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1", "0.0.0.0")
-MARKER = b"\x01"  # sent by `accept` once a client has connected
+MARKER_ID = b"\x02"  # sent by `accept` once a client has connected; its identity line follows
+ID_MAX = 4096  # bytes of an identity line
+VALUE_RE = re.compile(r"^[\x20-\x7e]{1,256}$")
 
 
 def load_servers(path, warn=True):
@@ -1124,11 +1138,34 @@ def close(f):
         pass
 
 
-def serve(sname, cfg, ex, hint_after):
+def session_env(line, allowed):
+    """The variables of a client's identity line (base64 JSON) whose names the
+    host allows, with plain printable values; anything else is dropped."""
+    try:
+        data = json.loads(base64.b64decode(line.strip() or b"e30=", validate=True))
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items()
+            if k in allowed and isinstance(v, str) and VALUE_RE.match(v)}
+
+
+def server_env(cfg, box, folder, allowed, ident):
+    """The server's environment: the supervisor's, without the identity names
+    (those of the session that started it), plus the client's own identity,
+    the server's configured env, and what the host knows: container and folder."""
+    env = {k: v for k, v in os.environ.items() if k not in allowed}
+    env.update(ident)
+    env.update({str(k): str(v) for k, v in (cfg.get("env") or {}).items()})
+    env["CBOX_CONTAINER"] = box
+    env["MCP_PROJECT_DIR"] = folder
+    return env
+
+
+def serve(sname, cfg, ex, hint_after, env):
     """One client connection. Ends — and takes the server with it — as soon as
     either the exec process (the client's side) or the server exits."""
-    env = dict(os.environ)
-    env.update({str(k): str(v) for k, v in (cfg.get("env") or {}).items()})
     argv = [os.path.expanduser(str(cfg["command"]))] + [str(a) for a in (cfg.get("args") or [])]
     try:
         srv = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1178,7 +1215,23 @@ def serve(sname, cfg, ex, hint_after):
     down.join(1)
 
 
-def slot(stop, runtime, box, config, extra, relay, sname, hint_after):
+def read_line(fd, limit):
+    """Bytes up to a newline (not included), at most limit; None when cut off."""
+    out = b""
+    while len(out) <= limit:
+        try:
+            c = os.read(fd, 1)
+        except OSError:
+            return None
+        if not c:
+            return None
+        if c == b"\n":
+            return out
+        out += c
+    return None
+
+
+def slot(stop, runtime, box, config, extra, relay, sname, hint_after, folder, allowed):
     """Keeps one `accept` pending in the container. Each connection is handed
     to its own thread, so the slot is ready again right away."""
     fails = 0
@@ -1199,7 +1252,8 @@ def slot(stop, runtime, box, config, extra, relay, sname, hint_after):
             marker = os.read(ex.stdout.fileno(), 1)
         except OSError:
             marker = b""
-        if marker != MARKER:
+        line = read_line(ex.stdout.fileno(), ID_MAX) if marker == MARKER_ID else None
+        if line is None:
             # Container stopped, relay missing, or exec failed: back off.
             close(ex.stdin)
             finish(ex, grace=1)
@@ -1209,10 +1263,13 @@ def slot(stop, runtime, box, config, extra, relay, sname, hint_after):
             stop.wait(min(30, 2 ** min(fails, 5)))
             continue
         fails = 0
-        threading.Thread(target=serve, args=(sname, cfg, ex, hint_after), daemon=True).start()
+        env = server_env(cfg, box, folder, allowed, session_env(line, allowed))
+        threading.Thread(target=serve, args=(sname, cfg, ex, hint_after, env), daemon=True).start()
 
 
-def cmd_supervise(runtime, box, config, relay, slots, hint_after, pidfile, extra=""):
+def cmd_supervise(runtime, box, config, relay, slots, hint_after, pidfile, extra="", folder="",
+                  session_names=""):
+    allowed = set(session_names.split())
     try:
         os.setsid()  # own process group, so stop can kill every child at once
     except OSError:
@@ -1232,7 +1289,7 @@ def cmd_supervise(runtime, box, config, relay, slots, hint_after, pidfile, extra
                 while len(alive) < int(slots):
                     t = threading.Thread(target=slot, daemon=True,
                                          args=(stop, runtime, box, config, extra, relay, sname,
-                                               float(hint_after)))
+                                               float(hint_after), folder, allowed))
                     t.start()
                     alive.append(t)
                 workers[sname] = alive
@@ -1444,11 +1501,15 @@ _cbox_mcp_relay_py() {
 # cbox-mcp-relay — installed by cbox at session start; local edits are overwritten.
 #   connect NAME  stdio command for Claude: reach host MCP server NAME
 #   accept NAME   run by the host over `container exec -i`; serves one client
-import glob, os, select, signal, socket, sys, time
+# connect first sends one line: the session's terminal identity
+# (CBOX_SESSION_TERM, base64 JSON). The host decides which of it a server sees.
+import glob, os, re, select, signal, socket, sys, time
 
 BASE = os.environ.get("CBOX_MCP_SOCKET_DIR", "/tmp/cbox-mcp")
 ACK = b"\x06"     # accept → client: this slot is yours
-MARKER = b"\x01"  # accept → host: a client connected, start the server
+MARKER_ID = b"\x02"  # accept → host: a client connected, its identity line follows
+ID_MAX = 4096  # bytes of an identity line
+ID_RE = re.compile(rb"^[A-Za-z0-9+/=]*$")
 DRAIN_SECONDS = 2  # accept: server output still forwarded after the client stops sending
 
 
@@ -1522,9 +1583,20 @@ def accept(name):
             pass
     try:
         conn.sendall(ACK)
+        line = b""
+        conn.settimeout(5)
+        while not line.endswith(b"\n") and len(line) <= ID_MAX:
+            c = conn.recv(1)
+            if not c:
+                return 0
+            line += c
+        conn.settimeout(None)
     except OSError:
         return 0
-    write_all(1, MARKER)
+    line = line.strip()
+    if len(line) > ID_MAX or not ID_RE.match(line):
+        line = b""
+    write_all(1, MARKER_ID + line + b"\n")
     pump(0, 1, conn, half_close=False)
     return 0
 
@@ -1548,6 +1620,14 @@ def connect(name):
             except OSError:
                 ok = False
             if ok:
+                ident = os.environ.get("CBOX_SESSION_TERM", "").encode()
+                if len(ident) > ID_MAX or not ID_RE.match(ident):
+                    ident = b""
+                try:
+                    s.sendall(ident + b"\n")
+                except OSError:
+                    s.close()
+                    continue
                 s.settimeout(None)
                 pump(0, 1, s, half_close=True)
                 return 0
@@ -1604,7 +1684,7 @@ _cbox_mcp_relay_pid() {
 # container, unless it is already running (it re-reads the config by itself).
 # Failures are reported, never fatal: the session works without host MCP.
 _cbox_mcp_relay_start() {
-  local name="$1"
+  local name="$1" _i
   local pidfile="$CBOX_DATA_DIR/.mcp-relay-$name.pid"
   local logfile="$CBOX_DATA_DIR/.mcp-relay-$name.log"
   # Host servers warden grants this container (written by its session).
@@ -1629,20 +1709,30 @@ _cbox_mcp_relay_start() {
     echo "⚠  Could not install cbox-mail-watch in '$name' — mail does not wake the agent this session"
   fi
 
+  local idfile="$CBOX_DATA_DIR/.mcp-relay-$name.id" id
+  id=$(_cbox_mcp_relay_id)
   if _cbox_mcp_relay_pid "$name" >/dev/null; then
-    return 0
+    [[ "$(cat "$idfile" 2>/dev/null)" == "$id" ]] && return 0
+    # Ends the host MCP connections of this container's running sessions too;
+    # their servers reconnect on the next use.
+    _cbox_log "ℹ  restarting the MCP relay (cbox or CBOX_SESSION_ENV changed)"
+    _cbox_mcp_relay_stop "$name"
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+      _cbox_mcp_relay_pid "$name" >/dev/null || break
+      sleep 0.2
+    done
   fi
 
   mkdir -p "$CBOX_DATA_DIR"
   rm -f "$pidfile"
+  printf '%s\n' "$id" > "$idfile"
   # Subshell: no job-control noise in interactive shells, and the supervisor
   # detaches into its own session so it survives the terminal.
   ( python3 -c "$(_cbox_mcp_py)" supervise \
       "$_CBOX_CMD" "$name" "$CBOX_MCP_CONFIG" "$_CBOX_MCP_RELAY" "$_CBOX_MCP_SLOTS" \
-      "$_CBOX_MCP_HINT_SECONDS" "$pidfile" "$extra" \
+      "$_CBOX_MCP_HINT_SECONDS" "$pidfile" "$extra" "$PWD" "$CBOX_SESSION_ENV" \
       </dev/null >"$logfile" 2>&1 & )
 
-  local _i
   for _i in 1 2 3 4 5 6 7 8 9 10; do
     [[ -f "$pidfile" ]] && break
     sleep 0.2
@@ -1652,6 +1742,24 @@ _cbox_mcp_relay_start() {
   else
     echo "⚠  MCP relay did not start — check $logfile"
   fi
+}
+
+# Identifies the code at both ends and what the supervisor was started with: a
+# supervisor started by another cbox version, or for other identity names, is
+# replaced, so host and container always speak the same protocol.
+_cbox_mcp_relay_id() {
+  { _cbox_mcp_py; _cbox_mcp_relay_py; echo "$PWD:$CBOX_SESSION_ENV"; } | cksum | cut -d' ' -f1
+}
+
+# The session's terminal identity, for the host MCP servers it calls: the
+# variables CBOX_SESSION_ENV names that are set, as base64 JSON (one token,
+# safe to pass as an environment value).
+_cbox_session_term() {
+  CBOX_SESSION_ENV="$CBOX_SESSION_ENV" python3 -c '
+import base64, json, os
+names = os.environ["CBOX_SESSION_ENV"].split()
+vals = {n: os.environ[n] for n in names if os.environ.get(n)}
+print(base64.b64encode(json.dumps(vals, sort_keys=True).encode()).decode())'
 }
 
 _cbox_mcp_relay_stop() {
@@ -6952,6 +7060,8 @@ _cbox_enter() {
   # CBOX_CONTAINER tells tools such as flux they run in a claudebox container
   # rather than on a host, which on Linux they cannot tell from the OS alone.
   local _exec_args=(-it -w "/Workspace/$name" -e "CBOX_CONTAINER=$name")
+  # Which terminal window this session runs in, for host MCP servers (relay).
+  _exec_args+=(-e "CBOX_SESSION_TERM=$(_cbox_session_term)")
   local _run="$command" _g _tunnel=$_audio _warden_mcp="" _warden_oc="" _warden_mail=""
   if (( _audio )); then
     # Through the tunnel, PulseAudio sees a local client and would offer shared

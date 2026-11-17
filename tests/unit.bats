@@ -392,6 +392,53 @@ _wait_procs() {
   [ -z "$socks" ]
 }
 
+@test "mcp relay: each server sees the terminal identity of the session that called it" {
+  _relay_setup
+  printf '#!/bin/bash\necho "ws=${CMUX_WORKSPACE_ID:-none} sf=${CMUX_SURFACE_ID:-none} c=$CBOX_CONTAINER d=$MCP_PROJECT_DIR x=${EVIL:-none} p=${PATH:+set}"\n' > "$RELAY_TMP/who"
+  chmod +x "$RELAY_TMP/who"
+  jq --arg w "$RELAY_TMP/who" '.mcpServers.who = {command: $w}' "$CBOX_MCP_CONFIG" > "$RELAY_TMP/c" && mv "$RELAY_TMP/c" "$CBOX_MCP_CONFIG"
+  sleep 3  # the supervisor re-reads the config
+  a=$(CMUX_WORKSPACE_ID=w1 CMUX_SURFACE_ID=s1 EVIL=1 _cbox_session_term)
+  b=$(CMUX_WORKSPACE_ID=w2 _cbox_session_term)
+  forged=$(printf '{"EVIL":"1","CBOX_CONTAINER":"other","CMUX_SURFACE_ID":"bad\\nline"}' | base64 | tr -d '\n')
+  run bash -c "
+    CBOX_SESSION_TERM='$a' timeout 10 '$_CBOX_MCP_RELAY' connect who </dev/null
+    CBOX_SESSION_TERM='$b' timeout 10 '$_CBOX_MCP_RELAY' connect who </dev/null
+    CBOX_SESSION_TERM='$forged' timeout 10 '$_CBOX_MCP_RELAY' connect who </dev/null
+    CBOX_SESSION_TERM='not base64!' timeout 10 '$_CBOX_MCP_RELAY' connect who </dev/null"
+  _relay_teardown
+  [ "${lines[0]}" = "ws=w1 sf=s1 c=rbox d=$PWD x=none p=set" ]
+  [ "${lines[1]}" = "ws=w2 sf=none c=rbox d=$PWD x=none p=set" ]
+  [ "${lines[2]}" = "ws=none sf=none c=rbox d=$PWD x=none p=set" ]
+  [ "${lines[3]}" = "ws=none sf=none c=rbox d=$PWD x=none p=set" ]
+}
+
+@test "mcp relay: the identity of the session that started the relay does not leak to others" {
+  CMUX_WORKSPACE_ID=first _relay_setup
+  printf '#!/bin/bash\necho "ws=${CMUX_WORKSPACE_ID:-none}"\n' > "$RELAY_TMP/who"
+  chmod +x "$RELAY_TMP/who"
+  jq --arg w "$RELAY_TMP/who" '.mcpServers.who = {command: $w}' "$CBOX_MCP_CONFIG" > "$RELAY_TMP/c" && mv "$RELAY_TMP/c" "$CBOX_MCP_CONFIG"
+  sleep 3
+  run bash -c "CBOX_SESSION_TERM='' timeout 10 '$_CBOX_MCP_RELAY' connect who </dev/null"
+  _relay_teardown
+  [ "$output" = "ws=none" ]
+}
+
+@test "mcp relay: a supervisor started by another cbox version or other identity names is replaced" {
+  _relay_setup
+  old=$(_cbox_mcp_relay_pid rbox)
+  run _cbox_mcp_relay_start rbox
+  [ "$(_cbox_mcp_relay_pid rbox)" = "$old" ]
+  CBOX_SESSION_ENV="CMUX_WORKSPACE_ID"
+  run _cbox_mcp_relay_start rbox
+  new=$(_cbox_mcp_relay_pid rbox)
+  run bash -c "echo hi | timeout 10 '$_CBOX_MCP_RELAY' connect echo"
+  _relay_teardown
+  [ -n "$new" ]
+  [ "$new" != "$old" ]
+  [ "$output" = "hi" ]
+}
+
 @test "mcp relay: not started when no host stdio servers are configured" {
   echo '{"mcpServers":{"r":{"url":"https://r.example.com/mcp"}}}' > "$CBOX_MCP_CONFIG"
   _CBOX_CMD=false

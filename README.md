@@ -250,6 +250,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_MCP_CONFIG` | `~/.config/claudebox/mcp.json` | MCP servers that run on the host and are relayed into the container (see [Host MCP Servers](#host-mcp-servers)) |
 | `CBOX_WARDEN_DIR` | `$CBOX_DATA_DIR/warden` | warden resources, approvals and session tokens — host only, never mounted |
 | `CBOX_WARDEN_PORT` | `47100` | Port of the warden broker, bound only to the container-facing host address |
+| `CBOX_SESSION_ENV` | cmux, iTerm2, Terminal, kitty, WezTerm, tmux variables | Names of terminal variables a session passes to the host MCP servers it calls (see [Host MCP Servers](#host-mcp-servers)); empty passes none |
 | `CBOX_MEMORY` | `4g` | Memory of each container (both modes); a project's `.cbox` can set its own (`[container] memory = 8g`). Applies to newly created containers: `cbox reset` |
 | `CBOX_EGRESS_ALLOW` | *(unset)* | Hosts a safe container may reach besides the defaults, e.g. `"openrouter.ai *.example.com host:8443"` (see [Outbound traffic in safe mode](#outbound-traffic-in-safe-mode)). Applies from the next session |
 | `CBOX_MASK` | *(safe mode: secret files)* | Files and folders in the project the container sees empty (see [Hidden secret files](#hidden-secret-files)). Unset: the default list in safe mode, nothing in normal mode; once set, it applies to both modes; `""` = nothing. Applies to newly created containers: `cbox reset` |
@@ -316,6 +317,16 @@ Changes take effect with the next `cbox` session; `cbox mcp` shows what is confi
 the container runtime's own `exec` channel. Nothing listens on the network — neither
 on the host nor in the container — so the server is not reachable from your LAN.
 Each connection starts a fresh server process, just like a local stdio server.
+
+**What a server knows about its caller.** Several sessions of one container share the
+relay, yet each server acts for the session that called it:
+
+- `CMUX_WORKSPACE_ID`, `TERM_SESSION_ID` and the like are those of the calling session's
+  terminal, so a terminal integration acts on that session's own tab. Only names in
+  `CBOX_SESSION_ENV` are passed; the default covers cmux, iTerm2, Terminal, kitty,
+  WezTerm and tmux.
+- `CBOX_CONTAINER` (the container's name) and `MCP_PROJECT_DIR` (the project's folder
+  on the host) are set by the host. Code in the container cannot change them.
 
 **What belongs where.**
 

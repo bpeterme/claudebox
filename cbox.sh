@@ -920,7 +920,7 @@ _cbox_audio_stop() {
 # same in bash 3.2 and zsh. Run as: python3 -c "$(_cbox_mcp_py)" <command> ...
 _cbox_mcp_py() {
   cat <<'PYEOF'
-import base64, json, os, re, select, signal, subprocess, sys, threading, time
+import base64, json, os, re, select, shutil, signal, subprocess, sys, threading, time
 from urllib.parse import urlsplit
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -1320,6 +1320,15 @@ def describe(cfg):
     return str(cfg.get("url", "")) if isinstance(cfg, dict) else ""
 
 
+def command_found(cmd):
+    """Whether a server's command exists on this host: a path (~ expanded) to an
+    executable file, or a name on the PATH."""
+    cmd = os.path.expanduser(str(cmd))
+    if os.sep in cmd:
+        return os.path.isfile(cmd) and os.access(cmd, os.X_OK)
+    return shutil.which(cmd) is not None
+
+
 def shown(path):
     home = os.path.expanduser("~")
     return "~" + path[len(home):] if path.startswith(home + os.sep) else path
@@ -1365,6 +1374,8 @@ def cmd_list(config, logfile=""):
         k = kind(cfg)
         if not NAME_RE.match(sname):
             mark, label = "✘", "invalid name"
+        elif k == "stdio" and not command_found(cfg["command"]):
+            mark, label = "✘", "not found"
         elif k == "stdio":
             mark, label = "✔", "host  "
         elif k == "remote":
@@ -1374,6 +1385,8 @@ def cmd_list(config, logfile=""):
         else:
             mark, label = "✘", "needs \"command\" or \"url\""
         print(f"  {mark} {sname.ljust(width)}  {label}  {describe(cfg)}")
+        if label == "not found":
+            print(f"      ⚠ no such command on this machine — fix its path in {shown_config}")
         for problem in problems.get(sname, [])[-2:]:
             print(f"      ⚠ {problem}")
 

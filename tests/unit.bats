@@ -466,16 +466,16 @@ _wait_procs() {
 }
 
 @test "cbox mcp: lists servers with their kind" {
-  echo '{"mcpServers":{"imcp":{"command":"/x/imcp"},"r":{"url":"https://r.example.com/mcp"},"l":{"url":"http://localhost:1/mcp"}}}' > "$CBOX_MCP_CONFIG"
+  echo '{"mcpServers":{"imcp":{"command":"/bin/sh"},"r":{"url":"https://r.example.com/mcp"},"l":{"url":"http://localhost:1/mcp"}}}' > "$CBOX_MCP_CONFIG"
   run _cbox_mcp_status "myapp"
-  [[ "$output" == *"✔ imcp"*"host"*"/x/imcp"* ]]
+  [[ "$output" == *"✔ imcp"*"host"*"/bin/sh"* ]]
   [[ "$output" == *"✔ r"*"remote"* ]]
   [[ "$output" == *"✘ l"*"not supported"* ]]
   [[ "$output" == *"relay for 'myapp' not running"* ]]
 }
 
 @test "cbox mcp: shows the latest relay problem under its server" {
-  echo '{"mcpServers":{"iMCP":{"command":"/x/imcp-server"},"other":{"command":"/x/o"}}}' > "$CBOX_MCP_CONFIG"
+  echo '{"mcpServers":{"iMCP":{"command":"sh"},"other":{"command":"sh"}}}' > "$CBOX_MCP_CONFIG"
   cat > "$CBOX_DATA_DIR/.mcp-relay-myapp.log" <<'LOG'
 2026-10-04 09:00:00 INFO iMCP: client connected — server started (pid 1)
 2026-10-04 09:00:25 WARN iMCP: no response from the server 25s after a client connected. Local Network ...
@@ -487,8 +487,21 @@ LOG
   [[ "$output" != *"other"*"⚠"* ]]
 }
 
+@test "cbox mcp: marks a host server whose command does not exist" {
+  printf '#!/bin/sh\n' > "$BATS_TEST_TMPDIR/srv"; chmod +x "$BATS_TEST_TMPDIR/srv"
+  cat > "$CBOX_MCP_CONFIG" <<JSON
+{"mcpServers":{"gone":{"command":"~/Applications/Nope.app/Contents/MacOS/x"},
+ "here":{"command":"$BATS_TEST_TMPDIR/srv"},"onpath":{"command":"sh"},"nopath":{"command":"no-such-cmd-xyz"}}}
+JSON
+  run _cbox_mcp_status "myapp"
+  [[ "$output" == *"✘ gone    not found"*"no such command on this machine — fix its path in"* ]]
+  [[ "$output" == *"✔ here    host"* ]]
+  [[ "$output" == *"✔ onpath  host"* ]]
+  [[ "$output" == *"✘ nopath  not found"* ]]
+}
+
 @test "cbox mcp: a later successful connection clears the problem" {
-  echo '{"mcpServers":{"iMCP":{"command":"/x/imcp-server"}}}' > "$CBOX_MCP_CONFIG"
+  echo '{"mcpServers":{"iMCP":{"command":"sh"}}}' > "$CBOX_MCP_CONFIG"
   cat > "$CBOX_DATA_DIR/.mcp-relay-myapp.log" <<'LOG'
 2026-10-04 09:00:30 WARN iMCP: client gave up before the server answered — server stopped
 2026-10-04 09:05:00 INFO iMCP: client connected — server started (pid 3)

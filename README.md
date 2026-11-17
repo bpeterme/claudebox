@@ -186,7 +186,7 @@ Limits:
 - `*.key` also matches Keynote files. If a project has Keynote files, set `CBOX_MASK` with `!*.key` and name its real key files instead.
 - Apple's runtime needs container 1.2.1 or newer (`--masked-path`). With an older one cbox does not create the container, rather than create it without hiding.
 
-### Reaching a server in the container (`.cbox`)
+### Project settings: ports and memory (`.cbox`)
 
 A web server in the container can be opened on your host at `http://localhost:<port>`, at the same address every session. List its ports in a `.cbox` file in the project folder:
 
@@ -200,6 +200,14 @@ ports = 47821 3000
 - **Set at creation:** a runtime publishes ports when it creates a container. After you change `.cbox`, cbox says so at the next start; apply it with `cbox reset`.
 - **Normal mode only:** safe containers publish no ports.
 - Ports 1024–65535; a port another program on the host already uses cannot be published.
+
+`.cbox` can also give the project's container more memory than `CBOX_MEMORY`, e.g. for several agents in one container (each Claude session needs about 400 MB):
+
+```ini
+memory = 8g        # 1g to 64g (or m for megabytes); both modes
+```
+
+Like ports, memory is set when the container is created: after a change, cbox says so at the next start; apply it with `cbox reset`. A session start also warns when the container has less than 600 MB free.
 
 ### Git safety (both modes)
 
@@ -234,7 +242,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_MCP_CONFIG` | `~/.config/claudebox/mcp.json` | MCP servers that run on the host and are relayed into the container (see [Host MCP Servers](#host-mcp-servers)) |
 | `CBOX_WARDEN_DIR` | `$CBOX_DATA_DIR/warden` | warden resources, approvals and session tokens — host only, never mounted |
 | `CBOX_WARDEN_PORT` | `47100` | Port of the warden broker, bound only to the container-facing host address |
-| `CBOX_MEMORY` | `4g` | Memory of each container (both modes). Applies to newly created containers: `cbox reset` |
+| `CBOX_MEMORY` | `4g` | Memory of each container (both modes); a project's `.cbox` can set its own (`memory = 8g`). Applies to newly created containers: `cbox reset` |
 | `CBOX_EGRESS_ALLOW` | *(unset)* | Hosts a safe container may reach besides the defaults, e.g. `"openrouter.ai *.example.com host:8443"` (see [Outbound traffic in safe mode](#outbound-traffic-in-safe-mode)). Applies from the next session |
 | `CBOX_MASK` | *(safe mode: secret files)* | Files and folders in the project the container sees empty (see [Hidden secret files](#hidden-secret-files)). Unset: the default list in safe mode, nothing in normal mode; once set, it applies to both modes; `""` = nothing. Applies to newly created containers: `cbox reset` |
 | `CBOX_PROTECT_GIT` | `1` | Mount the project's `.git/config` and `.git/hooks` read-only (see [Git safety](#git-safety-both-modes)); `0` = writable. Applies to newly created containers: `cbox reset` |

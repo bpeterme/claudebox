@@ -5018,8 +5018,76 @@ SH
   printf 'colour = blue\nports = 3000\n' > .cbox
   run _cbox_project_ports
   [ "$status" -eq 0 ]
-  [[ "$output" == *"unknown setting 'colour' ignored"* ]]
+  [[ "$output" == *"unknown setting 'colour' ignored (known: ports, memory)"* ]]
   [[ "$output" == *"3000"* ]]
+}
+
+@test "_cbox_project_memory: the .cbox's memory in lowercase, else CBOX_MEMORY" {
+  mkdir -p "$BATS_TMPDIR/mem-ok" && cd "$BATS_TMPDIR/mem-ok"
+  rm -f .cbox
+  [ "$(CBOX_MEMORY=4g _cbox_project_memory)" = "4g" ]
+  printf 'ports = 3000\n' > .cbox
+  [ "$(CBOX_MEMORY=4g _cbox_project_memory)" = "4g" ]
+  printf 'memory = 8G  # several agents\nports = 3000\n' > .cbox
+  [ "$(CBOX_MEMORY=4g _cbox_project_memory)" = "8g" ]
+  [ "$(_cbox_project_ports)" = "3000" ]
+  printf 'memory = 1536m' > .cbox
+  [ "$(_cbox_project_memory)" = "1536m" ]
+}
+
+@test "_cbox_project_memory: refuses sizes a container cannot get" {
+  mkdir -p "$BATS_TMPDIR/mem-bad" && cd "$BATS_TMPDIR/mem-bad"
+  for bad in 0g 65g 512m 8gb 8 abc -4g; do
+    printf 'memory = %s\n' "$bad" > .cbox
+    run _cbox_project_memory
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"memory = '$bad' is not a size"*"e.g. 8g"* ]]
+  done
+}
+
+@test "_cbox_create: both modes get the .cbox's memory, labelled; a bad one creates nothing" {
+  local capture="$BATS_TMPDIR/create-cboxmem-args"
+  mkdir -p "$BATS_TMPDIR/mem-create" && cd "$BATS_TMPDIR/mem-create"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  printf 'memory = 8g\n' > .cbox
+  local mode
+  for mode in normal safe; do
+    rm -f "$capture"; _cbox_create "cbox-unit-cboxmem" "$mode"
+    run cat "$capture"
+    [[ "$output" == *$'\n--memory=8g\n'* ]]
+    [[ "$output" == *$'\n--label\ncbox.memory=8g\n'* ]]
+  done
+  printf 'memory = 100g\n' > .cbox
+  rm -f "$capture"
+  run _cbox_create "cbox-unit-cboxmem" safe
+  [ "$status" -eq 1 ]
+  [ "$(grep -c "is not a size" <<<"$output")" -eq 1 ]
+  [[ "$output" != *"Creating"* ]]
+}
+
+@test "_cbox_memory_check: quiet when it matches or the container predates the label; names what asks for more" {
+  mkdir -p "$BATS_TMPDIR/mem-check" && cd "$BATS_TMPDIR/mem-check"
+  rm -f .cbox
+  HAVE=4g; _cbox_rt_label() { [[ "$2" == cbox.memory ]] && echo "$HAVE"; }
+  CBOX_MEMORY=4g run _cbox_memory_check proj
+  [ -z "$output" ]
+  HAVE=""; CBOX_MEMORY=8g run _cbox_memory_check proj
+  [ -z "$output" ]
+  HAVE=4g; CBOX_MEMORY=8g run _cbox_memory_check proj
+  [[ "$output" == *"has 4g of memory, but CBOX_MEMORY asks for 8g"*"cbox reset"* ]]
+  printf 'memory = 16g\n' > .cbox
+  CBOX_MEMORY=4g run _cbox_memory_check proj
+  [[ "$output" == *"has 4g of memory, but .cbox asks for 16g"* ]]
+}
+
+@test "_cbox_enter: every session warns in the container when memory runs low" {
+  for MODE in normal safe; do
+    EGRESS=allowlist LOGIN=shared
+    run _enter_safe
+    run cat "$BATS_TMPDIR/enter-egress"
+    [[ "$output" == *"MemAvailable"*"Only \$_f MB of memory free"*"memory = 8g in .cbox"* ]]
+  done
 }
 
 @test "_cbox_create: publishes .cbox ports on 127.0.0.1 with a label, normal mode only" {

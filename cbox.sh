@@ -87,6 +87,7 @@ Container Management:
 
 Project file .cbox:
   ports = 47821 3000                  Reach servers in the container at http://localhost:<port>
+  memory = 8g                         Container memory (default CBOX_MEMORY), e.g. for several agents
 
 MCP servers on the host ($(_cbox_shown "$CBOX_MCP_CONFIG")):
   cbox mcp                            Show configured host MCP servers and relay status
@@ -5800,6 +5801,7 @@ _cbox_sessions_link() {
   if [[ -L "$link" ]]; then
     rm -f "$link"
   elif [[ -d "$link" ]]; then
+    # Compat, remove after 2026-12-31: the folder an older cbox mounted over.
     if ! rmdir "$link" 2>/dev/null; then
       old="$link.old-$(date +%Y%m%d-%H%M%S)"
       if ! mv "$link" "$old"; then
@@ -6029,22 +6031,25 @@ _cbox_mask_check() {
 # published ports (the project's .cbox)
 # ---------------------------------------------------------
 #
-# A project's .cbox file lists ports of servers in its container that the
-# host reaches at http://localhost:<port>:
+# A project's .cbox file holds settings of its container:
 #
-#   ports = 47821 3000
+#   ports = 47821 3000     servers in the container the host reaches at
+#                          http://localhost:<port> (127.0.0.1 only, never the
+#                          network; normal containers only)
+#   memory = 8g            the container's memory (both modes), instead of
+#                          CBOX_MEMORY; for several agents in one container
 #
-# They are published on the host's 127.0.0.1 only, never to the network, and
-# only for normal containers. A runtime publishes ports when it creates a
-# container, so a changed list applies after cbox reset.
+# A runtime sets both when it creates a container, so a change applies after
+# cbox reset.
 
 _cbox_project_file() { echo "$PWD/.cbox"; }
 
-# Prints the ports the project's .cbox lists, sorted and space-separated;
-# nothing without a .cbox. Fails, saying why on stderr, for a line or port it
-# cannot use.
-_cbox_project_ports() {
-  local file shown line key value p ports=() list=()
+# Prints the project's .cbox settings, one "key value" line each: "ports"
+# with the ports sorted and space-separated, "memory" with the size in
+# lowercase (e.g. 8g). Nothing without a .cbox. Fails, saying why on stderr,
+# for a line or value it cannot use.
+_cbox_project_settings() {
+  local file shown line key value p ports=() list=() memory=""
   file=$(_cbox_project_file)
   [[ -f "$file" ]] || return 0
   shown=$(_cbox_shown "$file")
@@ -6066,11 +6071,48 @@ _cbox_project_ports() {
           fi
           ports+=("$((10#$p))")
         done ;;
-      *) echo "⚠  $shown: unknown setting '$key' ignored (known: ports)" >&2 ;;
+      memory)
+        value="${value//[[:space:]]/}"
+        if ! _cbox_memory_ok "$value"; then
+          echo "✖ $shown: memory = '$value' is not a size cbox can give a container — use e.g. 8g (1g to 64g, or m for megabytes)" >&2
+          return 1
+        fi
+        memory=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]') ;;
+      *) echo "⚠  $shown: unknown setting '$key' ignored (known: ports, memory)" >&2 ;;
     esac
   done <"$file"
-  [[ ${#ports[@]} -gt 0 ]] || return 0
-  printf '%s\n' "${ports[@]}" | sort -nu | paste -s -d ' ' -
+  if [[ ${#ports[@]} -gt 0 ]]; then
+    echo "ports $(printf '%s\n' "${ports[@]}" | sort -nu | paste -s -d ' ' -)"
+  fi
+  [[ -z "$memory" ]] || echo "memory $memory"
+}
+
+# Whether $1 is a container memory size cbox accepts: 1g to 64g, or the same
+# range in megabytes (1024m to 65536m).
+_cbox_memory_ok() {
+  [[ "$1" =~ ^([0-9]{1,6})([gGmM])$ ]] || return 1
+  local n=$((10#${BASH_REMATCH[1]})) u="${BASH_REMATCH[2]}"
+  case "$u" in
+    g|G) (( n >= 1 && n <= 64 )) ;;
+    *)   (( n >= 1024 && n <= 65536 )) ;;
+  esac
+}
+
+# Prints the ports the project's .cbox lists, sorted and space-separated;
+# nothing without them. Fails like _cbox_project_settings.
+_cbox_project_ports() {
+  local out
+  out=$(_cbox_project_settings) || return 1
+  awk '$1 == "ports" { $1 = ""; sub(/^ /, ""); print }' <<<"$out"
+}
+
+# The memory a new container of this project gets: the .cbox's memory, else
+# CBOX_MEMORY. Fails like _cbox_project_settings.
+_cbox_project_memory() {
+  local out want
+  out=$(_cbox_project_settings) || return 1
+  want=$(awk '$1 == "memory" { print $2 }' <<<"$out")
+  echo "${want:-$CBOX_MEMORY}"
 }
 
 # Runtime arguments, one per line, that publish ports $1 (space-separated) on
@@ -6105,6 +6147,29 @@ _cbox_ports_check() {
   [[ "$want" == "$have" ]] && return 0
   echo "⚠  .cbox lists ports ${want:-(none)}, but this container publishes ${have:-none}."
   echo "   Ports are set when a container is created: cbox reset"
+}
+
+# At session start: a note when the memory the container would get today
+# (.cbox memory, else CBOX_MEMORY) differs from the memory it was created
+# with (cbox.memory label; containers without it are not checked).
+_cbox_memory_check() {
+  local name="$1" want have from=CBOX_MEMORY
+  have=$(_cbox_rt_label "$name" cbox.memory)
+  [[ -n "$have" ]] || return 0
+  want=$(_cbox_project_memory 2>/dev/null) || return 0
+  [[ "$want" == "$have" ]] && return 0
+  _cbox_project_settings 2>/dev/null | grep -q '^memory ' && from=.cbox
+  echo "⚠  This container has $have of memory, but $from asks for $want."
+  echo "   Memory is set when a container is created: cbox reset"
+}
+
+# Below this many MB free, a session start warns (a Claude session needs ~400).
+_CBOX_LOW_MEMORY_MB=600
+
+# zsh code the session runs in the container before the agent: a warning when
+# the container has little memory left, e.g. with several agents in it.
+_cbox_low_memory_note() {
+  printf '%s' "_f=\$(awk '/MemAvailable/ { print int(\$2 / 1024) }' /proc/meminfo 2>/dev/null); (( _f > 0 && _f < $_CBOX_LOW_MEMORY_MB )) && print -r -- \"⚠  Only \$_f MB of memory free in this container; a Claude session needs about 400 MB. Close a session, or give the project more: memory = 8g in .cbox, then cbox reset\"; unset _f"
 }
 
 # The dockerfile in CBOX_BUILD_DIR, if that one starts with `FROM claudebox`:
@@ -6207,10 +6272,12 @@ _cbox_create() {
   _cbox_ensure_image || return 1
 
   # Before anything is created: a broken .cbox stops here with its reason.
-  local _ports=""
+  local _ports="" _memory
   if [[ "$mode" == "normal" ]]; then
     _ports=$(_cbox_project_ports) || return 1
   fi
+  # Warnings about the .cbox came with the ports (normal mode); its errors once.
+  _memory=$(_cbox_project_memory 2>/dev/null) || { _cbox_project_settings >/dev/null; return 1; }
 
   _cbox_step "Creating $mode container '$name' ($agent_bin)..."
 
@@ -6227,7 +6294,8 @@ _cbox_create() {
     -w "/Workspace/$name"
 
     -e ZDOTDIR=/home/claude
-    --memory="$CBOX_MEMORY"
+    --memory="$_memory"
+    --label "cbox.memory=$_memory"
   )
 
   if [[ "$agent_bin" == "claude" ]]; then
@@ -6787,6 +6855,9 @@ _cbox_enter() {
   while IFS= read -r _g; do _exec_args+=(-e "$_g"); done < <(_cbox_git_identity)
   _cbox_mask_check "$name" "$mode"
   _cbox_ports_check "$name" "$mode"
+  _cbox_memory_check "$name"
+  # Several agents can share a container: say so before one more would not fit.
+  _run="$(_cbox_low_memory_note); $_run"
   local _egress=""
   if [[ "$mode" == "safe" ]]; then
     # The container's only way out: the tunnel's proxy, which lets through
@@ -6810,6 +6881,7 @@ _cbox_enter() {
     # agent starts (the shared folder links there).
     _cbox_sessions_link
     _run="mkdir -p -m 700 $_CBOX_SESSIONS_LOCAL; $_run"
+    # Compat, remove after 2026-12-31: containers made with a sessions mount.
     if [[ "$(_cbox_rt_label "$name" cbox.sessions)" != "local" ]]; then
       echo "ℹ  This container was created by an older cbox: its sessions cannot find each other"
       echo "   (Claude Code's agent list, messages between sessions). Recreate it when convenient: cbox reset"

@@ -5902,7 +5902,7 @@ _cbox_warden_cmd() {
 # playwright browser cache
 # ---------------------------------------------------------
 
-# Chromium is baked into the image's /opt/ms-playwright when BUILD_PLAYWRIGHT=1,
+# Chromium may be baked into the image's /opt/ms-playwright (an image addition),
 # but a bind-mount over that path would hide it and force a fresh ~115 MB
 # download on first use. So when the host directory is still empty, copy the
 # image's browsers into it once.
@@ -5922,15 +5922,9 @@ _cbox_seed_playwright() {
   # Already seeded, or already filled from inside a container.
   [[ -n "$(ls -A "$CBOX_PLAYWRIGHT_DIR" 2>/dev/null)" ]] && return 0
 
-  # Whether the image actually has browsers cannot be known without looking
-  # inside it, and BUILD_PLAYWRIGHT does not answer the question: it describes
-  # what the *next* build will do, and it is commonly passed inline to
-  # `cbox rebuild` rather than kept in cbox.env — so it reads as unset here even
-  # when the image is fully baked. Gating on it would skip the copy and let an
-  # empty mount shadow browsers that are really there, which is the exact
-  # failure this function exists to prevent. So always look: copying nothing
-  # costs one short container run, and the empty check above means a machine
-  # that does have browsers pays it only once.
+  # Whether the image has browsers cannot be known without looking inside it,
+  # so always look: copying nothing costs one short container run, and the
+  # empty check above means a machine that has browsers pays it only once.
   #
   # `cp -a` of the directory *contents*, tolerating an image where
   # /opt/ms-playwright exists but is empty.
@@ -6419,7 +6413,7 @@ _cbox_additions_dockerfile() {
 # builds the result once, with the user's folder as the build context: upstream
 # changes to claudebox's dockerfile reach the image with every rebuild.
 _cbox_build_image() {
-  local args=(--build-arg HOST_UID="$(id -u)" --build-arg BUILD_PLAYWRIGHT="${BUILD_PLAYWRIGHT:-0}")
+  local args=(--build-arg HOST_UID="$(id -u)")
   local additions combined rc
   if additions=$(_cbox_additions_dockerfile); then
     combined=$(mktemp "${TMPDIR:-/tmp}/cbox-dockerfile.XXXXXX") || return 1

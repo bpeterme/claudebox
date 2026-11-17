@@ -65,6 +65,30 @@ This is what makes lead switching possible later: an agent becomes lead-capable 
 | 4 | Workers in `/team` (claudebox + cmux-safe-mcp) | about 3 h | Lead starts Codex/pi workers; non-Claude reviewer |
 | 5 | Lead switching | own plan | — |
 
+## Spike findings (phase 0, in a normal container)
+
+Versions: Codex 0.169.1, pi 0.73.1, both from npm.
+
+| | Codex | pi |
+|---|---|---|
+| Install size | about 400 MB (native binary) | about 20 MB |
+| API it calls | Responses API only (`<base>/responses`) | Chat Completions (`<base>/chat/completions`) |
+| Custom base URL | yes: `-c model_providers.<id>={base_url=…, env_key=…}` | yes: `models.json` overrides the built-in `openrouter` provider's `baseUrl` |
+| Key from env | `env_key` names the variable | reads `OPENROUTER_API_KEY` |
+| Warden's placeholder key | sent as `Bearer warden` | sent as `Bearer warden` |
+| Config folder | `CODEX_HOME` (default `~/.codex`) | `PI_CODING_AGENT_DIR` (default `~/.pi/agent`) |
+| Own sandbox | works in the container (read-only, no network by default), so it can stay on | none |
+| Subscription sign-in | `codex login --device-auth` | — |
+| Background network | — | update check and install ping; `PI_OFFLINE=1` turns them off |
+
+Consequences:
+
+- Warden's existing OpenRouter resource (`OPENROUTER_BASE_URL` + placeholder key) fits both agents as it is; no warden change.
+- Codex on OpenRouter depends on OpenRouter's Responses API. Still to check against the real service.
+- Codex's size argues for installing on first use, not in the image.
+
+Still to check on the Mac: a real OpenRouter call through warden for both, `codex login --device-auth`, and both agents in safe mode.
+
 ## Open decisions
 
 1. **pi's "done" signal:** watch the pane (leaning) or a small `cbox-mail` command. Decide in phase 4.

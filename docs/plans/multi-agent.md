@@ -87,10 +87,16 @@ Consequences:
 - Codex on OpenRouter depends on OpenRouter's Responses API. Still to check against the real service.
 - Codex's size argues for installing on first use, not in the image.
 
-Still to check on the Mac: a real OpenRouter call through warden for both, `codex login --device-auth`, and both agents in safe mode.
+Checked on the Mac through warden's OpenRouter resource:
+
+- pi: works. The npm package moved to `@earendil-works/pi-coding-agent`; `@mariozechner/…` is deprecated.
+- Codex: warden refused `POST /responses`, because the resource's `allow` list (as in warden's template) only has `POST /chat/completions, GET /models`. Codex needs `POST /responses` in that list; warden's template should list it too.
+- Codex after adding `POST /responses` to `allow`: works. It warns that it has no model metadata for OpenRouter model IDs and falls back to defaults; phase 2 should give it metadata for the models in use.
+
+Still to check: both agents in safe mode. A Codex subscription waits until there is one.
 
 ## Open decisions
 
 1. **pi's "done" signal:** watch the pane (leaning) or a small `cbox-mail` command. Decide in phase 4.
-2. **Install at image build or on first use:** every agent in the image makes it bigger for everyone. Decide after the spike.
+2. **Decided:** every agent except Claude Code is installed on first use, not in the image (opencode moves out of the image too).
 3. **Codex full support (MCP relay, warden mail)?** Decide after the spike.

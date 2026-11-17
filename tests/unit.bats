@@ -1413,6 +1413,7 @@ _share_setup() {
 # ---------------------------------------------------------------------------
 
 @test "_cbox_session_hangup: ends the whole session in the container, even what ignores HUP" {
+  [[ "$(/usr/bin/uname)" != "Darwin" ]] || skip "runs in the Linux container (setsid, ps -s)"
   printf '#!/bin/sh\nshift 2\nexec "$@"\n' > "$BATS_TMPDIR/rt"; chmod +x "$BATS_TMPDIR/rt"
   _CBOX_CMD="$BATS_TMPDIR/rt"
   local f; f=$(_cbox_session_pidfile "bats-$$")
@@ -3219,7 +3220,8 @@ _enter_safe() {
   _fake_runtime() {
     echo "$*" >> "$capture"
     # HUP=1: the terminal closes under the session (e.g. its cmux pane is closed).
-    if [[ -n "${HUP:-}" && "$1 $2" == "exec -it" ]]; then kill -HUP "$BASHPID"; fi
+    # (No $BASHPID in macOS's bash 3.2: a child signals its parent, this shell.)
+    if [[ -n "${HUP:-}" && "$1 $2" == "exec -it" ]]; then sh -c 'kill -HUP $PPID'; fi
   }
   _cbox_mode() { echo "$MODE"; }
   _cbox_rt_label() { case "$2" in cbox.egress) echo "$EGRESS" ;; cbox.safe-login) echo "$LOGIN" ;;

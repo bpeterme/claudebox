@@ -2957,6 +2957,61 @@ print(sorted(set(g.values())), g.get(hub), lab in g)" "$CBOX_WARDEN_DIR" "$(_fak
   [ "$(grep -c "^${CBOX_LABEL%%=*}=" "$capture")" -eq 1 ]
 }
 
+@test "_cbox_create: normal containers link the session registry instead of mounting it, and say so in a label" {
+  local capture="$BATS_TMPDIR/create-sessions-args"
+  cd "$BATS_TMPDIR"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  rm -f "$capture"; rm -rf "$CBOX_CLAUDE_DIR/sessions"
+  _cbox_create "cbox-unit-sessions" normal
+  run cat "$capture"
+  [[ "$output" == *$'\n--label\ncbox.sessions=local\n'* ]]
+  [[ "$output" != *"/home/claude/.claude/sessions"* ]]
+  [ "$(readlink "$CBOX_CLAUDE_DIR/sessions")" = "$_CBOX_SESSIONS_LOCAL" ]
+  rm -f "$capture"
+  _cbox_create "cbox-unit-sessions" safe
+  run cat "$capture"
+  [[ "$output" != *"cbox.sessions"* ]]
+}
+
+@test "_cbox_sessions_link: makes the link, or replaces an empty folder or a wrong link" {
+  local l="$CBOX_CLAUDE_DIR/sessions"
+  rm -rf "$l"
+  _cbox_sessions_link
+  [ "$(readlink "$l")" = "$_CBOX_SESSIONS_LOCAL" ]
+  rm -f "$l"; mkdir "$l"
+  _cbox_sessions_link
+  [ "$(readlink "$l")" = "$_CBOX_SESSIONS_LOCAL" ]
+  rm -f "$l"; ln -s /somewhere/else "$l"
+  _cbox_sessions_link
+  [ "$(readlink "$l")" = "$_CBOX_SESSIONS_LOCAL" ]
+  run _cbox_sessions_link
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "_cbox_sessions_link: moves a folder with old records aside, never deletes it" {
+  local l="$CBOX_CLAUDE_DIR/sessions"
+  rm -rf "$l" "$l".old-*
+  mkdir "$l"; echo '{}' > "$l/123.json"
+  CBOX_VERBOSE=1 run _cbox_sessions_link
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Old session records moved to"*"safe to delete"* ]]
+  [ "$(readlink "$l")" = "$_CBOX_SESSIONS_LOCAL" ]
+  [ "$(cat "$l".old-*/123.json)" = "{}" ]
+  rm -rf "$l".old-*
+}
+
+@test "_cbox_sessions_link: leaves a file in the way alone and says what to do" {
+  local l="$CBOX_CLAUDE_DIR/sessions"
+  rm -rf "$l"; echo keep > "$l"
+  run _cbox_sessions_link
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"is not a folder"*"Move it away"* ]]
+  [ "$(cat "$l")" = "keep" ]
+  rm -f "$l"
+}
+
 @test "_cbox_old_init: recognises containers created with tail as PID 1" {
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { echo '[{"configuration": {"initProcess": {"executable": "tail", "arguments": ["-f", "/dev/null"]}}}]'; }
@@ -3058,7 +3113,8 @@ _enter_safe() {
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { echo "$*" >> "$capture"; }
   _cbox_mode() { echo "$MODE"; }
-  _cbox_rt_label() { case "$2" in cbox.egress) echo "$EGRESS" ;; cbox.safe-login) echo "$LOGIN" ;; esac; }
+  _cbox_rt_label() { case "$2" in cbox.egress) echo "$EGRESS" ;; cbox.safe-login) echo "$LOGIN" ;;
+                                  cbox.sessions) echo "${SESSIONS-local}" ;; esac; }
   _cbox_safe_claude_dir() { echo "safe-claude $*" >> "$capture"; }
   _cbox_tunnel_start() { echo "tunnel $*" >> "$capture"; }
   _cbox_tunnel_stop() { :; }
@@ -3162,6 +3218,32 @@ _update() {
   run cat "$BATS_TMPDIR/enter-egress"
   [[ "$output" != *"HTTPS_PROXY"* ]]
   [[ "$output" != *"tunnel ebox on"* ]]
+}
+
+@test "_cbox_enter: normal sessions make the local session registry folder before the agent starts" {
+  MODE=normal EGRESS="" LOGIN=""
+  run _enter_safe
+  [[ "$output" != *"created by an older cbox"* ]]
+  run cat "$BATS_TMPDIR/enter-egress"
+  [[ "$output" == *"zsh -ic mkdir -p -m 700 $_CBOX_SESSIONS_LOCAL; "* ]]
+  [ "$(readlink "$CBOX_CLAUDE_DIR/sessions")" = "$_CBOX_SESSIONS_LOCAL" ]
+}
+
+@test "_cbox_enter: a normal container made with a sessions mount gets a reset hint" {
+  MODE=normal EGRESS="" LOGIN="" SESSIONS=""
+  run _enter_safe
+  [[ "$output" == *"created by an older cbox: its sessions cannot find each other"* ]]
+  [[ "$output" == *"cbox reset"* ]]
+}
+
+@test "_cbox_enter: safe sessions keep their own registry folder (no link, no hint)" {
+  MODE=safe EGRESS=allowlist LOGIN=shared SESSIONS=""
+  rm -rf "$CBOX_CLAUDE_DIR/sessions"
+  run _enter_safe
+  [[ "$output" != *"sessions cannot find each other"* ]]
+  run cat "$BATS_TMPDIR/enter-egress"
+  [[ "$output" != *"$_CBOX_SESSIONS_LOCAL"* ]]
+  [ ! -e "$CBOX_CLAUDE_DIR/sessions" ]
 }
 
 _egress_py() {  # runs python with the warden functions loaded
@@ -3344,23 +3426,6 @@ _safe_setup() {
   touch "$SD/sessions/20.json"
   _cbox_safe_claude_dir sbox
   [ -f "$SD/sessions/20.json" ]
-}
-
-@test "_cbox_create: normal mode gives each container its own session registry" {
-  local capture="$BATS_TMPDIR/create-sessions"
-  cd "$BATS_TMPDIR"
-  _CBOX_CMD=_fake_runtime
-  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
-  rm -rf "$CBOX_CLAUDE_DIR/sessions" "$CBOX_DATA_DIR/sessions"
-  rm -f "$capture"; _cbox_create "sesbox" "normal"
-  grep -qx "$CBOX_DATA_DIR/sessions/sesbox:/home/claude/.claude/sessions" "$capture"
-  [ -d "$CBOX_DATA_DIR/sessions/sesbox" ]
-  [ -d "$CBOX_CLAUDE_DIR/sessions" ]
-  # Mounted after the Claude folder it sits in.
-  run grep -nx "$CBOX_CLAUDE_DIR:/home/claude/.claude" "$capture"
-  local claude_line=${output%%:*}
-  run grep -nx "$CBOX_DATA_DIR/sessions/sesbox:/home/claude/.claude/sessions" "$capture"
-  (( claude_line < ${output%%:*} ))
 }
 
 @test "_cbox_create: safe mode mounts the shared Claude folder read-only and its own ~/.claude" {

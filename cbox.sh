@@ -173,6 +173,9 @@ _CBOX_OPENCODE_CONFIG="/home/claude/.cache/cbox/opencode.json"
 # Claude Code settings cbox writes in the container for sessions in a mail
 # group (claude --settings): the hooks of cbox-mail-watch.
 _CBOX_MAIL_HOOKS="/home/claude/.cache/cbox/mail-hooks.json"
+# Claude Code's registry of running sessions, on each container's own disk;
+# the shared folder's sessions entry links here (see _cbox_sessions_link).
+_CBOX_SESSIONS_LOCAL="/home/claude/.local/state/claude-sessions"
 # warden: host-side credential broker (see "warden" below). Its directory holds
 # resource definitions, approvals and session tokens — host only, never mounted.
 CBOX_WARDEN_DIR="${CBOX_WARDEN_DIR:-$CBOX_DATA_DIR/warden}"
@@ -5781,6 +5784,38 @@ _cbox_seed_claude_dir() {
   return 0
 }
 
+# Normal mode's session registry. Claude Code keeps one <pid>.json per running
+# session in ~/.claude/sessions; ListAgents, SendMessage and `claude agents`
+# find sessions there. Each container needs its own: every container counts
+# pids from 1 and has the image's /etc/machine-id, so in one shared folder
+# sessions of different containers overwrite each other's records. A mount
+# per container does not work on Apple's runtime: Claude Code chmods the
+# folder first, the root of a mount refuses that (EPERM), and the session is
+# never registered. So the shared folder's entry is a link to a folder on each
+# container's own disk; nothing on the host uses it. A non-empty folder found
+# there (from an older cbox) is moved aside, never deleted.
+_cbox_sessions_link() {
+  local link="$CBOX_CLAUDE_DIR/sessions" old
+  [[ -L "$link" && "$(readlink "$link")" == "$_CBOX_SESSIONS_LOCAL" ]] && return 0
+  if [[ -L "$link" ]]; then
+    rm -f "$link"
+  elif [[ -d "$link" ]]; then
+    if ! rmdir "$link" 2>/dev/null; then
+      old="$link.old-$(date +%Y%m%d-%H%M%S)"
+      if ! mv "$link" "$old"; then
+        echo "⚠  Could not replace $(_cbox_shown "$link") — sessions in this container cannot find each other (Claude Code's agent list and messages)"
+        return 0
+      fi
+      _cbox_log "ℹ  Old session records moved to $(_cbox_shown "$old") (safe to delete)"
+    fi
+  elif [[ -e "$link" ]]; then
+    echo "⚠  $(_cbox_shown "$link") is not a folder — sessions in this container cannot find each other. Move it away, then start cbox again."
+    return 0
+  fi
+  mkdir -p "$CBOX_CLAUDE_DIR"
+  ln -s "$_CBOX_SESSIONS_LOCAL" "$link"
+}
+
 # Safe mode's ~/.claude: a folder per container whose entries are symlinks
 # into the shared Claude folder, which the container sees read-only at
 # $_CBOX_SAFE_SHARED. The one exception is the login, .credentials.json: it is
@@ -6262,17 +6297,12 @@ _cbox_create() {
       unset _f _fname _key
     fi
     mkdir -p "$CBOX_SHARE_DIR"
-    # sessions: Claude Code's registry of running sessions, one <pid>.json
-    # each. It assumes one pid space per folder, but every container counts
-    # pids from 1 and has the image's /etc/machine-id: in a shared folder,
-    # sessions of different containers overwrite and delete each other's
-    # records. So each container has its own. (The mount point is made here,
-    # or the runtime would make it, root-owned on Linux.)
-    mkdir -p "$CBOX_DATA_DIR/sessions/$name" "$CBOX_CLAUDE_DIR/sessions"
-    chmod 700 "$CBOX_DATA_DIR/sessions/$name" "$CBOX_CLAUDE_DIR/sessions"
+    # Each container's own session registry, through a link (see
+    # _cbox_sessions_link); the label tells containers made with a mount there.
+    _cbox_sessions_link
     args+=(
+      --label "cbox.sessions=local"
       -v "$CBOX_CLAUDE_DIR:/home/claude/.claude"
-      -v "$CBOX_DATA_DIR/sessions/$name:/home/claude/.claude/sessions"
       -v "$CBOX_SHARE_DIR:/home/claude/share"
       -v "$CBOX_PLAYWRIGHT_DIR:/opt/ms-playwright"
     )
@@ -6776,6 +6806,14 @@ _cbox_enter() {
       echo "   Recreate it: cbox reset"
     fi
   else
+    # The session registry's folder on the container's own disk, before the
+    # agent starts (the shared folder links there).
+    _cbox_sessions_link
+    _run="mkdir -p -m 700 $_CBOX_SESSIONS_LOCAL; $_run"
+    if [[ "$(_cbox_rt_label "$name" cbox.sessions)" != "local" ]]; then
+      echo "ℹ  This container was created by an older cbox: its sessions cannot find each other"
+      echo "   (Claude Code's agent list, messages between sessions). Recreate it when convenient: cbox reset"
+    fi
     local _w_env
     while IFS= read -r _w_env; do
       case "$_w_env" in

@@ -245,7 +245,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_SSH_DIR` | *(unset)* | SSH dir to mount as `~/.ssh` in container (normal mode, **read-only**); unset = no SSH mount. With a warden ssh resource, only `config`, `known_hosts` and `*.pub` are mounted |
 | `CBOX_ZSHRC` | *(unset)* | `.zshrc` to source as `~/.zshrc.global` inside the container (**read-only**); unset = none. The container also sources `~/.zshrc.local`, but that file lives in the container only: `cbox reset` (a new container) removes it, so use it for temporary tweaks |
 | `CBOX_BUILD_DIR` | cbox.sh directory | Folder with the dockerfile for `cbox rebuild`; a dockerfile starting `FROM claudebox` adds to claudebox's (see [Your own additions](#your-own-additions-to-the-image)) |
-| `BUILD_PLAYWRIGHT` | `0` | Set to `1` to bake Playwright + Chromium into the image on the next `cbox rebuild` (or pass it inline). Decides whether the browser download happens at build time or on first use |
+| `CBOX_VERBOSE` | `0` | `1` shows all output: updates, sync messages, MCP relay status (per session: `cbox -v`) |
 | `CBOX_AUDIO` | *(unset)* | Set to `1` to enable Claude Code voice mode (requires PulseAudio on host) |
 | `CBOX_MCP_CONFIG` | `~/.config/claudebox/mcp.json` | MCP servers that run on the host and are relayed into the container (see [Host MCP Servers](#host-mcp-servers)) |
 | `CBOX_WARDEN_DIR` | `$CBOX_DATA_DIR/warden` | warden resources, approvals and session tokens — host only, never mounted |
@@ -273,10 +273,10 @@ The image is based on Ubuntu 26.04 and includes:
 - ripgrep, fd-find, jq, eza
 - zsh with autosuggestions and syntax highlighting
 - SoX + PulseAudio client (for voice mode)
-- Playwright + Chromium (opt-in via `BUILD_PLAYWRIGHT=1`), installed into
-  `/opt/ms-playwright`. That path is bind-mounted from `CBOX_PLAYWRIGHT_DIR` on the
-  host, so browsers are downloaded once per machine rather than once per container —
-  and survive `cbox reset`, `cbox prune` and image rebuilds
+- A place for Playwright's browsers, `/opt/ms-playwright`, bind-mounted from
+  `CBOX_PLAYWRIGHT_DIR` on the host: Chromium is downloaded once per machine rather
+  than once per container, and survives `cbox reset`, `cbox prune` and image rebuilds.
+  To have it in the image already, add it yourself (below)
 
 The container user is `claude` (UID matches your host UID to avoid permission issues on mounted volumes).
 
@@ -293,6 +293,16 @@ USER claude
 ```
 
 Point `CBOX_BUILD_DIR` in `cbox.env` at its folder and run `cbox rebuild`. cbox appends your file (without its `FROM` line) to claudebox's own dockerfile and builds both as one image, with your folder as the build context. Updates to claudebox's image reach yours at the next rebuild, with no copy to keep in step. claudebox's dockerfile ends as `USER claude` in `/Workspace`, so switch to `root` only where needed and back at the end. A dockerfile in `CBOX_BUILD_DIR` that starts from anything else is built as it is.
+
+**Playwright + Chromium in the image** (about 1.3 GB). Without it, the first
+project that needs a browser downloads it into the shared cache:
+
+```dockerfile
+# Playwright + Chromium, into /opt/ms-playwright (cbox's browser cache)
+RUN uv run --no-project --with playwright python -m playwright install --with-deps chromium
+```
+
+When cbox creates a container and the cache is still empty, it copies these browsers into it once.
 
 ## Host MCP Servers
 

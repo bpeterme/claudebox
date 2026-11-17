@@ -1971,33 +1971,16 @@ _clean_stubs() {
   [ -z "$output" ]
 }
 
-# BUILD_PLAYWRIGHT describes what the next build will do, not what the current
-# image holds, and is usually passed inline to `cbox rebuild` rather than stored
-# in cbox.env. Gating the seed on it let an empty mount shadow a fully baked
-# image, so seeding must not consult it at all.
-@test "_cbox_seed_playwright: seeds even when BUILD_PLAYWRIGHT is unset" {
+# Whether the image holds browsers is only known by looking: an empty mount
+# must never shadow a baked image.
+@test "_cbox_seed_playwright: always looks in the image when the cache is empty" {
   CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-unset-flag"
   rm -rf "$CBOX_PLAYWRIGHT_DIR"
   local capture="$BATS_TMPDIR/pw-unset-flag-args"
   rm -f "$capture"
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
-  unset BUILD_PLAYWRIGHT
   _cbox_seed_playwright
-
-  run cat "$capture"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"/opt/ms-playwright/."* ]]
-}
-
-@test "_cbox_seed_playwright: seeds even when BUILD_PLAYWRIGHT=0" {
-  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-flag-zero"
-  rm -rf "$CBOX_PLAYWRIGHT_DIR"
-  local capture="$BATS_TMPDIR/pw-flag-zero-args"
-  rm -f "$capture"
-  _CBOX_CMD=_fake_runtime
-  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
-  BUILD_PLAYWRIGHT=0 _cbox_seed_playwright
 
   run cat "$capture"
   [ "$status" -eq 0 ]
@@ -4842,7 +4825,7 @@ _image_docker() {
   run _cbox_ensure_image
   [ "$status" -eq 0 ]
   [[ "$output" == *"not found — building it once"* ]]
-  grep -q "^build --build-arg HOST_UID=$(id -u) .* -t claudebox " "$IMG_LOG"
+  grep -q "^build --build-arg HOST_UID=$(id -u) .*-t claudebox " "$IMG_LOG"
 }
 
 @test "image: an existing image is not rebuilt" {
@@ -4887,7 +4870,7 @@ SH
   run _cbox_build_image
   [ "$status" -eq 0 ]
   [ "$(grep -c '^build' "$BUILD_LOG")" = "1" ]
-  grep -q "^build --build-arg HOST_UID=$(id -u) .* -f .* -t claudebox_me $MINE\$" "$BUILD_LOG"
+  grep -q "^build --build-arg HOST_UID=$(id -u) -f .* -t claudebox_me $MINE\$" "$BUILD_LOG"
   # claudebox's dockerfile comes first, unchanged; the additions follow without their FROM.
   [ "$(grep -m1 '^FROM' "$BUILD_FILE")" = "$(grep -m1 '^FROM' "$_CBOX_OWN_BUILD_DIR/dockerfile")" ]
   grep -qF "$(tail -1 "$_CBOX_OWN_BUILD_DIR/dockerfile")" "$BUILD_FILE"

@@ -568,7 +568,7 @@ _warden_lib() {
   echo "$BATS_TMPDIR/warden_lib.py"
 }
 
-# Approve the project's current .warden as if the user typed "y".
+# Approve the project's current .cbox request as if the user typed "y".
 _warden_approve_yes() {
   python3 -c "
 import sys, io
@@ -687,9 +687,9 @@ INI
   [ "$(grep -c "REDACTED" "$CBOX_WARDEN_DIR/broker.log")" = 0 ]
 }
 
-@test "warden: project resource needs an approved .warden" {
+@test "warden: project resource needs an approved .cbox request" {
   _warden_setup
-  printf '[proj]\n' > .warden
+  printf '[warden "proj"]\n' > .cbox
   _warden_env >/dev/null
   before=$(cat "$CBOX_WARDEN_DIR/sessions/wbox.json")
   hint=$(cat "$WT/stderr")
@@ -702,21 +702,44 @@ INI
   [[ "$output" == *'"authorization": "Bearer sk-test-REDACTED-cbox.warden.proj"'* ]]
 }
 
-@test "warden: editing .warden after approval needs a new approval" {
+@test "warden: editing the .cbox request after approval needs a new approval" {
   _warden_setup
-  printf '[proj]\n' > .warden
+  printf '[warden "proj"]\n' > .cbox
   _warden_approve_yes
-  printf '[proj]\n[hdr]\n' > .warden
+  printf '[warden "proj"]\n[warden "hdr"]\n' > .cbox
   _warden_env >/dev/null
   run cat "$CBOX_WARDEN_DIR/sessions/wbox.json"
   _warden_teardown
   [[ "$output" != *'"proj"'* ]]
 }
 
+@test "warden: [container] changes, comments and layout keep the approval" {
+  _warden_setup
+  printf '[container]\n\tports = 3000\n[warden "proj"]\n' > .cbox
+  _warden_approve_yes
+  printf '# settings\n[container]\n\tports = 4000   ; dev\n\tmemory = 8g\n\n[warden "proj"]   # the API\n' > .cbox
+  _warden_env >/dev/null
+  run cat "$CBOX_WARDEN_DIR/sessions/wbox.json"
+  _warden_teardown
+  [[ "$output" == *'"proj"'* ]]
+}
+
+@test "warden: only [warden \"…\"] sections are a request; [container] is not a resource" {
+  run python3 -c "exec(open('$(_warden_lib)').read())
+import os
+os.makedirs('$BATS_TMPDIR/req', exist_ok=True)
+open('$BATS_TMPDIR/req/.cbox', 'w').write('[container]\n\tports = 3000\n')
+print(project_request('$BATS_TMPDIR/req'))
+open('$BATS_TMPDIR/req/.cbox', 'w').write('[container]\nports = 3000\n[warden \"store\"]\n\tprefix = p1\n[warden \"team\"]\n')
+print(project_request('$BATS_TMPDIR/req')[0])"
+  [ "${lines[0]}" = "({}, None)" ]
+  [ "${lines[1]}" = "{'store': {'prefix': 'p1'}, 'team': {}}" ]
+}
+
 @test "warden: unknown and invalid resources are reported, not fatal" {
   _warden_setup
   printf '[bad name]\nupstream = ftp://x\n' >> "$CBOX_WARDEN_DIR/resources"
-  printf '[ghost]\n' > .warden
+  printf '[warden "ghost"]\n' > .cbox
   _warden_approve_yes
   _warden_env >/dev/null
   run cat "$WT/stderr"
@@ -925,11 +948,11 @@ _warden_relocate() {
 
 @test "cbox warden: lists resources and what this project gets" {
   _warden_setup
-  printf '[proj]\n' > .warden
+  printf '[warden "proj"]\n' > .cbox
   run _cbox_warden_cmd list
   _warden_teardown
   [[ "$output" == *"✔ llm"*"every container"* ]]
-  [[ "$output" == *"· proj"*"listed in .warden, not approved"* ]]
+  [[ "$output" == *"· proj"*"listed in .cbox, not approved"* ]]
   [[ "$output" == *"cbox warden approve"* ]]
 }
 
@@ -984,7 +1007,7 @@ SH
   [[ "$output" == *"Usage: cbox warden"* ]]
 }
 
-# S3-style resource with the dvc policy (bucket bkt); the project's .warden sets the prefix.
+# S3-style resource with the dvc policy (bucket bkt); the project's .cbox sets the prefix.
 _warden_add_store() {
   cat >> "$CBOX_WARDEN_DIR/resources" <<INI
 [store]
@@ -1014,7 +1037,7 @@ print(h['authorization'].split('Signature=')[1])"
 @test "warden sigv4: container gets an AWS profile with dummy keys pointing at the broker" {
   _warden_setup
   _warden_add_store "profile = flux-dvc-bkt"
-  printf '[store]\nprefix = proj1\n' > .warden
+  printf '[warden "store"]\nprefix = proj1\n' > .cbox
   _warden_approve_yes
   env=$(_warden_env)
   _warden_teardown
@@ -1031,7 +1054,7 @@ print(h['authorization'].split('Signature=')[1])"
 @test "warden sigv4: re-signs with the real keys and drops the client's signature" {
   _warden_setup
   _warden_add_store
-  printf '[store]\nprefix = proj1\n' > .warden
+  printf '[warden "store"]\nprefix = proj1\n' > .cbox
   _warden_approve_yes
   url=$(_warden_url)
   out=$(curl -s -H 'Authorization: AWS4-HMAC-SHA256 Credential=warden/x' -H 'X-Amz-Security-Token: t' \
@@ -1046,7 +1069,7 @@ print(h['authorization'].split('Signature=')[1])"
 @test "warden sigv4: the dvc policy allows only the project's DVC tree, never deletes" {
   _warden_setup
   _warden_add_store
-  printf '[store]\nprefix = proj1\n' > .warden
+  printf '[warden "store"]\nprefix = proj1\n' > .cbox
   _warden_approve_yes
   url=$(_warden_url)/store
   code() { curl -s -o /dev/null -w '%{http_code}' -X "$1" "$url/$2"; }
@@ -1060,13 +1083,13 @@ print(h['authorization'].split('Signature=')[1])"
   [ "$got" = "200 200 200 200 | 403 403 403 403 403 403 403" ]
 }
 
-@test "warden sigv4: no grant without a prefix, or when .warden sets anything else" {
+@test "warden sigv4: no grant without a prefix, or when .cbox sets anything else" {
   _warden_setup
   _warden_add_store
   # Global availability alone does not do: the dvc policy needs a project prefix.
   sed -i.bak 's/^availability = project$/availability = global/' "$CBOX_WARDEN_DIR/resources"
   no_prefix=$(_warden_env)
-  printf '[store]\nprefix = proj1\nupstream = http://127.0.0.1:1\n' > .warden
+  printf '[warden "store"]\nprefix = proj1\nupstream = http://127.0.0.1:1\n' > .cbox
   _warden_approve_yes
   extra_key=$(_warden_env)
   extra_err=$(cat "$WT/stderr")
@@ -1076,14 +1099,14 @@ print(h['authorization'].split('Signature=')[1])"
   [[ "$extra_err" == *"only prefix is allowed"* ]]
 }
 
-@test "warden sigv4: a .warden prefix must stay inside the resource's own prefix" {
+@test "warden sigv4: a .cbox prefix must stay inside the resource's own prefix" {
   _warden_setup
   _warden_add_store "prefix = team"
-  printf '[store]\nprefix = other\n' > .warden
+  printf '[warden "store"]\nprefix = other\n' > .cbox
   _warden_approve_yes
   outside=$(_warden_env)
   outside_err=$(cat "$WT/stderr")
-  printf '[store]\nprefix = team/proj1\n' > .warden
+  printf '[warden "store"]\nprefix = team/proj1\n' > .cbox
   _warden_approve_yes
   inside=$(_warden_env)
   _warden_teardown
@@ -3827,7 +3850,7 @@ _wa_text() {
   [[ "$output" == *"1  Robots Lab  (group"*"2  Robots Two"*"3  Private Family"*"4  Evil [31mRed Group"*"5  Fake Community  (community"* ]]
   [[ "$output" != *$'\e'* ]]
   [[ "$output" != *"Alice"* ]]
-  [[ "$output" == *"'fake' shares 1 chat(s), read-only: Robots Lab"*".warden"*"[fake]"* ]]
+  [[ "$output" == *"'fake' shares 1 chat(s), read-only: Robots Lab"*'[warden "fake"]'*".cbox"* ]]
   grep -q '^type *= whatsapp' "$CBOX_WARDEN_DIR/resources"
   grep -q '^availability = project' "$CBOX_WARDEN_DIR/resources"
   [ "$(stat -c %a "$CBOX_WARDEN_DIR/whatsapp/fake.json" 2>/dev/null || stat -f %Lp "$CBOX_WARDEN_DIR/whatsapp/fake.json")" = "600" ]
@@ -3874,7 +3897,7 @@ _wa_text() {
   echo '{"chats": {"100@g.us": "Robots Lab"}, "seen": ["c1@g.us", "100@g.us", "200@g.us", "300@g.us", "600@g.us"]}' > "$CBOX_WARDEN_DIR/whatsapp/fake.json"
   _warden_env >/dev/null
   [ ! -e "$CBOX_WARDEN_DIR/sessions/wbox.mcp" ]
-  printf '[fake]\n' > .warden
+  printf '[warden "fake"]\n' > .cbox
   _warden_approve_yes
   run _warden_env
   mcp=$(sed -n 's/^WARDEN_MCP=//p' <<<"$output" | base64 -d)
@@ -4433,7 +4456,7 @@ for ev in ("SessionStart", "Stop", "UserPromptSubmit"):
   printf '[team]\ntype = mail\navailability = project\n' >> "$CBOX_WARDEN_DIR/resources"
   _warden_env >/dev/null
   [ ! -e "$CBOX_WARDEN_DIR/sessions/wbox.mcp" ]
-  printf '[team]\n' > .warden
+  printf '[warden "team"]\n' > .cbox
   _warden_approve_yes
   run _warden_env
   mcp=$(sed -n 's/^WARDEN_MCP=//p' <<<"$output" | base64 -d)
@@ -4985,7 +5008,7 @@ SH
 
 @test "_cbox_project_ports: reads spaces, commas and comments, sorted without duplicates" {
   mkdir -p "$BATS_TMPDIR/ports-ok" && cd "$BATS_TMPDIR/ports-ok"
-  printf '# servers the Mac opens\n\n  ports = 47821, 3000 3000  # dev\n' > .cbox
+  printf '# servers the Mac opens\n[container]\n\n  ports = 47821, 3000 3000  # dev\n' > .cbox
   run _cbox_project_ports
   [ "$status" -eq 0 ]
   [ "$output" = "3000 47821" ]
@@ -4993,7 +5016,7 @@ SH
 
 @test "_cbox_project_ports: a last line without newline counts" {
   mkdir -p "$BATS_TMPDIR/ports-nonl" && cd "$BATS_TMPDIR/ports-nonl"
-  printf 'ports = 8080' > .cbox
+  printf '[container]\nports = 8080' > .cbox
   run _cbox_project_ports
   [ "$output" = "8080" ]
 }
@@ -5001,7 +5024,7 @@ SH
 @test "_cbox_project_ports: refuses privileged, out-of-range and non-numeric ports" {
   mkdir -p "$BATS_TMPDIR/ports-bad" && cd "$BATS_TMPDIR/ports-bad"
   for bad in 80 65536 0 abc 3000x 99999999999; do
-    printf 'ports = 3000 %s\n' "$bad" > .cbox
+    printf '[container]\nports = 3000 %s\n' "$bad" > .cbox
     run _cbox_project_ports
     [ "$status" -eq 1 ]
     [[ "$output" == *"'$bad' is not a port cbox publishes"* ]]
@@ -5015,30 +5038,92 @@ SH
   [ "$status" -eq 1 ]
   [[ "$output" == *"is not a 'name = value' line"* ]]
 
-  printf 'colour = blue\nports = 3000\n' > .cbox
+  printf '[container]\ncolour = blue\nports = 3000\n' > .cbox
   run _cbox_project_ports
   [ "$status" -eq 0 ]
-  [[ "$output" == *"unknown setting 'colour' ignored (known: ports, memory)"* ]]
+  [[ "$output" == *"unknown setting 'colour' in [container] ignored (known: ports, memory)"* ]]
   [[ "$output" == *"3000"* ]]
+}
+
+@test "_cbox_project_settings: reads [container] only; warden sections are skipped, others warned" {
+  mkdir -p "$BATS_TMPDIR/sec-ok" && cd "$BATS_TMPDIR/sec-ok"
+  printf '; project\n[Container]\n\tports = 3000 ; web\n[warden "store"]\n\tprefix = p1\n\tports = 9999\n[later]\n\tports = 1234\n' > .cbox
+  run _cbox_project_ports
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"unknown section [later] ignored (known: [container], [warden \"<resource>\"])"* ]]
+  [ "${lines[${#lines[@]}-1]}" = "3000" ]
+}
+
+@test "_cbox_project_settings: a setting outside a section says to add [container]" {
+  mkdir -p "$BATS_TMPDIR/sec-loose" && cd "$BATS_TMPDIR/sec-loose"
+  printf 'ports = 3000\n' > .cbox
+  run _cbox_project_ports
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"'ports' must be in a section — add the line [container] above it"* ]]
+}
+
+# Compat, remove after 2026-12-31 (with cmd_upgrade_project).
+_upgrade() {  # $1: the answer typed, "" for none; runs in $PWD
+  printf '%s\n' "$1" | python3 -c "
+import sys
+sys.stdin.isatty = lambda: True
+exec(open(sys.argv[1]).read())
+cmd_upgrade_project(sys.argv[2], sys.argv[3], '1')
+" "$(_warden_lib)" "$CBOX_WARDEN_DIR" "$PWD"
+}
+
+@test "upgrade-project: moves .warden and loose .cbox lines into the sectioned .cbox, keeping the approval" {
+  mkdir -p "$BATS_TMPDIR/upg" && cd "$BATS_TMPDIR/upg"
+  rm -f .warden .cbox; mkdir -p "$CBOX_WARDEN_DIR"
+  printf '# web\nports = 3000\n' > .cbox
+  printf '[store]\nprefix = p1\n[team]\n' > .warden
+  python3 -c "import hashlib, json; print(json.dumps({'$PWD': hashlib.sha256(open('.warden', 'rb').read()).hexdigest()}))" \
+    > "$CBOX_WARDEN_DIR/approvals.json"
+  run _upgrade ""
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Update .cbox now (and remove .warden)? [Y/n]"* ]]
+  [[ "$output" == *"✔ .cbox updated and .warden removed"* ]]
+  [ ! -e .warden ]
+  run cat .cbox
+  [ "$output" = $'# web\n[container]\nports = 3000\n\n[warden "store"]\n\tprefix = p1\n\n[warden "team"]' ]
+  [ "$(_cbox_project_ports)" = "3000" ]
+  run python3 -c "exec(open('$(_warden_lib)').read())
+import json
+print(json.load(open('$CBOX_WARDEN_DIR/approvals.json'))['$PWD'] == project_request('$PWD')[1])"
+  [ "$output" = "True" ]
+}
+
+@test "upgrade-project: a no leaves both files; new-layout projects are not asked" {
+  mkdir -p "$BATS_TMPDIR/upg-no" && cd "$BATS_TMPDIR/upg-no"
+  rm -f .warden .cbox
+  printf '[team]\n' > .warden
+  run _upgrade "n"
+  [[ "$output" == *"Not changed"* ]]
+  [ -f .warden ]
+  [ ! -e .cbox ]
+  rm -f .warden
+  printf '[container]\nports = 3000\n' > .cbox
+  run _upgrade ""
+  [ -z "$output" ]
 }
 
 @test "_cbox_project_memory: the .cbox's memory in lowercase, else CBOX_MEMORY" {
   mkdir -p "$BATS_TMPDIR/mem-ok" && cd "$BATS_TMPDIR/mem-ok"
   rm -f .cbox
   [ "$(CBOX_MEMORY=4g _cbox_project_memory)" = "4g" ]
-  printf 'ports = 3000\n' > .cbox
+  printf '[container]\nports = 3000\n' > .cbox
   [ "$(CBOX_MEMORY=4g _cbox_project_memory)" = "4g" ]
-  printf 'memory = 8G  # several agents\nports = 3000\n' > .cbox
+  printf '[container]\nmemory = 8G  # several agents\nports = 3000\n' > .cbox
   [ "$(CBOX_MEMORY=4g _cbox_project_memory)" = "8g" ]
   [ "$(_cbox_project_ports)" = "3000" ]
-  printf 'memory = 1536m' > .cbox
+  printf '[container]\nmemory = 1536m' > .cbox
   [ "$(_cbox_project_memory)" = "1536m" ]
 }
 
 @test "_cbox_project_memory: refuses sizes a container cannot get" {
   mkdir -p "$BATS_TMPDIR/mem-bad" && cd "$BATS_TMPDIR/mem-bad"
   for bad in 0g 65g 512m 8gb 8 abc -4g; do
-    printf 'memory = %s\n' "$bad" > .cbox
+    printf '[container]\nmemory = %s\n' "$bad" > .cbox
     run _cbox_project_memory
     [ "$status" -eq 1 ]
     [[ "$output" == *"memory = '$bad' is not a size"*"e.g. 8g"* ]]
@@ -5050,7 +5135,7 @@ SH
   mkdir -p "$BATS_TMPDIR/mem-create" && cd "$BATS_TMPDIR/mem-create"
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
-  printf 'memory = 8g\n' > .cbox
+  printf '[container]\nmemory = 8g\n' > .cbox
   local mode
   for mode in normal safe; do
     rm -f "$capture"; _cbox_create "cbox-unit-cboxmem" "$mode"
@@ -5058,7 +5143,7 @@ SH
     [[ "$output" == *$'\n--memory=8g\n'* ]]
     [[ "$output" == *$'\n--label\ncbox.memory=8g\n'* ]]
   done
-  printf 'memory = 100g\n' > .cbox
+  printf '[container]\nmemory = 100g\n' > .cbox
   rm -f "$capture"
   run _cbox_create "cbox-unit-cboxmem" safe
   [ "$status" -eq 1 ]
@@ -5076,7 +5161,7 @@ SH
   [ -z "$output" ]
   HAVE=4g; CBOX_MEMORY=8g run _cbox_memory_check proj
   [[ "$output" == *"has 4g of memory, but CBOX_MEMORY asks for 8g"*"cbox reset"* ]]
-  printf 'memory = 16g\n' > .cbox
+  printf '[container]\nmemory = 16g\n' > .cbox
   CBOX_MEMORY=4g run _cbox_memory_check proj
   [[ "$output" == *"has 4g of memory, but .cbox asks for 16g"* ]]
 }
@@ -5093,7 +5178,7 @@ SH
 @test "_cbox_create: publishes .cbox ports on 127.0.0.1 with a label, normal mode only" {
   local capture="$BATS_TMPDIR/create-ports-args"
   mkdir -p "$BATS_TMPDIR/ports-create" && cd "$BATS_TMPDIR/ports-create"
-  printf 'ports = 47821 3000\n' > .cbox
+  printf '[container]\nports = 47821 3000\n' > .cbox
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
 
@@ -5123,7 +5208,7 @@ SH
 @test "_cbox_create: a broken .cbox creates nothing" {
   local capture="$BATS_TMPDIR/create-badports-args"
   mkdir -p "$BATS_TMPDIR/ports-create-bad" && cd "$BATS_TMPDIR/ports-create-bad"
-  printf 'ports = 80\n' > .cbox
+  printf '[container]\nports = 80\n' > .cbox
   rm -f "$capture"
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
@@ -5138,7 +5223,7 @@ SH
 
 @test "_cbox_ports_check: shows published ports; quiet when .cbox matches" {
   mkdir -p "$BATS_TMPDIR/ports-check" && cd "$BATS_TMPDIR/ports-check"
-  printf 'ports = 47821\n' > .cbox
+  printf '[container]\nports = 47821\n' > .cbox
   _cbox_rt_label() { [[ "$2" == cbox.ports ]] && echo "47821"; }
   run _cbox_ports_check proj normal
   [ "$status" -eq 0 ]
@@ -5147,7 +5232,7 @@ SH
 
 @test "_cbox_ports_check: a changed .cbox suggests cbox reset" {
   mkdir -p "$BATS_TMPDIR/ports-changed" && cd "$BATS_TMPDIR/ports-changed"
-  printf 'ports = 3000 47821\n' > .cbox
+  printf '[container]\nports = 3000 47821\n' > .cbox
   _cbox_rt_label() { [[ "$2" == cbox.ports ]] && echo "47821"; }
   run _cbox_ports_check proj normal
   [[ "$output" == *".cbox lists ports 3000 47821, but this container publishes 47821."* ]]
@@ -5174,7 +5259,7 @@ SH
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 
-  printf 'ports = 3000\n' > .cbox
+  printf '[container]\nports = 3000\n' > .cbox
   run _cbox_ports_check proj safe
   [ "$status" -eq 0 ]
   [[ "$output" == *"not published for safe containers"* ]]
@@ -5182,7 +5267,7 @@ SH
 
 @test "_cbox_ports_check: a broken .cbox says so and does not fail the session" {
   mkdir -p "$BATS_TMPDIR/ports-broken" && cd "$BATS_TMPDIR/ports-broken"
-  printf 'ports = 22\n' > .cbox
+  printf '[container]\nports = 22\n' > .cbox
   _cbox_rt_label() { echo ""; }
   run _cbox_ports_check proj normal
   [ "$status" -eq 0 ]

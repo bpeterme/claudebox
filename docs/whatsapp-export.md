@@ -4,7 +4,7 @@
 files, for the project's own code. It runs inside a claudebox container during
 a `cbox` session and reaches the host through the same relay as Claude's
 WhatsApp tools — with the same limits: only the chats of the resource the
-project lists in its `.warden`, read-only, no phone numbers or WhatsApp IDs.
+project asks for in its `.cbox`, read-only, no phone numbers or WhatsApp IDs.
 Setup: [WhatsApp chats](../README.md#whatsapp-chats).
 
 ```sh

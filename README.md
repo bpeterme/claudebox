@@ -117,7 +117,7 @@ cbox oc safe   # opencode in safe mode
 | `cbox warden` | List credential resources (APIs, storage, ssh keys, MCP servers, WhatsApp chats, mail groups) and what this project gets (see [Credentials (warden)](#credentials-warden)) |
 | `cbox warden edit` | Define resources the container may use |
 | `cbox warden secret set <resource>` | Store a resource's secret in the macOS Keychain (Linux: keyring) |
-| `cbox warden approve` | Approve this project's `.warden` file |
+| `cbox warden approve` | Approve what this project's `.cbox` asks warden for |
 | `cbox warden test <resource>` | Check a resource from the host |
 | `cbox warden whatsapp pick <resource>` | Choose the WhatsApp chats Claude may read (read-only) |
 | `cbox warden mail [show <thread>\|-f]` | Read what agents sent each other; `resume <thread>` lets a paused thread go on (see [Agent mail](#agent-mail)) |
@@ -186,14 +186,25 @@ Limits:
 - `*.key` also matches Keynote files. If a project has Keynote files, set `CBOX_MASK` with `!*.key` and name its real key files instead.
 - Apple's runtime needs container 1.2.1 or newer (`--masked-path`). With an older one cbox does not create the container, rather than create it without hiding.
 
-### Project settings: ports and memory (`.cbox`)
+### Project settings (`.cbox`)
 
-A web server in the container can be opened on your host at `http://localhost:<port>`, at the same address every session. List its ports in a `.cbox` file in the project folder:
+A project's claudebox settings live in one file, `.cbox`, in the project folder (tracked in git). It has two kinds of sections, so you can tell them apart at a glance:
 
 ```ini
-# .cbox (in the project folder, e.g. tracked in git)
-ports = 47821 3000
+# .cbox
+[container]                  # applied when the container is created (cbox reset)
+	ports  = 47821 3000
+	memory = 8g
+
+[warden "storage"]           # a resource this project asks warden for
+	prefix = my-project      # (you approve it once; again after a change here)
+
+[warden "team"]
 ```
+
+The format is git's config format, so tools can write it too, e.g. `git config -f .cbox container.memory 8g`. Comments start with `#` or `;`. The container can edit `.cbox`, but nothing in it takes effect without you: container settings apply at `cbox reset`, warden resources after your approval (see [Credentials](#credentials-warden)).
+
+**Ports** (`[container] ports`): a web server in the container can be opened on your host at `http://localhost:<port>`, at the same address every session.
 
 - **localhost only:** each port is published on the host's `127.0.0.1`, never to your network. `localhost` also counts as a secure origin, so browser features that need HTTPS (e.g. `crypto.subtle`) work over plain http.
 - **Listen on `0.0.0.0`:** the server inside must listen on all addresses (`0.0.0.0`), not only on the container's `127.0.0.1`.
@@ -201,13 +212,10 @@ ports = 47821 3000
 - **Normal mode only:** safe containers publish no ports.
 - Ports 1024–65535; a port another program on the host already uses cannot be published.
 
-`.cbox` can also give the project's container more memory than `CBOX_MEMORY`, e.g. for several agents in one container (each Claude session needs about 400 MB):
+**Memory** (`[container] memory`): more memory than `CBOX_MEMORY` for this project's container (both modes), e.g. for several agents in one container; each Claude session needs about 400 MB. 1g to 64g, or `m` for megabytes. Like ports, it is set when the container is created: after a change, cbox says so at the next start; apply it with `cbox reset`. A session start also warns when the container has less than 600 MB free.
 
-```ini
-memory = 8g        # 1g to 64g (or m for megabytes); both modes
-```
-
-Like ports, memory is set when the container is created: after a change, cbox says so at the next start; apply it with `cbox reset`. A session start also warns when the container has less than 600 MB free.
+<!-- Compat, remove after 2026-12-31 (with cmd_upgrade_project) -->
+**Older layouts:** projects with a `.warden` file, or a `.cbox` without `[container]`, are offered a one-time update at the next `cbox` start. It moves everything into the new `.cbox` and keeps an existing warden approval; commit the result.
 
 ### Git safety (both modes)
 
@@ -242,7 +250,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_MCP_CONFIG` | `~/.config/claudebox/mcp.json` | MCP servers that run on the host and are relayed into the container (see [Host MCP Servers](#host-mcp-servers)) |
 | `CBOX_WARDEN_DIR` | `$CBOX_DATA_DIR/warden` | warden resources, approvals and session tokens — host only, never mounted |
 | `CBOX_WARDEN_PORT` | `47100` | Port of the warden broker, bound only to the container-facing host address |
-| `CBOX_MEMORY` | `4g` | Memory of each container (both modes); a project's `.cbox` can set its own (`memory = 8g`). Applies to newly created containers: `cbox reset` |
+| `CBOX_MEMORY` | `4g` | Memory of each container (both modes); a project's `.cbox` can set its own (`[container] memory = 8g`). Applies to newly created containers: `cbox reset` |
 | `CBOX_EGRESS_ALLOW` | *(unset)* | Hosts a safe container may reach besides the defaults, e.g. `"openrouter.ai *.example.com host:8443"` (see [Outbound traffic in safe mode](#outbound-traffic-in-safe-mode)). Applies from the next session |
 | `CBOX_MASK` | *(safe mode: secret files)* | Files and folders in the project the container sees empty (see [Hidden secret files](#hidden-secret-files)). Unset: the default list in safe mode, nothing in normal mode; once set, it applies to both modes; `""` = nothing. Applies to newly created containers: `cbox reset` |
 | `CBOX_PROTECT_GIT` | `1` | Mount the project's `.git/config` and `.git/hooks` read-only (see [Git safety](#git-safety-both-modes)); `0` = writable. Applies to newly created containers: `cbox reset` |
@@ -395,21 +403,23 @@ Each `[section]` names a resource: lowercase letters, digits, `.`, `_` and `-`,
 up to 64 characters, starting with a letter or digit (e.g. `[github]`, `[build.server]`).
 
 A resource is either available to every container (`availability = global`)
-or only to projects that list it in a tracked `.warden` file **and** whose
-`.warden` you approved on the host (`project`). Editing `.warden` — also from
-inside the container — needs a new approval at the next session start.
+or only to projects that ask for it in their tracked `.cbox`
+(`[warden "<resource>"]`) **and** whose request you approved on the host
+(`project`). Changing a `[warden "…"]` section — also from inside the
+container — needs a new approval at the next session start; changes to
+`[container]` do not.
 
 **S3-compatible storage** (AWS S3, Cloudflare R2, MinIO, …) uses `auth = sigv4`:
 the container gets an AWS profile with dummy keys (`AWS_CONFIG_FILE`), and the
 broker re-signs every request with the real ones. `policy = dvc` limits a
 resource to DVC's data layout in one bucket and prefix, with no deletes. The
-prefix comes from the project's `.warden`, so one resource serves every
+prefix comes from the project's `.cbox`, so one resource serves every
 project in a bucket:
 
 ```ini
-# .warden (tracked in the project)
-[storage]
-prefix = my-project
+# .cbox (tracked in the project)
+[warden "storage"]
+	prefix = my-project
 ```
 
 **SSH keys** (`type = ssh`) stay on the host. The container gets an ssh agent
@@ -520,8 +530,9 @@ chat. Needs macOS with WhatsApp Desktop signed in.
 2. `cbox warden test work-chats` — checks the database is readable. The first
    time, macOS may ask whether your terminal may access data from other apps:
    allow it.
-3. In each project that should see the chats, add a `.warden` file with the
-   line `[work-chats]`. The next `cbox` start there asks you to approve it.
+3. In each project that should see the chats, add the line
+   `[warden "work-chats"]` to its `.cbox`. The next `cbox` start there asks
+   you to approve it.
 
 In that container, Claude gets an MCP server named after the resource, with
 four tools: `list_chats` (names, member and message counts), `list_members`,
@@ -585,10 +596,10 @@ on the host, which stamps the sender: an agent cannot pose as another project.
    availability = project
    ```
 
-2. In each project that should join, add the line `[team]` to its `.warden`.
-   The next `cbox` start there asks you to approve it.
+2. In each project that should join, add the line `[warden "team"]` to its
+   `.cbox`. The next `cbox` start there asks you to approve it.
 
-A project is in the group once it had a session with the approved `.warden`.
+A project is in the group once it had a session with its approved request.
 In its container, Claude gets an MCP server named after the group, with four
 tools: `mail_peers` (who is in the group, who has a session open),
 `mail_send` (start a thread with `to` and `subject`, or reply with `thread`),

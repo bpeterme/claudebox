@@ -349,6 +349,10 @@ If Claude reports that a host server failed to connect (for example after its 30
 connect timeout), start with `cbox mcp`: it shows the latest problem under each server.
 The full log is on the host; `cbox mcp` prints its path.
 
+"✘ not found" means the server's command does not exist on this Mac, e.g. the app
+was moved or is installed elsewhere than on your other Mac. A `~` in the path is
+expanded on each Mac, so `~/Applications/…` works across Macs with different user names.
+
 "no response from the server … after a client connected" means the server started
 but never answered. The relay is fine in that case; the server is stuck. Check
 whether it answers outside cbox (iMCP shown; use your server's command):

@@ -3,12 +3,16 @@
 CBOX_SH="$(cd "$BATS_TEST_DIRNAME/.." && pwd)/cbox.sh"
 
 setup() {
-  # The run's own temp dir: agents running the suite at the same time in one
-  # container would otherwise share HOME, CBOX_DATA_DIR, relay pid files and
-  # mail groups, kill each other's servers and leave bats waiting forever.
-  # On macOS the temp dir (/var/folders/…) is itself behind a symlink
-  # (/var → /private/var); cbox resolves paths, so compare against the real one.
-  BATS_TMPDIR=$(cd "${BATS_RUN_TMPDIR:-$BATS_TMPDIR}" && pwd -P)
+  # In Linux, the run's own temp dir: agents running the suite at the same time
+  # in one container would otherwise share HOME, CBOX_DATA_DIR, relay pid files
+  # and mail groups, kill each other's servers and leave bats waiting forever.
+  # Not on macOS: its temp dir is already long (/var/folders/…), and the run dir
+  # pushes socket paths past the 104-character limit; agents run in containers.
+  # On macOS the temp dir is itself behind a symlink (/var → /private/var);
+  # cbox resolves paths, so compare against the real one.
+  local tmp="$BATS_TMPDIR"
+  [[ "$(/usr/bin/uname)" == "Darwin" ]] || tmp="${BATS_RUN_TMPDIR:-$BATS_TMPDIR}"
+  BATS_TMPDIR=$(cd "$tmp" && pwd -P)
   # macOS has no `timeout`; the relay tests use it to bound a hanging client.
   if ! command -v timeout >/dev/null 2>&1; then
     mkdir -p "$BATS_TMPDIR/bin"

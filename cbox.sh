@@ -176,7 +176,7 @@ _CBOX_SAFE_SHARED="/home/claude/.cbox-claude"
 # read-only (see _cbox_safe_memory_links).
 _CBOX_SAFE_LOCAL=(projects file-history shell-snapshots session-env paste-cache
   todos plans debug statsig backups jobs cache state daemon
-  history.jsonl stats-cache.json)
+  history.jsonl stats-cache.json .last-cleanup)
 # Extra opencode config cbox writes in the container (OPENCODE_CONFIG): host MCP
 # servers and warden routes, merged over the user's own opencode.json.
 _CBOX_OPENCODE_CONFIG="/home/claude/.cache/cbox/opencode.json"

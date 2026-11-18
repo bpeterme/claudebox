@@ -3532,7 +3532,7 @@ _safe_setup() {
 @test "_cbox_safe_claude_dir: Claude Code's records are the container's own, memory stays shared" {
   _safe_setup
   mkdir -p "$CBOX_CLAUDE_DIR/projects/-Workspace-other/memory" "$CBOX_CLAUDE_DIR/file-history"
-  touch "$CBOX_CLAUDE_DIR/history.jsonl"
+  touch "$CBOX_CLAUDE_DIR/history.jsonl" "$CBOX_CLAUDE_DIR/.last-cleanup"
   # A safe folder made by an older cbox: records linked to the shared folder.
   mkdir -p "$SD"
   ln -s /home/claude/.cbox-claude/projects "$SD/projects"
@@ -3541,6 +3541,8 @@ _safe_setup() {
   [ ! -L "$SD/projects" ] && [ -d "$SD/projects" ]
   [ ! -e "$SD/file-history" ] && [ ! -L "$SD/file-history" ]
   [ ! -L "$SD/history.jsonl" ]
+  # Its own cleanup date, so old transcripts expire here too.
+  [ ! -L "$SD/.last-cleanup" ]
   # Memory: the container's project (even before it has any) and others with memory.
   [ "$(readlink "$SD/projects/-Workspace-sbox/memory")" = "/home/claude/.cbox-claude/projects/-Workspace-sbox/memory" ]
   [ "$(readlink "$SD/projects/-Workspace-other/memory")" = "/home/claude/.cbox-claude/projects/-Workspace-other/memory" ]

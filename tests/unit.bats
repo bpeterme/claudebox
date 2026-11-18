@@ -1476,6 +1476,41 @@ _share_setup() {
   [ "$status" -eq 2 ]
 }
 
+@test "_cbox_reset_ask: a stopped container or one without sessions is reset without asking" {
+  _cbox_running() { return 1; }
+  run _cbox_reset_ask "myproject" </dev/null
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  _cbox_running() { return 0; }
+  _cbox_container_has_sessions() { return 1; }
+  run _cbox_reset_ask "myproject" </dev/null
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "_cbox_reset_ask: an open session elsewhere keeps the container without a terminal to confirm" {
+  _cbox_running() { return 0; }
+  _cbox_container_has_sessions() { return 0; }
+  run _cbox_reset_ask "myproject" </dev/null
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"'myproject' is still in use in another terminal"*"run cbox reset in a terminal"* ]]
+}
+
+@test "cbox reset: does not remove a container that is open in another terminal" {
+  _cbox_system_start() { :; }
+  _cbox_exists() { return 0; }
+  _cbox_running() { return 0; }
+  _cbox_container_has_sessions() { return 0; }
+  _cbox_mcp_relay_stop() { echo "relay stopped" >> "$BATS_TMPDIR/reset-calls"; }
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { [[ "$1" != rm ]] || echo "$*" >> "$BATS_TMPDIR/reset-calls"; }
+  rm -f "$BATS_TMPDIR/reset-calls"
+  run cbox reset myproject </dev/null
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"still in use in another terminal"* ]]
+  [ ! -e "$BATS_TMPDIR/reset-calls" ]
+}
+
 @test "_cbox_container_has_sessions: returns 2 when the probe prints nothing" {
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { true; }
@@ -3492,6 +3527,40 @@ _safe_setup() {
   # Claude Code refreshes in place: the other side sees it.
   echo 'refreshed' > "$SD/.credentials.json"
   [ "$(cat "$CBOX_CLAUDE_DIR/.credentials.json")" = "refreshed" ]
+}
+
+@test "_cbox_safe_claude_dir: Claude Code's records are the container's own, memory stays shared" {
+  _safe_setup
+  mkdir -p "$CBOX_CLAUDE_DIR/projects/-Workspace-other/memory" "$CBOX_CLAUDE_DIR/file-history"
+  touch "$CBOX_CLAUDE_DIR/history.jsonl" "$CBOX_CLAUDE_DIR/.last-cleanup"
+  # A safe folder made by an older cbox: records linked to the shared folder.
+  mkdir -p "$SD"
+  ln -s /home/claude/.cbox-claude/projects "$SD/projects"
+  ln -s /home/claude/.cbox-claude/history.jsonl "$SD/history.jsonl"
+  _cbox_safe_claude_dir sbox
+  [ ! -L "$SD/projects" ] && [ -d "$SD/projects" ]
+  [ ! -e "$SD/file-history" ] && [ ! -L "$SD/file-history" ]
+  [ ! -L "$SD/history.jsonl" ]
+  # Its own cleanup date, so old transcripts expire here too.
+  [ ! -L "$SD/.last-cleanup" ]
+  # Memory: the container's project (even before it has any) and others with memory.
+  [ "$(readlink "$SD/projects/-Workspace-sbox/memory")" = "/home/claude/.cbox-claude/projects/-Workspace-sbox/memory" ]
+  [ "$(readlink "$SD/projects/-Workspace-other/memory")" = "/home/claude/.cbox-claude/projects/-Workspace-other/memory" ]
+  # Transcripts written since are kept; planted memory goes back to the link.
+  echo '{}' > "$SD/projects/-Workspace-sbox/session.jsonl"
+  rm "$SD/projects/-Workspace-sbox/memory"; mkdir "$SD/projects/-Workspace-sbox/memory"
+  _cbox_safe_claude_dir sbox
+  [ -f "$SD/projects/-Workspace-sbox/session.jsonl" ]
+  [ "$(readlink "$SD/projects/-Workspace-sbox/memory")" = "/home/claude/.cbox-claude/projects/-Workspace-sbox/memory" ]
+  # Config still links to the read-only shared folder.
+  [ "$(readlink "$SD/settings.json")" = "/home/claude/.cbox-claude/settings.json" ]
+}
+
+@test "_cbox_safe_memory_links: a project name with dots or spaces gets Claude Code's key" {
+  _safe_setup
+  mkdir -p "$SD"
+  _cbox_safe_memory_links "my.app v2" "$CBOX_CLAUDE_DIR" "$SD"
+  [ -L "$SD/projects/-Workspace-my-app-v2/memory" ]
 }
 
 @test "_cbox_safe_claude_dir: follows the shared folder at every run" {

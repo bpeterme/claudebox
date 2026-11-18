@@ -101,7 +101,7 @@ cbox oc safe   # opencode in safe mode
 | Command | Description |
 |---------|-------------|
 | `cbox stop` | Stop the current project's container |
-| `cbox reset [<name>]` | Remove the current project's container (or a named container) |
+| `cbox reset [<name>]` | Remove the current project's container (or a named container); asks first while it is open in another terminal |
 | `cbox rebuild` | Rebuild the container image; also remove the old images earlier rebuilds left behind (Docker: only cbox's; Apple's runtime: every image without a name) |
 | `cbox list` | List all cbox containers |
 | `cbox prune` | Remove all stopped cbox containers; on macOS also reclaim unused disk space in running ones, and old images no container uses any more, as `cbox rebuild` does |
@@ -134,7 +134,7 @@ cbox oc safe   # opencode in safe mode
 - All Linux capabilities dropped (`--cap-drop=ALL`)
 - No privilege escalation: `sudo` cannot switch to root without capabilities (Docker also sets `--security-opt no-new-privileges`)
 - 4 GB memory limit, 2 CPU cores, 512 max processes
-- Agent config read-only, except the login: safe and normal containers share one login, and a refresh in either keeps it valid for both. Each safe container has its own `~/.claude` (in `$CBOX_DATA_DIR/safe-claude/<name>`) whose entries link to the shared folder; its `.credentials.json` is the shared file itself (a hard link). A safe container can therefore change the shared login, but not your settings, hooks or skills
+- Agent config read-only, except the login: safe and normal containers share one login, and a refresh in either keeps it valid for both. Each safe container has its own `~/.claude` (in `$CBOX_DATA_DIR/safe-claude/<name>`) whose entries link to the shared folder; its `.credentials.json` is the shared file itself (a hard link). A safe container can therefore change the shared login, but not your settings, hooks or skills. Claude Code's own records (transcripts for `/resume`, file history, prompt history) stay in the safe container's folder; memory is shared but read-only, so a safe session cannot leave notes for normal ones
 - Claude Code's telemetry and error reports are off (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`)
 - Internet access only to allowed hosts (see below)
 - Secret files in the project read as empty (see below)

@@ -100,3 +100,4 @@ Still to check: both agents in safe mode. A Codex subscription waits until there
 1. **pi's "done" signal:** watch the pane (leaning) or a small `cbox-mail` command. Decide in phase 4.
 2. **Decided:** every agent except Claude Code is installed on first use, not in the image (opencode moves out of the image too).
 3. **Codex full support (MCP relay, warden mail)?** Decide after the spike.
+4. **Warden in safe mode:** safe containers start no warden, so Codex and pi (model through warden) and mail-based workers run in normal mode only. Reaching warden through the tunnel, like the egress proxy, would change that but widens what safe mode can reach. Decide when phase 4 starts.

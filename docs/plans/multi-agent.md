@@ -49,7 +49,38 @@ This is what makes lead switching possible later: an agent becomes lead-capable 
 - **API key (OpenRouter):** a warden http resource, as today. The key never enters the container.
 - **Codex subscription:** `codex login --device-auth` (the browser callback on localhost:1455 cannot reach the container). The login is kept in the agent's login folder, as Claude's is today. Warden routing does not apply to subscription traffic.
 
-### 4. Workers in `/team`
+### 4. Commands
+
+One pattern for every agent: `cbox [<agent>] [safe|shell|…]`.
+
+| You type | What runs |
+|---|---|
+| `cbox` | the project's default agent |
+| `cbox codex` | Codex, normal mode |
+| `cbox codex safe` | Codex, safe mode |
+| `cbox pi shell` | a shell in the container pi uses |
+| `cbox oc` | opencode (`oc` is an alias its module declares) |
+
+- Agent names come from the `agents/*/` folders, as do tab completions; no agent has its own branch in cbox's command handling (today `oc` is hard-coded).
+- Default agent, first match wins: `[container] agent =` in the project's `.cbox`, then `CBOX_AGENT` in `cbox.env`, then `claude`.
+- An agent folder named like a cbox command (`safe`, `reset`, …) is refused when it loads.
+- No picker at start: the choice rarely changes within a project.
+
+### 5. The container is the sandbox
+
+Agents run without their own sandbox, as Claude Code does today (its sandbox is off): Codex gets `--sandbox danger-full-access`. When an agent asks before acting (Claude's permissions, Codex's `--ask-for-approval`) stays the user's choice.
+
+### 6. Safe mode
+
+Agents with a subscription login work in safe mode the way Claude does: login in the container, their hosts on the egress allowlist, no MCP relay and no warden. For Codex (once there is a subscription):
+
+- its sign-in and API hosts on the default allowlist (exact list from a test with a real login);
+- `~/.codex/auth.json` shared between safe and normal containers, like Claude's `.credentials.json` (hard link), so a refresh in either keeps both valid;
+- its WebSocket connection through the egress proxy (untested; Codex falls back to HTTPS).
+
+Agents that reach their model through warden (OpenRouter) are normal mode only (open decision 4).
+
+### 7. Workers in `/team`
 
 - The `worker` command takes an agent name; the lead picks one per task, e.g. a Codex reviewer for Claude's work.
 - "Done" signal: warden mail for agents with `mail`; the lead watches the pane for others (pi).
@@ -77,7 +108,7 @@ Versions: Codex 0.169.1, pi 0.73.1, both from npm.
 | Key from env | `env_key` names the variable | reads `OPENROUTER_API_KEY` |
 | Warden's placeholder key | sent as `Bearer warden` | sent as `Bearer warden` |
 | Config folder | `CODEX_HOME` (default `~/.codex`) | `PI_CODING_AGENT_DIR` (default `~/.pi/agent`) |
-| Own sandbox | works in the container (read-only, no network by default), so it can stay on | none |
+| Own sandbox | works in a normal container (read-only, no network by default); turned off anyway, see below | none |
 | Subscription sign-in | `codex login --device-auth` | — |
 | Background network | — | update check and install ping; `PI_OFFLINE=1` turns them off |
 

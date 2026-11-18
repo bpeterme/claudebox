@@ -3529,6 +3529,38 @@ _safe_setup() {
   [ "$(cat "$CBOX_CLAUDE_DIR/.credentials.json")" = "refreshed" ]
 }
 
+@test "_cbox_safe_claude_dir: Claude Code's records are the container's own, memory stays shared" {
+  _safe_setup
+  mkdir -p "$CBOX_CLAUDE_DIR/projects/-Workspace-other/memory" "$CBOX_CLAUDE_DIR/file-history"
+  touch "$CBOX_CLAUDE_DIR/history.jsonl"
+  # A safe folder made by an older cbox: records linked to the shared folder.
+  mkdir -p "$SD"
+  ln -s /home/claude/.cbox-claude/projects "$SD/projects"
+  ln -s /home/claude/.cbox-claude/history.jsonl "$SD/history.jsonl"
+  _cbox_safe_claude_dir sbox
+  [ ! -L "$SD/projects" ] && [ -d "$SD/projects" ]
+  [ ! -e "$SD/file-history" ] && [ ! -L "$SD/file-history" ]
+  [ ! -L "$SD/history.jsonl" ]
+  # Memory: the container's project (even before it has any) and others with memory.
+  [ "$(readlink "$SD/projects/-Workspace-sbox/memory")" = "/home/claude/.cbox-claude/projects/-Workspace-sbox/memory" ]
+  [ "$(readlink "$SD/projects/-Workspace-other/memory")" = "/home/claude/.cbox-claude/projects/-Workspace-other/memory" ]
+  # Transcripts written since are kept; planted memory goes back to the link.
+  echo '{}' > "$SD/projects/-Workspace-sbox/session.jsonl"
+  rm "$SD/projects/-Workspace-sbox/memory"; mkdir "$SD/projects/-Workspace-sbox/memory"
+  _cbox_safe_claude_dir sbox
+  [ -f "$SD/projects/-Workspace-sbox/session.jsonl" ]
+  [ "$(readlink "$SD/projects/-Workspace-sbox/memory")" = "/home/claude/.cbox-claude/projects/-Workspace-sbox/memory" ]
+  # Config still links to the read-only shared folder.
+  [ "$(readlink "$SD/settings.json")" = "/home/claude/.cbox-claude/settings.json" ]
+}
+
+@test "_cbox_safe_memory_links: a project name with dots or spaces gets Claude Code's key" {
+  _safe_setup
+  mkdir -p "$SD"
+  _cbox_safe_memory_links "my.app v2" "$CBOX_CLAUDE_DIR" "$SD"
+  [ -L "$SD/projects/-Workspace-my-app-v2/memory" ]
+}
+
 @test "_cbox_safe_claude_dir: follows the shared folder at every run" {
   _safe_setup
   _cbox_safe_claude_dir sbox

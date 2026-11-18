@@ -170,6 +170,13 @@ _CBOX_EGRESS_PORT=3128
 # Where a safe container sees the shared CBOX_CLAUDE_DIR (read-only); its own
 # ~/.claude links into it (see _cbox_safe_claude_dir).
 _CBOX_SAFE_SHARED="/home/claude/.cbox-claude"
+# Claude Code's records in ~/.claude, which a safe container keeps for itself
+# (writable) instead of linking them to the read-only shared folder. They
+# never change how a normal session behaves. Memory stays shared and
+# read-only (see _cbox_safe_memory_links).
+_CBOX_SAFE_LOCAL=(projects file-history shell-snapshots session-env paste-cache
+  todos plans debug statsig backups jobs cache state daemon
+  history.jsonl stats-cache.json)
 # Extra opencode config cbox writes in the container (OPENCODE_CONFIG): host MCP
 # servers and warden routes, merged over the user's own opencode.json.
 _CBOX_OPENCODE_CONFIG="/home/claude/.cache/cbox/opencode.json"
@@ -6039,12 +6046,36 @@ _cbox_sessions_link() {
 # when it refreshes the login, so a refresh in any container reaches all of
 # them; a symlink would not do, Claude Code refuses to open one there.
 # Runs at create and at every session start, so it follows the shared folder.
+# A safe container's projects/<key>/memory links to the shared one, which it
+# can read but not change: a session that was talked into something cannot
+# leave notes for normal sessions. <key> is how Claude Code names a project
+# folder (every character but letters and digits becomes "-"): the container's
+# own project always, and every other project with memory.
+_cbox_safe_memory_links() {
+  local name="$1" src="$2" dir="$3" key want m
+  local keys=("$(printf '%s' "/Workspace/$name" | tr -c 'A-Za-z0-9' '-')")
+  for m in "$src"/projects/*/memory; do
+    [[ -d "$m" ]] || continue
+    m="${m%/memory}"
+    keys+=("${m##*/}")
+  done
+  for key in "${keys[@]}"; do
+    mkdir -p "$dir/projects/$key"
+    want="$_CBOX_SAFE_SHARED/projects/$key/memory"
+    [[ "$(readlink "$dir/projects/$key/memory" 2>/dev/null)" == "$want" ]] && continue
+    rm -rf "${dir:?}/projects/$key/memory"
+    ln -s "$want" "$dir/projects/$key/memory"
+  done
+}
+
 _cbox_safe_claude_dir() {
   local name="$1" src="$CBOX_CLAUDE_DIR" dir="$CBOX_DATA_DIR/safe-claude/$1" e base want
   mkdir -p "$dir"
   # Names of the shared folder link there; a local entry of the same name goes.
+  # Claude Code's own records (_CBOX_SAFE_LOCAL) stay the container's.
   while IFS= read -r e; do
     base="${e##*/}"
+    [[ " ${_CBOX_SAFE_LOCAL[*]} " == *" $base "* ]] && continue
     want="$_CBOX_SAFE_SHARED/$base"
     [[ -L "$dir/$base" && "$(readlink "$dir/$base")" == "$want" ]] && continue
     rm -rf "${dir:?}/$base"
@@ -6059,6 +6090,13 @@ _cbox_safe_claude_dir() {
   [[ -L "$dir/sessions" ]] && rm -f "$dir/sessions"
   mkdir -p "$dir/sessions"
   chmod 700 "$dir/sessions"
+  # Claude Code's records (transcripts, file history, prompt history, ...):
+  # the container's own, so they can be written. An older cbox linked them to
+  # the read-only shared folder.
+  for base in "${_CBOX_SAFE_LOCAL[@]}"; do
+    [[ "$(readlink "$dir/$base" 2>/dev/null)" == "$_CBOX_SAFE_SHARED/"* ]] && rm -f "$dir/$base"
+  done
+  _cbox_safe_memory_links "$name" "$src" "$dir"
 
   local s="$src/.credentials.json" l="$dir/.credentials.json"
   [[ -L "$s" || -L "$l" ]] && return 0  # Claude Code would not open it anyway

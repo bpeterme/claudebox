@@ -211,11 +211,22 @@ _CBOX_MASK_DEFAULT=".env .env.* !.env.example !.env.sample !.env.template *.pem 
 # CBOX_SSH_DIR  — path to SSH dir to mount; unset = no SSH mount
 # CBOX_SHARE_CONFIG — folders of ~/.config to share read-only, e.g. "opencode nvim"
 # CBOX_ZSHRC    — path to a .zshrc to source inside container; unset = none
+# The folder of the real cbox.sh, through symlinks (~/.local/bin/cbox -> a
+# clone, Homebrew's bin/cbox -> its Cellar): the dockerfile and the git
+# checkout sit next to the real file. Plain readlink, for macOS' too.
+_cbox_self="${BASH_SOURCE[0]}"
+_n=0
+while [[ -L "$_cbox_self" ]] && (( _n++ < 10 )); do
+  _t=$(readlink "$_cbox_self")
+  [[ "$_t" == /* ]] && _cbox_self="$_t" || _cbox_self="$(dirname "$_cbox_self")/$_t"
+done
+_CBOX_SELF_DIR="$(cd "$(dirname "$_cbox_self")" && pwd)"
+unset _cbox_self _t _n
 # claudebox's own dockerfile: next to cbox.sh, or for prefix-based installs
 # (e.g. Homebrew) in PREFIX/share/claudebox.
-_CBOX_OWN_BUILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_CBOX_OWN_BUILD_DIR="$_CBOX_SELF_DIR"
 if [[ ! -f "$_CBOX_OWN_BUILD_DIR/dockerfile" ]]; then
-  _cbox_share="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/share/claudebox"
+  _cbox_share="$(cd "$_CBOX_SELF_DIR/.." && pwd)/share/claudebox"
   [[ -f "$_cbox_share/dockerfile" ]] && _CBOX_OWN_BUILD_DIR="$_cbox_share"
   unset _cbox_share
 fi
@@ -223,7 +234,7 @@ _CBOX_BUILD_DIR="${CBOX_BUILD_DIR:-$_CBOX_OWN_BUILD_DIR}"
 [[ -f "$_CBOX_BUILD_DIR/dockerfile" || -f "$_CBOX_BUILD_DIR/Dockerfile" ]] || _CBOX_BUILD_DIR="$_CBOX_OWN_BUILD_DIR"
 _CBOX_VERSION="dev"
 if [[ "$_CBOX_VERSION" == "dev" ]]; then
-  _v=$(git -C "$(dirname "${BASH_SOURCE[0]}")" describe --tags --always 2>/dev/null)
+  _v=$(git -C "$_CBOX_SELF_DIR" describe --tags --always 2>/dev/null)
   [[ -n "$_v" ]] && _CBOX_VERSION="$_v"
   unset _v
 fi

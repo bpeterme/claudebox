@@ -102,6 +102,26 @@ _runtime_bin() {
 # _cbox_resolve_path
 # ---------------------------------------------------------------------------
 
+# A manual install links ~/.local/bin/cbox to a clone: cbox must find its
+# dockerfile and version next to the real file, not next to the link.
+@test "cbox via a symlink: finds the dockerfile and version of the real file" {
+  local bin="$BATS_TMPDIR/symlink-bin"
+  mkdir -p "$bin"
+  ln -sf "$CBOX_SH" "$bin/cbox"
+  ln -sf "cbox" "$bin/cbox-relative"
+  local show='source "$1"; echo "$_CBOX_OWN_BUILD_DIR"; echo "$_CBOX_VERSION"'
+  run bash -c "$show" _ "$CBOX_SH"
+  [ "$status" -eq 0 ]
+  local expected="$output"
+  [ "${lines[0]}" = "$(dirname "$CBOX_SH")" ]
+  run bash -c "$show" _ "$bin/cbox"
+  [ "$status" -eq 0 ]
+  [ "$output" = "$expected" ]
+  run bash -c "$show" _ "$bin/cbox-relative"
+  [ "$status" -eq 0 ]
+  [ "$output" = "$expected" ]
+}
+
 @test "_cbox_resolve_path: returns path unchanged for a regular file" {
   local f="$BATS_TMPDIR/regular"
   touch "$f"

@@ -56,14 +56,19 @@ cbox --help
 Homebrew on Linux is untested; use a clone:
 
 ```bash
-git clone https://github.com/bpeterme/claudebox.git ~/claudebox
-# update later: git -C ~/claudebox pull
+git clone https://github.com/bpeterme/claudebox.git ~/.local/share/claudebox-src
+mkdir -p ~/.local/bin && ln -s ~/.local/share/claudebox-src/cbox.sh ~/.local/bin/cbox
+# update later: git -C ~/.local/share/claudebox-src pull
 ```
 
-Add to your `~/.zshrc` or `~/.bashrc`:
+The link puts `cbox` on your `PATH`, where scripts find it. If your shell says
+`cbox: command not found`, add `export PATH="$HOME/.local/bin:$PATH"` to your
+`~/.zshrc` or `~/.bashrc`.
+
+For tab completion, also add to your `~/.zshrc` or `~/.bashrc`:
 
 ```bash
-source ~/claudebox/cbox.sh
+source ~/.local/share/claudebox-src/cbox.sh
 ```
 
 Then:

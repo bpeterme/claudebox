@@ -7554,6 +7554,7 @@ cbox() {
   while [[ "${1:-}" == -* ]]; do
     case "$1" in
       -v|--verbose) local CBOX_VERBOSE=1; shift ;;
+      -h|--help) _cbox_help; return 0 ;;
       *) echo "Unknown flag: $1"; return 1 ;;
     esac
   done

@@ -102,6 +102,18 @@ _runtime_bin() {
 # _cbox_resolve_path
 # ---------------------------------------------------------------------------
 
+# The README's first command; -v/--verbose parsing once swallowed it.
+@test "cbox --help and -h show the help, alone or after -v" {
+  local args
+  for args in "--help" "-h" "help" "-v --help"; do
+    # shellcheck disable=SC2086
+    run bash "$CBOX_SH" $args
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Usage"* || "$output" == *"usage"* ]]
+    [[ "$output" != *"Unknown flag"* ]]
+  done
+}
+
 # A manual install links ~/.local/bin/cbox to a clone: cbox must find its
 # dockerfile and version next to the real file, not next to the link.
 @test "cbox via a symlink: finds the dockerfile and version of the real file" {

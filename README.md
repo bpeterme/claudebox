@@ -57,10 +57,15 @@ Homebrew on Linux is untested; use a clone:
 
 ```bash
 git clone https://github.com/bpeterme/claudebox.git ~/claudebox
+mkdir -p ~/.local/bin && ln -s ~/claudebox/cbox.sh ~/.local/bin/cbox
 # update later: git -C ~/claudebox pull
 ```
 
-Add to your `~/.zshrc` or `~/.bashrc`:
+The link puts `cbox` on your `PATH`, where scripts find it. If your shell says
+`cbox: command not found`, add `export PATH="$HOME/.local/bin:$PATH"` to your
+`~/.zshrc` or `~/.bashrc`.
+
+For tab completion, also add to your `~/.zshrc` or `~/.bashrc`:
 
 ```bash
 source ~/claudebox/cbox.sh

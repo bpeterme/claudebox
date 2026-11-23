@@ -102,6 +102,18 @@ _runtime_bin() {
 # _cbox_resolve_path
 # ---------------------------------------------------------------------------
 
+# The README's first command; -v/--verbose parsing once swallowed it.
+@test "cbox --help and -h show the help, alone or after -v" {
+  local args
+  for args in "--help" "-h" "help" "-v --help"; do
+    # shellcheck disable=SC2086
+    run bash "$CBOX_SH" $args
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Usage"* || "$output" == *"usage"* ]]
+    [[ "$output" != *"Unknown flag"* ]]
+  done
+}
+
 # A manual install links ~/.local/bin/cbox to a clone: cbox must find its
 # dockerfile and version next to the real file, not next to the link.
 @test "cbox via a symlink: finds the dockerfile and version of the real file" {
@@ -915,6 +927,19 @@ _warden_relocate() {
   _warden_relocate "$dots/output-styles/resources"
   run _warden_env
   rm -f "$CBOX_CLAUDE_DIR/output-styles"
+  _warden_teardown
+  [ -z "$output" ]
+  [[ "$(cat "$WT/stderr")" == *"warden is off"* ]]
+}
+
+@test "warden guard: off when the file sits in a dir mounted via a container ~/.config symlink" {
+  _warden_setup
+  local dots="$BATS_TMPDIR/wdots-config"
+  rm -rf "$dots" "$CBOX_HOST_CONFIG_DIR/opencode"; mkdir -p "$dots/opencode" "$CBOX_HOST_CONFIG_DIR/opencode"
+  ln -s "$dots/opencode" "$CBOX_HOST_CONFIG_DIR/opencode/shared"
+  _warden_relocate "$dots/opencode/resources"
+  run _warden_env
+  rm -rf "$CBOX_HOST_CONFIG_DIR/opencode"
   _warden_teardown
   [ -z "$output" ]
   [[ "$(cat "$WT/stderr")" == *"warden is off"* ]]
@@ -2235,6 +2260,50 @@ _clean_stubs() {
   [[ "$output" == *"$dots/output-styles:$dots/output-styles"* ]]
   [[ "$output" != *"$dots/output-styles/ELI5.md:"* ]]
   [ "$(grep -c "^$dots/settings.json:$dots/settings.json\$" "$capture")" -eq 1 ]
+}
+
+@test "_cbox_create: mounts symlink targets in the container's ~/.config (normal mode only)" {
+  local capture="$BATS_TMPDIR/create-config-link-args"
+  local dots="$BATS_TMPDIR/config-dots"
+  rm -rf "$capture" "$dots" "$CBOX_HOST_CONFIG_DIR/opencode"
+  mkdir -p "$dots/opencode" "$CBOX_HOST_CONFIG_DIR/opencode"
+  echo "{}" > "$dots/opencode/opencode.jsonc"
+  ln -s "$dots/opencode/opencode.jsonc" "$CBOX_HOST_CONFIG_DIR/opencode/opencode.jsonc"
+  mkdir -p "$BATS_TMPDIR/config-link-project"
+  cd "$BATS_TMPDIR/config-link-project"
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-config-link"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+
+  _cbox_create "cbox-unit-config-link" "normal"
+  local normal; normal=$(cat "$capture")
+  rm -f "$capture"; _cbox_create "cbox-unit-config-link" "safe"
+  local safe; safe=$(cat "$capture")
+  rm -rf "$CBOX_HOST_CONFIG_DIR/opencode"
+
+  [[ "$normal" == *"$dots/opencode/opencode.jsonc:$dots/opencode/opencode.jsonc"* ]]
+  [[ "$safe" != *"$dots/opencode/opencode.jsonc:"* ]]
+}
+
+@test "_cbox_create: never mounts a symlink target that holds the Mac's config" {
+  local capture="$BATS_TMPDIR/create-host-config-link-args"
+  rm -f "$capture" "$CBOX_HOST_CONFIG_DIR/claudebox-real" "$CBOX_CLAUDE_DIR/host-claude"
+  mkdir -p "$HOME/.claude"
+  ln -s "$HOME/.config/claudebox" "$CBOX_HOST_CONFIG_DIR/claudebox-real"
+  ln -s "$HOME/.claude" "$CBOX_CLAUDE_DIR/host-claude"
+  mkdir -p "$BATS_TMPDIR/host-config-link-project"
+  cd "$BATS_TMPDIR/host-config-link-project"
+  CBOX_PLAYWRIGHT_DIR="$BATS_TMPDIR/pw-host-config-link"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+
+  run _cbox_create "cbox-unit-host-config-link" "normal"
+  rm -f "$CBOX_HOST_CONFIG_DIR/claudebox-real" "$CBOX_CLAUDE_DIR/host-claude"
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"holds config that runs on this Mac — not mounted"* ]]
+  ! grep -q "^$HOME/.config/claudebox:" "$capture"
+  ! grep -q "^$HOME/.claude:" "$capture"
 }
 
 @test "_cbox_create: possibly-empty arrays are expanded bash-3.2-safe under set -u" {

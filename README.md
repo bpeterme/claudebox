@@ -243,7 +243,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_KEEPALIVE_SECONDS` | `600` | Seconds container stays alive before auto-stop in keepalive mode |
 | `CBOX_DATA_DIR` | `~/.local/share/claudebox` | Per-project container config files (`.claude-<name>.json`) and logs; `cbox doctor` shows the folder in use |
 | `CBOX_CLAUDE_DIR` | `~/.config/claudebox/.claude` | The container's Claude Code folder, mounted as `~/.claude` (read-write; read-only in safe mode, except the login). Not your Mac's `~/.claude`: Claude Code on the Mac runs the hooks in its `settings.json`, so cbox refuses it. On first use cbox copies your settings, `CLAUDE.md`, keybindings, agents, commands, skills and output styles into it (copies, not links); log in once inside the container |
-| `CBOX_HOST_CONFIG_DIR` | `~/.config/claudebox/.config` | The container's own `~/.config` (normal mode, read-write). Not your real `~/.config`: that holds config that runs on your Mac and tokens, so cbox refuses it |
+| `CBOX_HOST_CONFIG_DIR` | `~/.config/claudebox/.config` | The container's own `~/.config` (normal mode, read-write). Not your real `~/.config`: that holds config that runs on your Mac and tokens, so cbox refuses it. Symlinks in it (and in `CBOX_CLAUDE_DIR`), up to one folder deep, work: cbox mounts each target at its own path, writable in normal mode, e.g. `opencode/opencode.jsonc` → a file in your dotfiles. Takes effect when a container is created |
 | `CBOX_SHARE_CONFIG` | *(unset)* | Folders of your real `~/.config` to share **read-only** into the container's `~/.config`, e.g. `"opencode nvim"`. Code in the container can read them, so leave out folders holding tokens (`gh`, `gcloud`). `claudebox` is never shared. Applies to newly created containers: `cbox reset` |
 | `CBOX_SHARE_DIR` | `~/.cache/claudebox/share` | Share folder, mounted as `~/share` in container; cleared when the last cbox session on this Mac closes (read-write) |
 | `CBOX_PLAYWRIGHT_DIR` | `$CBOX_DATA_DIR/ms-playwright` | Playwright browser cache, mounted as `/opt/ms-playwright` (read-write; read-only in safe mode). Shared by all projects, kept across resets and rebuilds |
@@ -540,6 +540,66 @@ env      = OPENROUTER_DECISIONS_URL={url}/decisions
 The container then posts to `$OPENROUTER_DECISIONS_URL`. A new resource
 reaches a container at its next session start (exit its sessions, start
 `cbox` again); a changed `allow` on an existing one applies at once.
+
+**CI results** let the agent check its own pushes. GitLab, with a fine-grained
+personal access token that has only **Pipeline: Read** and **Job: Read**,
+limited to the projects you choose:
+
+```ini
+[gitlab-ci]
+upstream = https://gitlab.com/api/v4                # self-hosted: https://<host>/api/v4
+auth     = header:PRIVATE-TOKEN
+secret   = cbox.warden.gitlab-ci                    # cbox warden secret set gitlab-ci
+allow    = GET /projects/*/pipelines*, GET /projects/*/jobs/*
+env      = WARDEN_GITLAB_API={url}
+test     = GET /projects/my-group%2Fmy-project/pipelines?per_page=1
+```
+
+The token decides which projects can be read; `allow` keeps it to reading
+pipelines and jobs. A project is named by its path with `/` written as `%2F`.
+In the container:
+
+```sh
+curl -s "$WARDEN_GITLAB_API/projects/my-group%2Fmy-project/pipelines?ref=dev&per_page=1" | jq
+curl -s "$WARDEN_GITLAB_API/projects/my-group%2Fmy-project/pipelines/<pipeline-id>/jobs" | jq
+curl -s "$WARDEN_GITLAB_API/projects/my-group%2Fmy-project/jobs/<job-id>/trace"     # the job log
+```
+
+**A local model server** (llama.cpp's `llama-server`, or any server with an
+OpenAI-compatible API and an API key) works like any other API. `http://` and
+LAN addresses are fine: the request leaves from the host, so the host must reach
+the server. One resource lets code in the container call the model:
+
+```ini
+[llama]
+upstream = http://192.0.2.10:8080/v1
+auth     = bearer
+secret   = cbox.warden.llama                 # cbox warden secret set llama: the server's --api-key
+env      = LLAMA_BASE_URL={url} LLAMA_API_KEY=warden
+test     = GET /models
+```
+
+If the server also speaks Anthropic's API (recent `llama-server` builds answer
+`POST /v1/messages`), Claude Code itself can run on the local model. A second
+resource with the same secret does it, for the projects that ask for it:
+
+```ini
+[llama-claude]
+upstream     = http://192.0.2.10:8080       # no /v1: Claude Code adds /v1/messages itself
+auth         = bearer
+secret       = cbox.warden.llama
+availability = project                       # only projects whose .cbox lists [warden "llama-claude"]
+allow        = POST /v1/messages, POST /v1/messages/count_tokens, GET /v1/models
+env          = ANTHROPIC_BASE_URL={url} ANTHROPIC_AUTH_TOKEN=warden
+test         = GET /v1/models
+```
+
+Use `ANTHROPIC_AUTH_TOKEN`, not `ANTHROPIC_API_KEY`: the token goes out as
+`Authorization: Bearer`, the header warden replaces with the real key. Keep it
+`availability = project`: as `global`, every container's Claude Code would run
+on the local model. One server answers both formats at once, sharing its slots
+(`--parallel`) and context. Local models are much weaker at Claude Code's long
+tool-call sessions than Claude: try a small multi-step task first.
 
 Not available in safe mode.
 

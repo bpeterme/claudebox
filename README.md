@@ -541,6 +541,42 @@ The container then posts to `$OPENROUTER_DECISIONS_URL`. A new resource
 reaches a container at its next session start (exit its sessions, start
 `cbox` again); a changed `allow` on an existing one applies at once.
 
+**A local model server** (llama.cpp's `llama-server`, or any server with an
+OpenAI-compatible API and an API key) works like any other API. `http://` and
+LAN addresses are fine: the request leaves from the host, so the host must reach
+the server. One resource lets code in the container call the model:
+
+```ini
+[llama]
+upstream = http://192.0.2.10:8080/v1
+auth     = bearer
+secret   = cbox.warden.llama                 # cbox warden secret set llama: the server's --api-key
+env      = LLAMA_BASE_URL={url} LLAMA_API_KEY=warden
+test     = GET /models
+```
+
+If the server also speaks Anthropic's API (recent `llama-server` builds answer
+`POST /v1/messages`), Claude Code itself can run on the local model. A second
+resource with the same secret does it, for the projects that ask for it:
+
+```ini
+[llama-claude]
+upstream     = http://192.0.2.10:8080       # no /v1: Claude Code adds /v1/messages itself
+auth         = bearer
+secret       = cbox.warden.llama
+availability = project                       # only projects whose .cbox lists [warden "llama-claude"]
+allow        = POST /v1/messages, POST /v1/messages/count_tokens, GET /v1/models
+env          = ANTHROPIC_BASE_URL={url} ANTHROPIC_AUTH_TOKEN=warden
+test         = GET /v1/models
+```
+
+Use `ANTHROPIC_AUTH_TOKEN`, not `ANTHROPIC_API_KEY`: the token goes out as
+`Authorization: Bearer`, the header warden replaces with the real key. Keep it
+`availability = project`: as `global`, every container's Claude Code would run
+on the local model. One server answers both formats at once, sharing its slots
+(`--parallel`) and context. Local models are much weaker at Claude Code's long
+tool-call sessions than Claude: try a small multi-step task first.
+
 Not available in safe mode.
 
 ### WhatsApp chats

@@ -3974,13 +3974,13 @@ def load_json(path, default):
 def container_mounts(d, extra=()):
     """Host paths that some container can see: the dirs and files cbox mounts
     (passed in as CBOX_* environment), the targets of symlinks in the Claude
-    dir (mounted at their own path, up to two levels deep, like _cbox_create),
-    and the workspace of every active session."""
+    dir and the container's ~/.config (mounted at their own path, up to two
+    levels deep, like _cbox_create), and the workspace of every active session."""
     found = [os.environ.get(v) for v in ("CBOX_CLAUDE_DIR", "CBOX_HOST_CONFIG_DIR", "CBOX_SHARE_DIR",
                                           "CBOX_PLAYWRIGHT_DIR", "CBOX_SSH_DIR", "CBOX_ZSHRC")]
     found += os.environ.get("CBOX_SHARED_CONFIG_PATHS", "").split("\n")
-    claude = os.environ.get("CBOX_CLAUDE_DIR")
-    for level in ([claude] if claude and os.path.isdir(claude) else []):
+    scanned = [os.environ.get(v) for v in ("CBOX_CLAUDE_DIR", "CBOX_HOST_CONFIG_DIR")]
+    for level in [d for d in scanned if d and os.path.isdir(d)]:
         for e in os.scandir(level):
             if e.is_symlink():
                 found.append(e.path)
@@ -6715,27 +6715,35 @@ _cbox_create() {
   done <<<"$_mask"
   unset _mask _m
 
-  # For each symlink in CBOX_CLAUDE_DIR, resolve it to the real host path and
+  # For each symlink in CBOX_CLAUDE_DIR (and, in normal mode, the container's
+  # ~/.config, CBOX_HOST_CONFIG_DIR), resolve it to the real host path and
   # mount that target at its own absolute path inside the container. The symlink
   # in ~/.claude points to e.g. /Users/me/.config/dotfiles/claude/settings.json;
   # mounting that path at the same path in the container lets the symlink resolve.
   # maxdepth 2 also covers symlinks one level down (e.g. output-styles/ELI5.md,
-  # commands/foo.md) without recursing into large trees like projects/.
+  # opencode/opencode.jsonc) without recursing into large trees like projects/.
+  # A target that holds config running on this Mac is never mounted.
   # Targets inside an already-mounted target directory (or duplicates) are
   # skipped: Apple Container shares a file mount's parent directory, so a
   # directory mount plus file mounts inside it collapse into the file mounts
   # alone and the rest of the directory disappears. Sorting puts a parent
   # before its children.
-  local _ro="" _link _target _kept _nested
+  local _ro="" _link _target _kept _nested _scan_dirs=("$CBOX_CLAUDE_DIR")
   local _targets=() _mounted=()
   [[ "$mode" == "safe" ]] && _ro=":ro"
+  [[ "$mode" == "normal" ]] && _scan_dirs+=("$CBOX_HOST_CONFIG_DIR")
   while IFS= read -r _link; do
     _target=$(_cbox_resolve_path "$_link")
     [[ -e "$_target" ]] || continue
     [[ "$_target" == "$CBOX_CLAUDE_DIR"* ]] && continue
+    [[ "$mode" == "normal" && ( "$_target" == "$CBOX_HOST_CONFIG_DIR" || "$_target" == "$CBOX_HOST_CONFIG_DIR/"* ) ]] && continue
     [[ "$_target" == "$PWD" || "$_target" == "$PWD/"* ]] && continue
+    if _cbox_holds_host_config "$_target"; then
+      echo "⚠  $_link points to $_target, which holds config that runs on this Mac — not mounted." >&2
+      continue
+    fi
     _targets+=("$_target")
-  done < <(find "$CBOX_CLAUDE_DIR" -maxdepth 2 -type l 2>/dev/null)
+  done < <(find "${_scan_dirs[@]}" -maxdepth 2 -type l 2>/dev/null)
   while IFS= read -r _target; do
     [[ -n "$_target" ]] || continue
     _nested=0
@@ -6746,7 +6754,7 @@ _cbox_create() {
     _mounted+=("$_target")
     args+=(-v "$_target:$_target$_ro")
   done < <(printf '%s\n' ${_targets[@]+"${_targets[@]}"} | LC_ALL=C sort)
-  unset _ro _link _target _kept _nested _targets _mounted
+  unset _ro _link _target _kept _nested _scan_dirs _targets _mounted
 
   # Ports the project's .cbox lists (normal mode): on the host's 127.0.0.1
   # only. The label lets a session tell when .cbox has changed since.

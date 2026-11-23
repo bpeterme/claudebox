@@ -541,6 +541,30 @@ The container then posts to `$OPENROUTER_DECISIONS_URL`. A new resource
 reaches a container at its next session start (exit its sessions, start
 `cbox` again); a changed `allow` on an existing one applies at once.
 
+**CI results** let the agent check its own pushes. GitLab, with a fine-grained
+personal access token that has only **Pipeline: Read** and **Job: Read**,
+limited to the projects you choose:
+
+```ini
+[gitlab-ci]
+upstream = https://gitlab.com/api/v4                # self-hosted: https://<host>/api/v4
+auth     = header:PRIVATE-TOKEN
+secret   = cbox.warden.gitlab-ci                    # cbox warden secret set gitlab-ci
+allow    = GET /projects/*/pipelines*, GET /projects/*/jobs/*
+env      = WARDEN_GITLAB_API={url}
+test     = GET /projects/my-group%2Fmy-project/pipelines?per_page=1
+```
+
+The token decides which projects can be read; `allow` keeps it to reading
+pipelines and jobs. A project is named by its path with `/` written as `%2F`.
+In the container:
+
+```sh
+curl -s "$WARDEN_GITLAB_API/projects/my-group%2Fmy-project/pipelines?ref=dev&per_page=1" | jq
+curl -s "$WARDEN_GITLAB_API/projects/my-group%2Fmy-project/pipelines/<pipeline-id>/jobs" | jq
+curl -s "$WARDEN_GITLAB_API/projects/my-group%2Fmy-project/jobs/<job-id>/trace"     # the job log
+```
+
 **A local model server** (llama.cpp's `llama-server`, or any server with an
 OpenAI-compatible API and an API key) works like any other API. `http://` and
 LAN addresses are fine: the request leaves from the host, so the host must reach

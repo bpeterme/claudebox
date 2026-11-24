@@ -1590,6 +1590,44 @@ _share_setup() {
 }
 
 # ---------------------------------------------------------------------------
+# _cbox_host_tz
+# ---------------------------------------------------------------------------
+
+@test "_cbox_host_tz: reads the zone from a macOS /etc/localtime link" {
+  _CBOX_HOST_ETC="$BATS_TMPDIR/tz-etc"; rm -rf "$_CBOX_HOST_ETC"; mkdir -p "$_CBOX_HOST_ETC"
+  ln -s /var/db/timezone/zoneinfo/Europe/Berlin "$_CBOX_HOST_ETC/localtime"
+  TZ="" run _cbox_host_tz
+  [ "$output" = "Europe/Berlin" ]
+}
+
+@test "_cbox_host_tz: reads the zone from a relative Linux /etc/localtime link" {
+  _CBOX_HOST_ETC="$BATS_TMPDIR/tz-etc"; rm -rf "$_CBOX_HOST_ETC"; mkdir -p "$_CBOX_HOST_ETC"
+  ln -s ../usr/share/zoneinfo/America/Argentina/Buenos_Aires "$_CBOX_HOST_ETC/localtime"
+  TZ="" run _cbox_host_tz
+  [ "$output" = "America/Argentina/Buenos_Aires" ]
+}
+
+@test "_cbox_host_tz: a zone name in the host's TZ wins, a file path does not" {
+  _CBOX_HOST_ETC="$BATS_TMPDIR/tz-etc"; rm -rf "$_CBOX_HOST_ETC"; mkdir -p "$_CBOX_HOST_ETC"
+  ln -s /usr/share/zoneinfo/Europe/Berlin "$_CBOX_HOST_ETC/localtime"
+  TZ="Asia/Tokyo" run _cbox_host_tz
+  [ "$output" = "Asia/Tokyo" ]
+  TZ=":/etc/localtime" run _cbox_host_tz
+  [ "$output" = "Europe/Berlin" ]
+}
+
+@test "_cbox_host_tz: falls back to /etc/timezone, else prints nothing" {
+  _CBOX_HOST_ETC="$BATS_TMPDIR/tz-etc"; rm -rf "$_CBOX_HOST_ETC"; mkdir -p "$_CBOX_HOST_ETC"
+  : > "$_CBOX_HOST_ETC/localtime"
+  TZ="" run _cbox_host_tz
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  echo "Europe/Vienna" > "$_CBOX_HOST_ETC/timezone"
+  TZ="" run _cbox_host_tz
+  [ "$output" = "Europe/Vienna" ]
+}
+
+# ---------------------------------------------------------------------------
 # _cbox_flux_install
 # ---------------------------------------------------------------------------
 

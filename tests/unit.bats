@@ -5671,3 +5671,10 @@ SH
   [ "$status" -ne 0 ]
   [ ! -e "$KC/default/cbox.warden.x" ]
 }
+
+@test "cbox.sh is committed as executable" {
+  # The manual install links ~/.local/bin/cbox to the clone's cbox.sh: programs that
+  # look cbox up on PATH (flux, scripts) run that file, so it needs the exec bit.
+  run git -C "$BATS_TEST_DIRNAME/.." ls-files -s cbox.sh
+  [[ "$output" == 100755* ]]
+}

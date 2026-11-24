@@ -4229,25 +4229,34 @@ def ssh_trust(d, h, interactive):
     return True
 
 
+def secret_lookups(item, account, platform, keychain=""):
+    """Commands that look up a secret, tried in order. On macOS: the keychain
+    CBOX_KEYCHAIN names first, then the keychain search list, so items stored
+    before it was set (or by flux in its own keychain) are still found."""
+    if platform == "darwin":
+        find = ["security", "find-generic-password", "-s", item, "-a", account, "-w"]
+        return ([find + [os.path.expanduser(keychain)]] if keychain else []) + [find]
+    if shutil.which("secret-tool"):
+        return [["secret-tool", "lookup", "service", item, "account", account]]
+    return []
+
+
 def read_secret(r, field="secret"):
     """Secret for resource r: CBOX_WARDEN_SECRET_CMD <item>, else the macOS
     Keychain, else the Linux keyring through secret-tool (as flux does)."""
     item = r[field]
     account = r.get("secret-account") or os.environ.get("USER", "")
     cmd = os.environ.get("CBOX_WARDEN_SECRET_CMD")
-    if cmd:
-        argv = [cmd, item]
-    elif sys.platform == "darwin":
-        argv = ["security", "find-generic-password", "-s", item, "-a", account, "-w"]
-    elif shutil.which("secret-tool"):
-        argv = ["secret-tool", "lookup", "service", item, "account", account]
-    else:
+    lookups = [[cmd, item]] if cmd else secret_lookups(
+        item, account, sys.platform, os.environ.get("CBOX_KEYCHAIN", ""))
+    if not lookups:
         raise LookupError("no secret store: install secret-tool (apt install libsecret-tools), or set CBOX_WARDEN_SECRET_CMD")
-    p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
-    value = p.stdout.decode().rstrip("\n")
-    if p.returncode != 0 or not value:
-        raise LookupError(f"secret '{item}' not found — set it with: cbox warden secret set <name>")
-    return value
+    for argv in lookups:
+        p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+        value = p.stdout.decode().rstrip("\n")
+        if p.returncode == 0 and value:
+            return value
+    raise LookupError(f"secret '{item}' not found — set it with: cbox warden secret set <name>")
 
 
 def project_file(project):
@@ -5667,7 +5676,7 @@ _cbox_warden_env() {
     "CBOX_CLAUDE_DIR=$CBOX_CLAUDE_DIR" "CBOX_HOST_CONFIG_DIR=$CBOX_HOST_CONFIG_DIR"
     "CBOX_SHARE_DIR=$CBOX_SHARE_DIR" "CBOX_PLAYWRIGHT_DIR=$CBOX_PLAYWRIGHT_DIR"
     "CBOX_SSH_DIR=${CBOX_SSH_DIR:-}" "CBOX_ZSHRC=${CBOX_ZSHRC:-}"
-    "CBOX_EGRESS_ALLOW=${CBOX_EGRESS_ALLOW:-}"
+    "CBOX_EGRESS_ALLOW=${CBOX_EGRESS_ALLOW:-}" "CBOX_KEYCHAIN=${CBOX_KEYCHAIN:-}"
     "CBOX_SHARED_CONFIG_PATHS=$(_cbox_shared_config_names | sed "s|^|${XDG_CONFIG_HOME:-$HOME/.config}/|")"
   )
 }
@@ -5736,8 +5745,9 @@ _cbox_warden_broker_pid() {
 # Identifies the broker's code and address. A running broker started by another
 # cbox version (e.g. before brew upgrade) would keep serving old rules, so it is
 # restarted; sessions live in files, so running containers keep their access.
+# A changed CBOX_KEYCHAIN restarts it too: the broker reads secrets with it.
 _cbox_warden_broker_id() {
-  { _cbox_warden_py; echo "$1:$CBOX_WARDEN_PORT"; } | cksum | cut -d' ' -f1
+  { _cbox_warden_py; echo "$1:$CBOX_WARDEN_PORT:${CBOX_KEYCHAIN:-}"; } | cksum | cut -d' ' -f1
 }
 
 _cbox_warden_broker_start() {
@@ -5746,7 +5756,7 @@ _cbox_warden_broker_start() {
   id=$(_cbox_warden_broker_id "$ip")
   if _cbox_warden_broker_pid >/dev/null; then
     [[ "$(cat "$idfile" 2>/dev/null)" == "$id" ]] && return 0
-    _cbox_log "ℹ  restarting the warden broker (cbox was updated)"
+    _cbox_log "ℹ  restarting the warden broker (cbox or CBOX_KEYCHAIN changed)"
     _cbox_warden_broker_stop
   fi
   rm -f "$pidfile"
@@ -5837,6 +5847,28 @@ _cbox_warden_end() {
   fi
 }
 
+# Quotes a word for the command line of `security -i`: in double quotes, with
+# backslash and double quote escaped.
+_cbox_security_quote() {
+  local s="${1//\\/\\\\}"
+  printf '"%s"' "${s//\"/\\\"}"
+}
+
+# Stores a macOS Keychain item: $1 service, $2 account, $3 label, $4 value,
+# $5 keychain (empty: the default keychain). The value goes to `security -i` on
+# stdin, never on a command line (the process list shows those), and is read
+# back afterwards, since `security -i` need not report a failed command.
+_cbox_keychain_store() {
+  local kc="${5:-}" line
+  [[ "$4" != *$'\n'* ]] || return 1
+  [[ -n "$kc" ]] && kc="${kc/#\~/$HOME}"
+  line="add-generic-password -U -s $(_cbox_security_quote "$1") -a $(_cbox_security_quote "$2")"
+  line+=" -l $(_cbox_security_quote "$3") -w $(_cbox_security_quote "$4")"
+  [[ -n "$kc" ]] && line+=" $(_cbox_security_quote "$kc")"
+  printf '%s\n' "$line" | security -i >/dev/null 2>&1
+  [[ "$(security find-generic-password -s "$1" -a "$2" -w ${kc:+"$kc"} 2>/dev/null)" == "$4" ]]
+}
+
 _cbox_warden_secret_set() {
   local res="$1"
   if [[ ! "$res" =~ ^[a-z0-9][a-z0-9_.-]{0,63}$ ]]; then
@@ -5844,8 +5876,17 @@ _cbox_warden_secret_set() {
     return 1
   fi
   if [[ "$(/usr/bin/uname)" == "Darwin" ]]; then
-    echo "Paste the secret for '$res' (input is hidden). It is stored in the Keychain as cbox.warden.$res."
-    security add-generic-password -U -s "cbox.warden.$res" -a "$USER" -l "cbox warden: $res" -w || return 1
+    local where="the Keychain" value
+    [[ -n "${CBOX_KEYCHAIN:-}" ]] && where="the keychain $CBOX_KEYCHAIN"
+    echo "Paste the secret for '$res' (input is hidden). It is stored in $where as cbox.warden.$res."
+    IFS= read -rs value || true
+    echo
+    [[ -n "$value" ]] || { echo "Nothing pasted — nothing stored."; return 1; }
+    _cbox_keychain_store "cbox.warden.$res" "$USER" "cbox warden: $res" "$value" "${CBOX_KEYCHAIN:-}" || {
+      echo "Could not write to $where."
+      [[ -n "${CBOX_KEYCHAIN:-}" ]] && echo "Check CBOX_KEYCHAIN in $(_cbox_shown "$_CBOX_ENV_FILE") and that the keychain is unlocked."
+      return 1
+    }
   else
     # Linux: the desktop keyring (Secret Service), as flux uses. secret-tool
     # asks for the value itself, hidden, and never takes it as an argument.

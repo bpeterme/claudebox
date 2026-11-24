@@ -261,6 +261,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_MASK` | *(safe mode: secret files)* | Files and folders in the project the container sees empty (see [Hidden secret files](#hidden-secret-files)). Unset: the default list in safe mode, nothing in normal mode; once set, it applies to both modes; `""` = nothing. Applies to newly created containers: `cbox reset` |
 | `CBOX_PROTECT_GIT` | `1` | Mount the project's `.git/config` and `.git/hooks` read-only (see [Git safety](#git-safety-both-modes)); `0` = writable. Applies to newly created containers: `cbox reset` |
 | `CBOX_WARDEN_HOST` | Apple: the default network's gateway (usually `192.168.64.1`) / `docker0` IP (WSL without it: `eth0`) | Host address containers reach the broker on |
+| `CBOX_KEYCHAIN` | *(unset: the default keychain)* | macOS keychain for warden's secrets, a name in `~/Library/Keychains` or a path. `cbox warden secret set` writes there; warden looks there first, then in the keychain search list, so items stored elsewhere are still found |
 | `CBOX_WARDEN_SECRET_CMD` | *(unset)* | Instead of the Keychain or keyring: command that prints the secret for an item name |
 
 > [!WARNING]
@@ -421,6 +422,9 @@ cbox warden secret set openrouter   # paste the key; stored in the Keychain (Lin
 cbox warden edit                    # define the resource (template included)
 cbox warden test openrouter         # check it from the host
 ```
+
+To keep the secrets in a keychain other than your default one (e.g. one shared
+across apps), set `CBOX_KEYCHAIN` in `cbox.env`.
 
 Resources live in `$CBOX_WARDEN_DIR/resources` (default `~/.local/share/claudebox/warden/resources`).
 The file holds no secrets — only Keychain/keyring item names and URLs — so it can be

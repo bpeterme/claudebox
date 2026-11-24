@@ -5615,3 +5615,66 @@ print(json.load(open('$CBOX_WARDEN_DIR/approvals.json'))['$PWD'] == project_requ
   run _cbox_busy_release
   [ "$status" -eq 0 ]
 }
+
+@test "warden secret_lookups: CBOX_KEYCHAIN first, then the keychain search list" {
+  run python3 -c "exec(open('$(_warden_lib)').read())
+import os
+os.environ['HOME'] = '/home/u'
+for kc in ('', '~/Library/Keychains/shared.keychain-db'):
+    for argv in secret_lookups('cbox.warden.x', 'me', 'darwin', kc):
+        print(' '.join(argv))"
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "security find-generic-password -s cbox.warden.x -a me -w" ]
+  [ "${lines[1]}" = "security find-generic-password -s cbox.warden.x -a me -w /home/u/Library/Keychains/shared.keychain-db" ]
+  [ "${lines[2]}" = "security find-generic-password -s cbox.warden.x -a me -w" ]
+  [ "${#lines[@]}" -eq 3 ]
+}
+
+# A fake macOS security: `-i` runs one add-generic-password line from stdin,
+# find-generic-password reads it back. Items live per keychain in $KC; every
+# command line is logged to $KC/args.
+_fake_security() {
+  KC="$BATS_TMPDIR/kc"; rm -rf "$KC"; mkdir -p "$KC/bin"
+  cat > "$KC/bin/security" <<'SH'
+#!/usr/bin/env bash
+KC="$(dirname "$0")/.."
+echo "$*" >> "$KC/args"
+store() { local s="" w="" k="default"; while [[ $# -gt 0 ]]; do case "$1" in
+  -s) s="$2"; shift 2 ;; -w) w="$2"; shift 2 ;; -a|-l) shift 2 ;; -U) shift ;; *) k="${1##*/}"; shift ;; esac; done
+  mkdir -p "$KC/$k"; printf '%s' "$w" > "$KC/$k/$s"; }
+case "$1" in
+  -i) IFS= read -r line; eval "set -- $line"; shift; store "$@" ;;
+  find-generic-password) shift; s="" k="default"; while [[ $# -gt 0 ]]; do case "$1" in
+      -s) s="$2"; shift 2 ;; -a) shift 2 ;; -w) shift ;; *) k="${1##*/}"; shift ;; esac; done
+    [[ -f "$KC/$k/$s" ]] && cat "$KC/$k/$s" ;;
+esac
+SH
+  chmod +x "$KC/bin/security"
+  PATH="$KC/bin:$PATH"
+}
+
+@test "_cbox_keychain_store: the value goes over stdin into the chosen keychain" {
+  _fake_security
+  export VAL='p"a\ss w0rd'
+  run bash -c "source '$CBOX_SH'; _cbox_keychain_store cbox.warden.llm me 'cbox warden: llm' \"\$VAL\" '~/kc/shared.keychain-db'"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$KC/shared.keychain-db/cbox.warden.llm")" = 'p"a\ss w0rd' ]
+  ! grep -q 'w0rd' "$KC/args"
+}
+
+@test "_cbox_keychain_store: default keychain when none is set; a value with a newline is refused" {
+  _fake_security
+  run bash -c "source '$CBOX_SH'; _cbox_keychain_store cbox.warden.llm me l secret1 ''"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$KC/default/cbox.warden.llm")" = "secret1" ]
+  run bash -c "source '$CBOX_SH'; _cbox_keychain_store cbox.warden.x me l \$'a\nb' ''"
+  [ "$status" -ne 0 ]
+  [ ! -e "$KC/default/cbox.warden.x" ]
+}
+
+@test "cbox.sh is committed as executable" {
+  # The manual install links ~/.local/bin/cbox to the clone's cbox.sh: programs that
+  # look cbox up on PATH (flux, scripts) run that file, so it needs the exec bit.
+  run git -C "$BATS_TEST_DIRNAME/.." ls-files -s cbox.sh
+  [[ "$output" == 100755* ]]
+}

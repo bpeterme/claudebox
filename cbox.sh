@@ -6918,6 +6918,26 @@ _cbox_git_identity() {
   return 0
 }
 
+# The container runs on UTC. Sessions use the host's time zone instead, so
+# times (such as when usage limits reset) show in local time. Read at every
+# session start: a host that changes zone passes the new one to the next session.
+# Prints the zone name (Europe/Berlin), or nothing when the host has none.
+_CBOX_HOST_ETC="${_CBOX_HOST_ETC:-/etc}"
+_cbox_host_tz() {
+  local tz="${TZ:-}" link
+  # A zone name set on the host wins; ":/path" and file paths mean nothing inside.
+  if [[ -n "$tz" && "$tz" != :* && "$tz" != /* ]]; then printf '%s\n' "$tz"; return 0; fi
+  # macOS, most Linux and WSL: /etc/localtime links to .../zoneinfo/<zone>.
+  link=$(readlink "$_CBOX_HOST_ETC/localtime" 2>/dev/null) || link=""
+  if [[ "$link" == *zoneinfo/?* ]]; then printf '%s\n' "${link#*zoneinfo/}"; return 0; fi
+  # Debian-style hosts with a copied file name the zone in /etc/timezone.
+  if [[ -r "$_CBOX_HOST_ETC/timezone" ]]; then
+    tz=$(head -n 1 "$_CBOX_HOST_ETC/timezone" | tr -d '[:space:]')
+    [[ -n "$tz" ]] && printf '%s\n' "$tz"
+  fi
+  return 0
+}
+
 # ---------------------------------------------------------
 # git guard: catch commands planted for git on the Mac
 # ---------------------------------------------------------
@@ -7173,6 +7193,8 @@ _cbox_enter() {
     _run="mkdir -p -m 700 $_CBOX_TUNNEL_DIR && print -l 'enable-shm = no' 'enable-memfd = no' >| $_CBOX_TUNNEL_DIR/pulse-client.conf; $_run"
   fi
   while IFS= read -r _g; do _exec_args+=(-e "$_g"); done < <(_cbox_git_identity)
+  _g=$(_cbox_host_tz)
+  [[ -n "$_g" ]] && _exec_args+=(-e "TZ=$_g")
   _cbox_mask_check "$name" "$mode"
   _cbox_ports_check "$name" "$mode"
   _cbox_memory_check "$name"

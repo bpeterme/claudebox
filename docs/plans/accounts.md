@@ -62,7 +62,7 @@ Saved accounts sit outside every folder a container mounts: a container can only
 ```
 
 - Parsed with the other `[container]` keys (`_cbox_project_settings`); a bad alias name is refused there.
-- Applied at create (the mount, and the label `cbox.account`). Afterwards the label counts, not `.cbox`: the container can write `.cbox`, so a changed pin only warns ("cbox reset"), as a changed `ports =` does.
+- Applied at create (the mount, and the label `cbox.account`). Afterwards the label counts, not `.cbox`: the container can write `.cbox`. When `.cbox` pins another account than the label, the next start asks in the host terminal whether to apply it (`_cbox_account_pin_ask` in `_cbox_ensure`); yes recreates the container. Without a terminal it only warns ("cbox reset").
 - Each session start records the pin in `accounts/.pins/<container>`, so `use` (skips pinned projects' `oauthAccount`), `list` and `remove` know it without asking the runtime.
 - A `/login` inside a pinned container writes into the pinned account's file. The next session start notices (the project's `oauthAccount` names another account) and takes that account's `oauthAccount` into the saved one, saying so.
 - At session start: `account: work (pinned in .cbox)` or `account: personal (global)`.

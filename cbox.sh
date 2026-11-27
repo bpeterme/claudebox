@@ -6497,7 +6497,8 @@ _cbox_account_start() {
     alias=$(_cbox_account_of "$CBOX_CLAUDE_DIR/.credentials.json")
     [[ -n "$alias" ]] && echo "ℹ  Claude account: $alias (cbox account use)"
   fi
-  if [[ "$want" != "$have" ]]; then
+  # With a terminal, _cbox_ensure asked before the session already.
+  if [[ "$want" != "$have" && ! -t 0 ]]; then
     echo "⚠  .cbox pins the account ${want:-(none)}, but this container uses ${have:-the one of cbox account use}."
     echo "   The account is set when a container is created: cbox reset"
   fi
@@ -6510,6 +6511,47 @@ _cbox_account_start() {
       echo "   If that is wrong: /login here with the right account. Logins in a pinned project stay in its account."
     fi
   fi
+  return 0
+}
+
+# Before a session in an existing container: when .cbox pins another account
+# than the container was created with, asks in the terminal whether to apply
+# it, and removes the container on yes (the caller creates it again, which
+# reads .cbox). The question is answered on the host, so code in the container
+# that wrote .cbox cannot answer it. Succeeds only when the container is gone.
+_cbox_account_pin_ask() {
+  local name="$1" have want answer="" out=/dev/stdout
+  want=$(_cbox_project_account 2>/dev/null) || return 1
+  # No pin and no saved accounts: nothing can differ (a pin needs one).
+  [[ -z "$want" && -z "$(_cbox_account_names)" ]] && return 1
+  [[ "$(_cbox_rt_label "$name" cbox.agent)" == "claude" ]] || return 1
+  have=$(_cbox_rt_label "$name" cbox.account)
+  [[ "$want" == "$have" ]] && return 1
+  [[ -t 0 ]] || return 1  # no terminal: the session start warns instead
+  _cbox_busy_hold && out=/dev/tty
+  if [[ -n "$want" ]] && ! _cbox_account_pin_ok "$want" 2>"$out"; then
+    echo "   Keeping this container's account for now." > "$out"
+    _cbox_busy_release
+    return 1
+  fi
+  {
+    if [[ -n "$want" ]]; then
+      echo "⚠  .cbox now pins the Claude account '$want' (this container uses ${have:+"'$have'"}${have:-the one of cbox account use})."
+    else
+      echo "⚠  .cbox no longer pins an account (this container is pinned to '$have')."
+    fi
+    echo "   Applying it recreates the container: the project folder and Claude's data stay,"
+    echo "   anything installed inside the container by hand goes."
+    printf '   Apply it now? [y/N] '
+  } > "$out"
+  read -r answer || answer=""
+  _cbox_busy_release
+  if [[ "$answer" != [yY]* ]]; then
+    echo "   Not now: cbox asks again at the next start." > "$out"
+    return 1
+  fi
+  _cbox_reset_ask "$name" || return 1
+  _cbox_remove "$name"
   return 0
 }
 
@@ -7285,6 +7327,12 @@ _cbox_ensure() {
     return 1
   fi
 
+  # .cbox pins another account than the container has: recreate it, if you say so.
+  if _cbox_account_pin_ask "$name"; then
+    _cbox_create "$name" "$requested_mode"
+    return
+  fi
+
   _cbox_project_check "$name" || return 1
 
   if ! _cbox_running "$name"; then
@@ -7452,6 +7500,21 @@ _cbox_git_guard_start() {
 
 # Before a reset: a container with an open session (another terminal) is only
 # removed after a yes on a terminal; anything else keeps it.
+# Removes container $1 and what runs on the host for it (cbox reset).
+_cbox_remove() {
+  local name="$1"
+  _cbox_step "Removing container '$name'..."
+  _cbox_mcp_relay_stop "$name"
+  _cbox_tunnel_stop "$name"
+  _cbox_warden_end "$name"
+  # The runtime echoes the removed name — "Removing …" already said it.
+  if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
+    $_CBOX_CMD rm -f "$name"
+  else
+    $_CBOX_CMD rm -f "$name" >/dev/null
+  fi
+}
+
 _cbox_reset_ask() {
   local name="$1" answer="" out=/dev/stdout
   _cbox_running "$name" || return 0
@@ -8090,16 +8153,7 @@ cbox() {
         _cbox_busy_end
         return 1
       fi
-      _cbox_step "Removing container '$reset_target'..."
-      _cbox_mcp_relay_stop "$reset_target"
-      _cbox_tunnel_stop "$reset_target"
-      _cbox_warden_end "$reset_target"
-      # The runtime echoes the removed name — "Removing …" already said it.
-      if [[ "${CBOX_VERBOSE:-0}" == "1" ]]; then
-        $_CBOX_CMD rm -f "$reset_target"
-      else
-        $_CBOX_CMD rm -f "$reset_target" >/dev/null
-      fi
+      _cbox_remove "$reset_target"
       _cbox_busy_end
       ;;
 

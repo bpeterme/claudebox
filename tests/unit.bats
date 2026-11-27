@@ -6006,3 +6006,83 @@ _pin_setup() {
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
+
+# Runs bash script $1 in a pseudo-terminal, typing $2; prints what it shows.
+_in_pty() {
+  python3 - "$1" "$2" <<'PY'
+import os, pty, sys
+script, answer = sys.argv[1], sys.argv[2]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp("bash", ["bash", script])
+os.write(fd, answer.encode())
+out = b""
+while True:
+    try:
+        d = os.read(fd, 1024)
+    except OSError:
+        break
+    if not d:
+        break
+    out += d
+os.waitpid(pid, 0)
+sys.stdout.write(out.decode(errors="replace"))
+PY
+}
+
+# A session start in pinproj, whose container has the account $1 (empty:
+# none), answering $2 when asked.
+_pin_ask() {
+  cat > "$BATS_TMPDIR/pin-ask.sh" <<SH
+source "$CBOX_SH"
+_cbox_rt_label() { case "\$2" in cbox.agent) echo claude ;; cbox.account) echo "$1" ;; esac; }
+_cbox_busy_hold() { return 1; }
+_cbox_reset_ask() { return 0; }
+_cbox_remove() { echo "REMOVED \$1"; }
+cd "$PROJ"
+_cbox_account_pin_ask pinproj && echo "RECREATE" || echo "KEEP"
+SH
+  _in_pty "$BATS_TMPDIR/pin-ask.sh" "$2"
+}
+
+@test "account pin: a changed .cbox asks at session start; yes recreates the container" {
+  _pin_setup
+  printf '[container]\n  account = work\n' > .cbox
+  run _pin_ask "" $'y\n'
+  [[ "$output" == *"pins the Claude account 'work' (this container uses the one of cbox account use)"* ]]
+  [[ "$output" == *"REMOVED pinproj"* ]]
+  [[ "$output" == *"RECREATE"* ]]
+  run _pin_ask "personal" $'\n'
+  [[ "$output" == *"uses 'personal'"* ]]
+  [[ "$output" == *"asks again at the next start"* ]]
+  [[ "$output" != *"REMOVED"* ]]
+  [[ "$output" == *"KEEP"* ]]
+  # Pin removed from .cbox: asks too.
+  command rm -f .cbox
+  run _pin_ask "work" $'y\n'
+  [[ "$output" == *"no longer pins an account"* ]]
+  [[ "$output" == *"RECREATE"* ]]
+}
+
+@test "account pin: no question when nothing changed, or the new account is not saved here" {
+  _pin_setup
+  printf '[container]\n  account = work\n' > .cbox
+  run _pin_ask "work" $'y\n'
+  [[ "$output" != *"Apply"* ]]
+  [[ "$output" == *"KEEP"* ]]
+  printf '[container]\n  account = client-a\n' > .cbox
+  run _pin_ask "work" $'y\n'
+  [[ "$output" == *"cbox account add client-a"* ]]
+  [[ "$output" == *"Keeping this container's account"* ]]
+  [[ "$output" != *"REMOVED"* ]]
+}
+
+@test "account pin: without a terminal, no question (the session start warns)" {
+  _pin_setup
+  printf '[container]\n  account = work\n' > .cbox
+  _cbox_rt_label() { case "$2" in cbox.agent) echo claude ;; esac; }
+  _cbox_remove() { echo "REMOVED"; }
+  run _cbox_account_pin_ask pinproj </dev/null
+  [ "$status" -eq 1 ]
+  [ -z "$output" ]
+}

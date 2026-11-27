@@ -298,7 +298,7 @@ A project can always use one account, whatever `cbox account use` says. In its `
   account = work
 ```
 
-- Takes effect when the container is created (`cbox reset`), like `ports`: code in the container can write `.cbox`, so a change there waits for you. The session start says which account a container uses, and when `.cbox` asks for another one.
+- After you add, change or remove the pin, the next `cbox` start asks whether to apply it; yes recreates the container (the project folder and Claude's data stay). You answer on the Mac, so code in the container that edits `.cbox` cannot switch accounts by itself. The session start says which account a container uses.
 - A machine without that account stops with what to do (`cbox account add work`). It never falls back to another account, which would bill the wrong subscription.
 - `cbox account` shows which projects pin an account; a pinned account cannot be removed.
 - A `/login` inside a pinned project changes that saved account (the session start names the new email). Use it to log in again with the same account, not to switch.

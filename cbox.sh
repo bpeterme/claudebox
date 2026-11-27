@@ -6195,18 +6195,21 @@ _cbox_accounts_dir() { echo "$CBOX_DATA_DIR/accounts"; }
 _cbox_account_names() {
   local d
   for d in "$(_cbox_accounts_dir)"/*/; do
-    [[ -f "$d.credentials.json" ]] && basename "$d"
+    d="${d%/}"
+    [[ -f "$d/.credentials.json" ]] && printf '%s\n' "${d##*/}"
   done
   return 0
 }
 
 # Prints the alias whose saved login is the file $1 (empty: none).
 _cbox_account_of() {
-  local f="$1" a
+  local f="$1" a names
   [[ -f "$f" ]] || return 0
+  # The whole list first: leaving a loop over a pipe early would break it.
+  names=$(_cbox_account_names)
   while IFS= read -r a; do
-    [[ "$f" -ef "$(_cbox_accounts_dir)/$a/.credentials.json" ]] && { echo "$a"; return 0; }
-  done < <(_cbox_account_names)
+    [[ -n "$a" && "$f" -ef "$(_cbox_accounts_dir)/$a/.credentials.json" ]] && { echo "$a"; return 0; }
+  done <<< "$names"
   return 0
 }
 

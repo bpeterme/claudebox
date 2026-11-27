@@ -289,6 +289,20 @@ cbox account                 # list; * = in use
 - Saved accounts are per machine: claudedot does not sync them (each machine's login is its own). Run `cbox account add` once per machine and account.
 - Without saved accounts, nothing changes.
 
+### One account per project
+
+A project can always use one account, whatever `cbox account use` says. In its `.cbox`:
+
+```ini
+[container]
+  account = work
+```
+
+- Takes effect when the container is created (`cbox reset`), like `ports`: code in the container can write `.cbox`, so a change there waits for you. The session start says which account a container uses, and when `.cbox` asks for another one.
+- A machine without that account stops with what to do (`cbox account add work`). It never falls back to another account, which would bill the wrong subscription.
+- `cbox account` shows which projects pin an account; a pinned account cannot be removed.
+- A `/login` inside a pinned project changes that saved account (the session start names the new email). Use it to log in again with the same account, not to switch.
+
 ## Container Image
 
 The image is based on Ubuntu 26.04 and includes:

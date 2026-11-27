@@ -5336,7 +5336,7 @@ SH
   printf '[container]\ncolour = blue\nports = 3000\n' > .cbox
   run _cbox_project_ports
   [ "$status" -eq 0 ]
-  [[ "$output" == *"unknown setting 'colour' in [container] ignored (known: ports, memory)"* ]]
+  [[ "$output" == *"unknown setting 'colour' in [container] ignored (known: ports, memory, account)"* ]]
   [[ "$output" == *"3000"* ]]
 }
 
@@ -5871,4 +5871,138 @@ _acct_login() {
   [ "$output" = "personal" ]
   run _cbox_complete
   [[ "$output" == *account* ]]
+}
+
+# --- account pins -----------------------------------------------------------
+
+# Saved accounts personal (in use) and work; a project folder to cd into.
+_pin_setup() {
+  _acct_setup
+  _cbox_account_cmd proj add personal >/dev/null
+  _acct_login w1 two@example.com
+  _cbox_account_cmd proj add work >/dev/null
+  _cbox_account_cmd proj use personal >/dev/null
+  PROJ="$BATS_TMPDIR/pinproj"
+  command rm -rf "$PROJ"; mkdir -p "$PROJ"
+  cd "$PROJ"
+}
+
+@test "account pin: .cbox account is parsed and checked" {
+  _pin_setup
+  printf '[container]\n  account = work\n' > .cbox
+  [ "$(_cbox_project_account)" = work ]
+  printf '[container]\n  account = ../x\n' > .cbox
+  run _cbox_project_settings
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"not an account name"* ]]
+}
+
+@test "account pin: a normal container gets the pinned login mounted, and a label" {
+  _pin_setup
+  printf '[container]\n  account = work\n' > .cbox
+  local capture="$BATS_TMPDIR/create-pin"
+  _CBOX_RUNTIME=docker
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  command rm -f "$capture"; _cbox_create pinproj normal
+  run cat "$capture"
+  [[ "$output" == *"cbox.account=work"* ]]
+  [[ "$output" == *"$AD/work/.credentials.json:/home/claude/.claude/.credentials.json"* ]]
+  # Without a pin: neither.
+  command rm -f .cbox "$capture"; _cbox_create pinproj normal
+  run cat "$capture"
+  [[ "$output" != *"cbox.account"* ]]
+  [[ "$output" != *"/home/claude/.claude/.credentials.json"* ]]
+}
+
+@test "account pin: a missing account stops the create with what to do" {
+  _pin_setup
+  printf '[container]\n  account = client-a\n' > .cbox
+  _CBOX_RUNTIME=docker
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { echo "ran"; }
+  run _cbox_create pinproj normal
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cbox account add client-a"* ]]
+  [[ "$output" != *"ran"* ]]
+}
+
+@test "account pin: a safe container links the pinned login, and keeps it after a switch" {
+  _pin_setup
+  local SD="$CBOX_DATA_DIR/safe-claude/sbox"
+  _cbox_safe_claude_dir sbox work
+  [ "$SD/.credentials.json" -ef "$AD/work/.credentials.json" ]
+  [ "$LOGIN" -ef "$AD/personal/.credentials.json" ]
+  _cbox_account_cmd proj use work >/dev/null
+  _cbox_account_cmd proj use personal >/dev/null
+  _cbox_safe_claude_dir sbox work
+  [ "$SD/.credentials.json" -ef "$AD/work/.credentials.json" ]
+}
+
+@test "account pin: session start names the account, records the pin, writes its oauthAccount" {
+  _pin_setup
+  printf '[container]\n  account = work\n' > .cbox
+  _cbox_rt_label() { [[ "$2" == cbox.account ]] && echo work; }
+  echo '{"oauthAccount":{"emailAddress":"one@example.com","accountUuid":"a1"}}' > "$CBOX_DATA_DIR/.claude-pinproj.json"
+  run _cbox_account_start pinproj
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Claude account: work (pinned in .cbox)"* ]]
+  [ "$(cat "$AD/.pins/pinproj")" = work ]
+  [ "$(jq -r .oauthAccount.emailAddress "$CBOX_DATA_DIR/.claude-pinproj.json")" = "two@example.com" ]
+  # cbox account use leaves the pinned project alone, and says so there.
+  run _cbox_account_cmd pinproj use work
+  run _cbox_account_cmd pinproj use personal
+  [[ "$output" == *"stays on 'work'"* ]]
+  [ "$(jq -r .oauthAccount.emailAddress "$CBOX_DATA_DIR/.claude-pinproj.json")" = "two@example.com" ]
+  [ "$(jq -r .oauthAccount.emailAddress "$CBOX_DATA_DIR/.claude-proj.json")" = "one@example.com" ]
+  # list and remove know the pin.
+  run _cbox_account_cmd proj list
+  [[ "$output" == *"pinned by: pinproj"* ]]
+  run _cbox_account_cmd proj remove work
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"pinned by: pinproj"* ]]
+}
+
+@test "account pin: a changed .cbox takes effect only at cbox reset" {
+  _pin_setup
+  printf '[container]\n  account = work\n' > .cbox
+  _cbox_rt_label() { :; }   # created without a pin
+  run _cbox_account_start pinproj
+  [[ "$output" == *"Claude account: personal"* ]]
+  [[ "$output" == *"cbox reset"* ]]
+  [ ! -e "$AD/.pins/pinproj" ]
+  # Pinned at create, pin removed from .cbox since: still pinned until reset.
+  command rm -f .cbox
+  _cbox_rt_label() { [[ "$2" == cbox.account ]] && echo work; }
+  run _cbox_account_start pinproj
+  [[ "$output" == *"Claude account: work (pinned"* ]]
+  [[ "$output" == *"cbox reset"* ]]
+}
+
+@test "account pin: session start stops when the pinned account is not saved here" {
+  _pin_setup
+  _cbox_rt_label() { [[ "$2" == cbox.account ]] && echo client-a; }
+  run _cbox_account_start pinproj
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cbox account add client-a"* ]]
+}
+
+@test "account pin: a /login in a pinned project renames the account, and says so" {
+  _pin_setup
+  _cbox_rt_label() { [[ "$2" == cbox.account ]] && echo work; }
+  echo '{"keep":1}' > "$CBOX_DATA_DIR/.claude-pinproj.json"
+  _cbox_account_start pinproj >/dev/null
+  # /login with another account in the container: the project file names it.
+  echo '{"oauthAccount":{"emailAddress":"three@example.com","accountUuid":"x3"}}' > "$CBOX_DATA_DIR/.claude-pinproj.json"
+  run _cbox_account_start pinproj
+  [[ "$output" == *"now three@example.com"* ]]
+  [ "$(jq -r .emailAddress "$AD/work/account.json")" = "three@example.com" ]
+}
+
+@test "account pin: without saved accounts or a pin, session start is silent" {
+  _acct_setup
+  _cbox_rt_label() { :; }
+  run _cbox_account_start proj
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
 }

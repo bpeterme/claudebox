@@ -1,6 +1,6 @@
 # Plan: switching Claude accounts (`cbox account`)
 
-Status: phase 1 (global accounts) built 2026-11-28 on dev; phase 2 (pins) next.
+Status: phases 1–3 built 2026-11-28 on dev. Not yet tried on a Mac: a single-file mount inside a mounted folder (pinned normal containers), and `/login` inside a pinned container.
 
 ## Goals
 
@@ -62,7 +62,9 @@ Saved accounts sit outside every folder a container mounts: a container can only
 ```
 
 - Parsed with the other `[container]` keys (`_cbox_project_settings`); a bad alias name is refused there.
-- Applied at create (the mount). A changed pin warns and resets the container, as a changed `ports =` does.
+- Applied at create (the mount, and the label `cbox.account`). Afterwards the label counts, not `.cbox`: the container can write `.cbox`, so a changed pin only warns ("cbox reset"), as a changed `ports =` does.
+- Each session start records the pin in `accounts/.pins/<container>`, so `use` (skips pinned projects' `oauthAccount`), `list` and `remove` know it without asking the runtime.
+- A `/login` inside a pinned container writes into the pinned account's file. The next session start notices (the project's `oauthAccount` names another account) and takes that account's `oauthAccount` into the saved one, saying so.
 - At session start: `account: work (pinned in .cbox)` or `account: personal (global)`.
 - `cbox account use` in a pinned project says so: "this project is pinned to work; other containers now use personal".
 - **Pin to an alias this Mac does not have: the session stops** with "run `cbox account add work`". A silent fallback would bill the wrong subscription.

@@ -1,6 +1,6 @@
 # Plan: switching Claude accounts (`cbox account`)
 
-Status: draft, 2026-11-27. Open questions answered 2026-11-28; nothing built yet.
+Status: phase 1 (global accounts) built 2026-11-28 on dev; phase 2 (pins) next.
 
 ## Goals
 
@@ -27,8 +27,9 @@ $CBOX_DATA_DIR/accounts/            (700)
   <alias>/
     .credentials.json               (600)  the only copy of this login
     account.json                           oauthAccount, saved at add
-  active                                   alias of the global default
 ```
+
+The global default is the alias whose file `$CBOX_CLAUDE_DIR/.credentials.json` is (same inode); there is no separate state file.
 
 Everything a container sees as `.credentials.json` is a hard link to, or a mount of, the alias's file. So a refresh in any container updates the one copy, and no copy goes stale.
 
@@ -47,8 +48,8 @@ Saved accounts sit outside every folder a container mounts: a container can only
 |---|---|
 | `cbox account add <alias>` | Saves the current login as `<alias>` and makes it the global default. Adding an alias again updates it (after a new `/login`). |
 | `cbox account use <alias>` | Makes `<alias>` the global default: re-points the global hard link, writes its `oauthAccount` into every `.claude-<name>.json` of projects without a pin. |
-| `cbox account list` | Alias, email, global default, token expiry, and which projects pin it. |
-| `cbox account remove <alias>` | Asks first. Refused while it is the global default or a pin of a known project. |
+| `cbox account list` | Alias, email, plan (max/pro), the global default; with pins: which projects pin it. |
+| `cbox account remove <alias>` | Asks first (terminal only). Refused while it is the global default; with pins also while a known project pins it. |
 
 - Adding a second account: `/login` inside a container with the other account, then `cbox account add <alias>`. **No `/logout` first**: it can revoke the token just saved.
 - Alias names: letters, digits, `.`, `_`, `-` (as MCP server names).

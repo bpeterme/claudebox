@@ -5678,3 +5678,196 @@ SH
   run git -C "$BATS_TEST_DIRNAME/.." ls-files -s cbox.sh
   [[ "$output" == 100755* ]]
 }
+
+# --- accounts -------------------------------------------------------------
+
+_acct_setup() {
+  LOGIN="$CBOX_CLAUDE_DIR/.credentials.json"
+  AD="$CBOX_DATA_DIR/accounts"
+  command rm -rf "$AD" "$CBOX_CLAUDE_DIR/.oauth_refresh.lock"
+  echo '{"claudeAiOauth":{"accessToken":"a1","subscriptionType":"max"}}' > "$LOGIN"
+  echo '{"oauthAccount":{"emailAddress":"one@example.com","accountUuid":"u1"},"keep":1}' \
+    > "$CBOX_DATA_DIR/.claude-proj.json"
+  echo '{"keep":2}' > "$CBOX_DATA_DIR/.claude-other.json"
+}
+
+# /login with another account in a container: Claude Code replaces the file.
+_acct_login() {
+  command rm -f "$LOGIN"
+  echo "{\"claudeAiOauth\":{\"accessToken\":\"$1\",\"subscriptionType\":\"pro\"}}" > "$LOGIN"
+  echo "{\"oauthAccount\":{\"emailAddress\":\"$2\",\"accountUuid\":\"$1\"},\"keep\":1}" \
+    > "$CBOX_DATA_DIR/.claude-proj.json"
+}
+
+@test "account: without saved accounts nothing changes" {
+  _acct_setup
+  run _cbox_account_cmd proj
+  [[ "$output" == *"No saved accounts"* ]]
+  run _cbox_account_check
+  [ -z "$output" ]
+  [ ! -e "$AD" ]
+}
+
+@test "account add: the saved login is the login in use (one file), with its oauthAccount" {
+  _acct_setup
+  run _cbox_account_cmd proj add personal
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"'personal' (one@example.com)"* ]]
+  [ "$AD/personal/.credentials.json" -ef "$LOGIN" ]
+  [ "$(stat -c %a "$AD" 2>/dev/null || stat -f %Lp "$AD")" = 700 ]
+  [ "$(stat -c %a "$LOGIN" 2>/dev/null || stat -f %Lp "$LOGIN")" = 600 ]
+  [ "$(jq -r .emailAddress "$AD/personal/account.json")" = "one@example.com" ]
+  # A refresh in a container (in place) updates the saved account.
+  echo '{"claudeAiOauth":{"accessToken":"a2"}}' > "$LOGIN"
+  [ "$(jq -r .claudeAiOauth.accessToken "$AD/personal/.credentials.json")" = "a2" ]
+}
+
+@test "account add: one login cannot be saved under two names; adding an alias again updates it" {
+  _acct_setup
+  _cbox_account_cmd proj add personal >/dev/null
+  run _cbox_account_cmd proj add work
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"already saved as 'personal'"* ]]
+  [ ! -e "$AD/work" ]
+  run _cbox_account_cmd proj add personal
+  [ "$status" -eq 0 ]
+  _acct_login a9 one@example.com   # the same account, logged in again
+  _cbox_account_cmd proj add personal >/dev/null
+  [ "$AD/personal/.credentials.json" -ef "$LOGIN" ]
+  [ "$(jq -r .claudeAiOauth.accessToken "$AD/personal/.credentials.json")" = "a9" ]
+}
+
+@test "account add: outside the project, the most recently changed project names the account" {
+  _acct_setup
+  echo '{"oauthAccount":{"emailAddress":"old@example.com"}}' > "$CBOX_DATA_DIR/.claude-aaa.json"
+  touch -t 200001010000 "$CBOX_DATA_DIR/.claude-aaa.json"
+  run _cbox_account_cmd elsewhere add personal
+  [[ "$output" == *"(one@example.com)"* ]]
+}
+
+@test "account add: no login, or a bad name, is refused" {
+  _acct_setup
+  run _cbox_account_cmd proj add ../x
+  [ "$status" -eq 1 ]
+  command rm -f "$LOGIN"
+  run _cbox_account_cmd proj add personal
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"/login"* ]]
+}
+
+@test "account use: switches the login of all containers and every project's oauthAccount" {
+  _acct_setup
+  _cbox_account_cmd proj add personal >/dev/null
+  _acct_login w1 two@example.com
+  _cbox_account_cmd proj add work >/dev/null
+  run _cbox_account_cmd proj use personal
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"now use 'personal' (one@example.com)"* ]]
+  [ "$LOGIN" -ef "$AD/personal/.credentials.json" ]
+  [ "$(jq -r .oauthAccount.emailAddress "$CBOX_DATA_DIR/.claude-proj.json")" = "one@example.com" ]
+  [ "$(jq -r .oauthAccount.emailAddress "$CBOX_DATA_DIR/.claude-other.json")" = "one@example.com" ]
+  [ "$(jq -r .keep "$CBOX_DATA_DIR/.claude-other.json")" = 2 ]
+  # The saved work login is untouched, and the lock is released.
+  [ "$(jq -r .claudeAiOauth.accessToken "$AD/work/.credentials.json")" = "w1" ]
+  [ ! -e "$CBOX_CLAUDE_DIR/.oauth_refresh.lock" ]
+  [ ! -e "$LOGIN.cbox-tmp" ]
+  run _cbox_account_cmd proj use personal
+  [[ "$output" == *"already use 'personal'"* ]]
+  run _cbox_account_cmd proj list
+  [[ "${lines[0]}" == "* personal"*"one@example.com"*"max" ]]
+  [[ "${lines[1]}" == "  work"*"two@example.com"*"pro"* ]]
+}
+
+@test "account use: a login that is not saved is not thrown away" {
+  _acct_setup
+  _cbox_account_cmd proj add personal >/dev/null
+  _acct_login n1 new@example.com
+  run _cbox_account_cmd proj use personal
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"not saved"* ]]
+  [ "$(jq -r .claudeAiOauth.accessToken "$LOGIN")" = "n1" ]
+  run _cbox_account_check
+  [[ "$output" == *"New Claude login found"* ]]
+  run _cbox_account_cmd proj list
+  [[ "$output" == *"not saved"* ]]
+}
+
+@test "account use: unknown name lists the saved ones" {
+  _acct_setup
+  _cbox_account_cmd proj add personal >/dev/null
+  run _cbox_account_cmd proj use nope
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Saved: personal"* ]]
+}
+
+@test "account use: waits for Claude Code's refresh lock, takes over a stale one" {
+  _acct_setup
+  _cbox_account_cmd proj add personal >/dev/null
+  _acct_login w1 two@example.com
+  _cbox_account_cmd proj add work >/dev/null
+  mkdir "$CBOX_CLAUDE_DIR/.oauth_refresh.lock"
+  ( sleep 2; rmdir "$CBOX_CLAUDE_DIR/.oauth_refresh.lock" ) &
+  local start=$SECONDS
+  run _cbox_account_cmd proj use personal
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"waiting"* ]]
+  (( SECONDS - start >= 2 ))
+  mkdir "$CBOX_CLAUDE_DIR/.oauth_refresh.lock"
+  touch -t 200001010000 "$CBOX_CLAUDE_DIR/.oauth_refresh.lock"
+  run _cbox_account_cmd proj use work
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"waiting"* ]]
+  [ "$LOGIN" -ef "$AD/work/.credentials.json" ]
+  [ ! -e "$CBOX_CLAUDE_DIR/.oauth_refresh.lock" ]
+}
+
+@test "account: another disk is refused with a hint, nothing half-done" {
+  _acct_setup
+  ln() { return 1; }
+  run _cbox_account_cmd proj add personal
+  unset -f ln
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"same disk"* ]]
+  [ ! -e "$AD/personal" ]
+}
+
+@test "account use: a safe container follows the switch, not its newer old login" {
+  _acct_setup
+  SD="$CBOX_DATA_DIR/safe-claude/sbox"
+  _cbox_account_cmd proj add personal >/dev/null
+  _acct_login w1 two@example.com
+  _cbox_account_cmd proj add work >/dev/null
+  _cbox_safe_claude_dir sbox
+  [ "$SD/.credentials.json" -ef "$AD/work/.credentials.json" ]
+  _cbox_account_cmd proj use personal >/dev/null
+  # The safe session refreshed work's token meanwhile: newer than personal's.
+  touch -t 200001010000 "$AD/personal/.credentials.json"
+  _cbox_safe_claude_dir sbox
+  [ "$SD/.credentials.json" -ef "$AD/personal/.credentials.json" ]
+  [ "$LOGIN" -ef "$AD/personal/.credentials.json" ]
+}
+
+@test "account remove: not the one in use; asks in a terminal only" {
+  _acct_setup
+  _cbox_account_cmd proj add personal >/dev/null
+  _acct_login w1 two@example.com
+  _cbox_account_cmd proj add work >/dev/null
+  run _cbox_account_cmd proj remove work
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"in use"* ]]
+  run _cbox_account_cmd proj remove personal < /dev/null
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"terminal"* ]]
+  [ -f "$AD/personal/.credentials.json" ]
+}
+
+@test "account: completions offer subcommands and saved names" {
+  _acct_setup
+  _cbox_account_cmd proj add personal >/dev/null
+  run _cbox_complete account
+  [[ "$output" == *use* && "$output" == *remove* ]]
+  run _cbox_complete account use
+  [ "$output" = "personal" ]
+  run _cbox_complete
+  [[ "$output" == *account* ]]
+}

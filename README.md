@@ -119,6 +119,7 @@ cbox oc safe   # opencode in safe mode
 | `cbox doctor` | Run environment diagnostics: where your settings, data and logs are, companion tool status and, on macOS, whether Apple container is up to date |
 | `cbox mcp` | Show host MCP servers and relay status |
 | `cbox mcp import` | Import MCP servers from Claude Desktop / Claude Code on the host |
+| `cbox account` | List saved Claude accounts; `add <name>`, `use <name>`, `remove <name>` (see [Several Claude accounts](#several-claude-accounts)) |
 | `cbox warden` | List credential resources (APIs, storage, ssh keys, MCP servers, WhatsApp chats, mail groups) and what this project gets (see [Credentials (warden)](#credentials-warden)) |
 | `cbox warden edit` | Define resources the container may use |
 | `cbox warden secret set <resource>` | Store a resource's secret in the macOS Keychain (Linux: keyring) |
@@ -268,6 +269,25 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 > **Do not place `CBOX_CLAUDE_DIR` (default `~/.config/claudebox/.claude`) or your project directories on iCloud Drive, Dropbox Smart Sync, Google Drive Stream, or any on-demand cloud storage.** These services evict file contents to stubs when not recently accessed. A container mounting an evicted path will fail to read files that appear to exist on disk — a subtle failure that is hard to diagnose.
 >
 > **Do not use continuous sync tools (Syncthing, rsync daemons, etc.) on `CBOX_CLAUDE_DIR`.** They can write into the directory while Claude is actively appending to a conversation file, risking corruption or lost writes. If you need to sync it across machines, use [claudedot](https://github.com/bpeterme/claudedot) — it only touches the directory at explicit session boundaries.
+
+## Several Claude accounts
+
+With more than one Claude subscription, save each login once and switch all containers with one command:
+
+```bash
+cbox account add personal    # saves the login containers use now
+# in cbox: /login with the other account (no /logout first: it can revoke the saved login)
+cbox account add work
+cbox account use personal    # all containers switch
+cbox account                 # list; * = in use
+```
+
+- Running sessions switch with their next message; safe sessions when they start again.
+- Each account is one file in `$CBOX_DATA_DIR/accounts/<name>/`; the login containers use is a hard link to it, so a token refresh in any container keeps the saved account current. Saved accounts are outside every folder a container mounts.
+- `$CBOX_DATA_DIR` and `$CBOX_CLAUDE_DIR` must be on the same disk.
+- A `/login` since the last `cbox account add` is not overwritten: `cbox account use` refuses until you save it, and cbox mentions it when a session starts.
+- Saved accounts are per machine: claudedot does not sync them (each machine's login is its own). Run `cbox account add` once per machine and account.
+- Without saved accounts, nothing changes.
 
 ## Container Image
 

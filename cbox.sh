@@ -95,6 +95,12 @@ MCP servers on the host ($(_cbox_shown "$CBOX_MCP_CONFIG")):
   cbox mcp                            Show configured host MCP servers and relay status
   cbox mcp import                     Import servers from Claude Desktop / Claude Code
 
+Claude accounts (several subscriptions):
+  cbox account                        List saved accounts (* = in use)
+  cbox account add <name>             Save the current login as <name>
+  cbox account use <name>             Switch all containers to <name>
+  cbox account remove <name>          Delete a saved account
+
 Credentials without exposing them (warden):
   cbox warden                         List resources and what this project gets
   cbox warden edit                    Define resources (APIs, storage, ssh keys, MCP servers)
@@ -6153,8 +6159,9 @@ _cbox_safe_claude_dir() {
   local s="$src/.credentials.json" l="$dir/.credentials.json"
   [[ -L "$s" || -L "$l" ]] && return 0  # Claude Code would not open it anyway
   if [[ -f "$s" && ! "$s" -ef "$l" ]]; then
-    # A login made in this safe container since (it replaced its file) wins.
-    if [[ -f "$l" && "$l" -nt "$s" ]]; then
+    # A login made in this safe container since (it replaced its file) wins;
+    # a saved account is none (cbox account use switched away from it).
+    if [[ -f "$l" && "$l" -nt "$s" && -z "$(_cbox_account_of "$l")" ]]; then
       ln -f "$l" "$s" 2>/dev/null && return 0
     elif ln -f "$s" "$l" 2>/dev/null; then
       return 0
@@ -6168,6 +6175,256 @@ _cbox_safe_claude_dir() {
   return 0
 }
 
+
+# ---------------------------------------------------------
+# accounts: several Claude logins, one in use (cbox account)
+# ---------------------------------------------------------
+# $CBOX_DATA_DIR/accounts/<alias>/.credentials.json is the only copy of a
+# login; the login containers use ($CBOX_CLAUDE_DIR/.credentials.json) is a
+# hard link to one of them. Claude Code rewrites the file in place when it
+# refreshes the token (refresh tokens rotate: a second copy would go stale), so
+# the saved account stays current. The account in use is the one whose file
+# that is; no other state. account.json keeps the account's oauthAccount
+# (Claude Code reads its org and account IDs from each project's
+# ~/.claude.json), written into every .claude-<name>.json at a switch.
+# Without saved accounts, nothing here runs.
+
+_cbox_accounts_dir() { echo "$CBOX_DATA_DIR/accounts"; }
+
+# Prints the saved aliases, one per line.
+_cbox_account_names() {
+  local d
+  for d in "$(_cbox_accounts_dir)"/*/; do
+    [[ -f "$d.credentials.json" ]] && basename "$d"
+  done
+  return 0
+}
+
+# Prints the alias whose saved login is the file $1 (empty: none).
+_cbox_account_of() {
+  local f="$1" a
+  [[ -f "$f" ]] || return 0
+  while IFS= read -r a; do
+    [[ "$f" -ef "$(_cbox_accounts_dir)/$a/.credentials.json" ]] && { echo "$a"; return 0; }
+  done < <(_cbox_account_names)
+  return 0
+}
+
+_cbox_account_valid_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && return 0
+  echo "✘ '$1' cannot be an account name: use letters, digits, '.', '_' and '-'." >&2
+  return 1
+}
+
+_cbox_account_py() {
+  cat <<'PYEOF'
+import glob, json, os, sys
+
+def load(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+cmd = sys.argv[1]
+if cmd == "get":
+    # The oauthAccount of the first project file that has one.
+    for path in sys.argv[2:]:
+        acct = load(path).get("oauthAccount")
+        if isinstance(acct, dict) and acct:
+            print(json.dumps(acct))
+            break
+elif cmd == "set":
+    # Writes the saved oauthAccount into every project file, in place: each
+    # is mounted into its container as a single file, a rename would not reach it.
+    acct = load(sys.argv[2])
+    if acct:
+        for path in sys.argv[3:]:
+            data = load(path)
+            if not data or data.get("oauthAccount") == acct:
+                continue
+            data["oauthAccount"] = acct
+            with open(path, "w") as f:
+                json.dump(data, f)
+elif cmd == "show":
+    # email<TAB>plan of a saved account.
+    d = sys.argv[2]
+    acct = load(os.path.join(d, "account.json"))
+    cred = load(os.path.join(d, ".credentials.json")).get("claudeAiOauth") or {}
+    print(f"{acct.get('emailAddress', '')}\t{cred.get('subscriptionType', '') or ''}")
+PYEOF
+}
+
+# Project files (~/.claude.json of each container): the current project's
+# first, then the most recently changed (where a /login just happened).
+_cbox_account_project_files() {
+  local own="$CBOX_DATA_DIR/.claude-$1.json" f
+  [[ -f "$own" ]] && echo "$own"
+  while IFS= read -r f; do
+    [[ -f "$f" && "$f" != "$own" ]] && echo "$f"
+  done < <(ls -t "$CBOX_DATA_DIR"/.claude-*.json 2>/dev/null)
+  return 0
+}
+
+# Claude Code's refresh lock, a folder in the Claude folder (kept fresh every
+# 5 s, stale after 60 s). Holding it, a switch cannot meet a refresh halfway:
+# Claude Code re-reads the login under the lock and keeps what it finds.
+_cbox_account_lock() {
+  local lock="$CBOX_CLAUDE_DIR/.oauth_refresh.lock" i said=""
+  for (( i = 0; i < 70; i++ )); do
+    mkdir "$lock" 2>/dev/null && return 0
+    if [[ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+      rm -rf "$lock"; continue  # left by a session that ended mid-refresh
+    fi
+    [[ -n "$said" ]] || { echo "ℹ  Claude is refreshing its login, waiting..."; said=1; }
+    sleep 1
+  done
+  echo "✘ Claude's login stayed locked ($(_cbox_shown "$lock")). Try again in a minute." >&2
+  return 1
+}
+
+_cbox_account_unlock() { rm -rf "$CBOX_CLAUDE_DIR/.oauth_refresh.lock"; }
+
+_cbox_account_disk_hint() {
+  echo "✘ Saved accounts must be on the same disk as Claude's folder:" >&2
+  echo "   $(_cbox_shown "$(_cbox_accounts_dir)") and $(_cbox_shown "$CBOX_CLAUDE_DIR")" >&2
+  echo "   Set CBOX_DATA_DIR or CBOX_CLAUDE_DIR in $(_cbox_shown "$_CBOX_ENV_FILE") so they are." >&2
+}
+
+_cbox_account_add() {
+  local alias="${1:-}" name="$2" login="$CBOX_CLAUDE_DIR/.credentials.json" dir other acct
+  [[ -n "$alias" ]] || { echo "Usage: cbox account add <name>" >&2; return 1; }
+  _cbox_account_valid_name "$alias" || return 1
+  if [[ ! -f "$login" ]]; then
+    echo "✘ No login to save: start cbox, run /login, then cbox account add $alias." >&2
+    return 1
+  fi
+  other=$(_cbox_account_of "$login")
+  if [[ -n "$other" && "$other" != "$alias" ]]; then
+    echo "✘ This login is already saved as '$other'." >&2
+    echo "   For another account: in cbox, run /login with it (no /logout first), then cbox account add $alias." >&2
+    return 1
+  fi
+  dir="$(_cbox_accounts_dir)/$alias"
+  mkdir -p "$dir"
+  chmod 700 "$(_cbox_accounts_dir)" "$dir"
+  if [[ "$other" != "$alias" ]] && ! ln -f "$login" "$dir/.credentials.json" 2>/dev/null; then
+    [[ -f "$dir/.credentials.json" ]] || rmdir "$dir" 2>/dev/null
+    _cbox_account_disk_hint
+    return 1
+  fi
+  chmod 600 "$dir/.credentials.json"
+  local files=() f
+  while IFS= read -r f; do files+=("$f"); done < <(_cbox_account_project_files "$name")
+  acct=$(python3 -c "$(_cbox_account_py)" get ${files[@]+"${files[@]}"})
+  [[ -n "$acct" ]] && printf '%s\n' "$acct" > "$dir/account.json"
+  local email
+  email=$(python3 -c "$(_cbox_account_py)" show "$dir" | cut -f1)
+  echo "✔ Saved the current login as '$alias'${email:+ ($email)}. All containers use it."
+  echo "  To add another account: in cbox, run /login with it (no /logout first), then cbox account add <name>."
+}
+
+_cbox_account_use() {
+  local alias="${1:-}" name="$2" login="$CBOX_CLAUDE_DIR/.credentials.json" saved current
+  [[ -n "$alias" ]] || { echo "Usage: cbox account use <name>" >&2; return 1; }
+  saved="$(_cbox_accounts_dir)/$alias/.credentials.json"
+  if [[ ! -f "$saved" ]]; then
+    echo "✘ No saved account '$alias'. Saved: $(_cbox_account_names | paste -sd, - | sed 's/,/, /g')" >&2
+    return 1
+  fi
+  current=$(_cbox_account_of "$login")
+  if [[ "$current" == "$alias" ]]; then
+    echo "All containers already use '$alias'."
+    return 0
+  fi
+  if [[ -f "$login" && -z "$current" ]]; then
+    echo "✘ The current login is not saved, a switch would lose it (a /login since the last cbox account add?)." >&2
+    echo "   Save it first: cbox account add <name>" >&2
+    return 1
+  fi
+  _cbox_account_lock || return 1
+  # Link to a temporary name, then rename: the login is never missing.
+  if ! ln -f "$saved" "$login.cbox-tmp" 2>/dev/null; then
+    _cbox_account_unlock
+    _cbox_account_disk_hint
+    return 1
+  fi
+  mv -f "$login.cbox-tmp" "$login"
+  _cbox_account_unlock
+  local files=() f
+  while IFS= read -r f; do files+=("$f"); done < <(_cbox_account_project_files "$name")
+  [[ -f "${saved%/*}/account.json" ]] &&
+    python3 -c "$(_cbox_account_py)" set "${saved%/*}/account.json" ${files[@]+"${files[@]}"}
+  local email
+  email=$(python3 -c "$(_cbox_account_py)" show "${saved%/*}" | cut -f1)
+  echo "✔ All containers now use '$alias'${email:+ ($email)}."
+  echo "  Running sessions switch with their next message; safe sessions when they start again."
+}
+
+_cbox_account_list() {
+  local login="$CBOX_CLAUDE_DIR/.credentials.json" current a info mark any=""
+  current=$(_cbox_account_of "$login")
+  while IFS= read -r a; do
+    any=1
+    info=$(python3 -c "$(_cbox_account_py)" show "$(_cbox_accounts_dir)/$a")
+    mark=" "; [[ "$a" == "$current" ]] && mark="*"
+    printf '%s %-14s %-32s %s\n' "$mark" "$a" "${info%%$'\t'*}" "${info#*$'\t'}"
+  done < <(_cbox_account_names)
+  if [[ -z "$any" ]]; then
+    echo "No saved accounts. Save the current login: cbox account add <name>"
+  elif [[ -f "$login" && -z "$current" ]]; then
+    echo "⚠  The current login is not saved (a /login since?). Save it: cbox account add <name>"
+  else
+    echo "(* = in use by all containers)"
+  fi
+}
+
+_cbox_account_remove() {
+  local alias="${1:-}" dir answer=""
+  [[ -n "$alias" ]] || { echo "Usage: cbox account remove <name>" >&2; return 1; }
+  _cbox_account_valid_name "$alias" || return 1
+  dir="$(_cbox_accounts_dir)/$alias"
+  [[ -f "$dir/.credentials.json" ]] || { echo "✘ No saved account '$alias'." >&2; return 1; }
+  if [[ "$(_cbox_account_of "$CBOX_CLAUDE_DIR/.credentials.json")" == "$alias" ]]; then
+    echo "✘ '$alias' is in use. Switch first: cbox account use <name>" >&2
+    return 1
+  fi
+  if [[ ! -t 0 ]]; then
+    echo "✘ Run cbox account remove in a terminal to confirm." >&2
+    return 1
+  fi
+  printf "Remove the saved account '%s'? Its login is gone for cbox afterwards. [y/N] " "$alias"
+  read -r answer || answer=""
+  [[ "$answer" == [yY]* ]] || return 1
+  rm -rf "${dir:?}"
+  echo "✔ Removed '$alias'."
+}
+
+# At session start: a login that is none of the saved accounts came from a
+# /login since. Say so, so it can be saved before a switch.
+_cbox_account_check() {
+  local login="$CBOX_CLAUDE_DIR/.credentials.json"
+  [[ -n "$(_cbox_account_names)" && -f "$login" ]] || return 0
+  [[ -n "$(_cbox_account_of "$login")" ]] && return 0
+  echo "ℹ  New Claude login found, not among your saved accounts. Save it: cbox account add <name>"
+}
+
+_cbox_account_cmd() {
+  local name="$1"; shift
+  case "${1:-}" in
+    ""|list) _cbox_account_list ;;
+    add)     _cbox_account_add "${2:-}" "$name" ;;
+    use)     _cbox_account_use "${2:-}" "$name" ;;
+    remove)  _cbox_account_remove "${2:-}" ;;
+    *)
+      echo "Unknown account command: $1"
+      echo "Usage: cbox account [list|add <name>|use <name>|remove <name>]"
+      return 1
+      ;;
+  esac
+}
 # Folder names listed in CBOX_SHARE_CONFIG, one per line (zsh does not split
 # an unquoted variable, so no word splitting here).
 _cbox_shared_config_names() {
@@ -7292,6 +7549,7 @@ _cbox_enter() {
   fi
 
   if [[ "$agent_bin" == "claude" ]]; then
+    _cbox_account_check
     [[ "$mode" != "safe" ]] && _cbox_mcp_relay_start "$name"
     _cbox_generate_claude_json "$name" "$mode" "$_warden_mcp"
     # Mail wakes the idle agent: hooks of cbox's own settings file, next to
@@ -7746,6 +8004,11 @@ cbox() {
       _cbox_warden_cmd "$@"
       ;;
 
+    account)
+      shift
+      _cbox_account_cmd "$name" "$@"
+      ;;
+
     _doctor)
       _cbox_doctor_inline
       ;;
@@ -7861,10 +8124,12 @@ _cbox_complete() {
   case "$*" in
     "")
       printf '%s\n' -v --verbose safe shell keepalive oc opencode list stop reset \
-        prune rebuild update doctor mcp warden version help
+        prune rebuild update doctor mcp warden account version help
       ;;
     stop|reset)                     _cbox_system_down || _cbox_list_names ;;
     mcp)                            printf '%s\n' list import ;;
+    account)                        printf '%s\n' list add use remove ;;
+    "account use"|"account remove") _cbox_account_names ;;
     warden)                         printf '%s\n' list edit secret approve test whatsapp mail log ;;
     "warden secret")                echo set ;;
     "warden secret set"|"warden test") _cbox_warden_python names "$CBOX_WARDEN_DIR" 2>/dev/null ;;

@@ -5774,6 +5774,7 @@ _acct_login() {
   run _cbox_account_cmd proj use personal
   [[ "$output" == *"already use 'personal'"* ]]
   run _cbox_account_cmd proj list
+  printf '%s\n' "$output"   # shown when the test fails
   [[ "${lines[0]}" == "* personal"*"one@example.com"*"max" ]]
   [[ "${lines[1]}" == "  work"*"two@example.com"*"pro"* ]]
 }

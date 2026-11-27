@@ -6364,13 +6364,13 @@ _cbox_account_use() {
 }
 
 _cbox_account_list() {
-  local login="$CBOX_CLAUDE_DIR/.credentials.json" current a info mark any=""
+  local login="$CBOX_CLAUDE_DIR/.credentials.json" current a email plan mark any=""
   current=$(_cbox_account_of "$login")
   while IFS= read -r a; do
     any=1
-    info=$(python3 -c "$(_cbox_account_py)" show "$(_cbox_accounts_dir)/$a")
+    IFS=$'\t' read -r email plan < <(python3 -c "$(_cbox_account_py)" show "$(_cbox_accounts_dir)/$a")
     mark=" "; [[ "$a" == "$current" ]] && mark="*"
-    printf '%s %-14s %-32s %s\n' "$mark" "$a" "${info%%$'\t'*}" "${info#*$'\t'}"
+    printf '%s %-14s %-32s %s\n' "$mark" "$a" "$email" "$plan"
   done < <(_cbox_account_names)
   if [[ -z "$any" ]]; then
     echo "No saved accounts. Save the current login: cbox account add <name>"

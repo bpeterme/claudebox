@@ -1,6 +1,6 @@
 # Plan: switching Claude accounts (`cbox account`)
 
-Status: draft, 2026-11-27. Nothing built yet.
+Status: draft, 2026-11-27. Open questions answered 2026-11-28; nothing built yet.
 
 ## Goals
 
@@ -85,18 +85,17 @@ Saved accounts sit outside every folder a container mounts: a container can only
 - Hard links need `$CBOX_DATA_DIR` and `$CBOX_CLAUDE_DIR` on one disk. Otherwise: the same warning safe mode prints today, and `cbox account` refuses to start.
 - Safe containers switch at their next session start (their hard link is fixed while they run). Normal containers switch on their next message.
 
-## Open questions
+## Answered questions
 
-1. **Single-file mounts in Apple's `container`:** does `-v <file>:<file>` work, and does an in-place rewrite inside reach the host file? Test on the Mac (10 minutes). If not: a pinned normal container gets its own `~/.claude` of links, as safe mode does (`_cbox_safe_claude_dir`).
-2. **Claude Code's credential lock:** does it lock `.credentials.json` during a refresh, and can `cbox account use` take that lock? Otherwise a switch during a refresh can lose the rotated token.
-3. **Is `oauthAccount` needed for anything but display?** If Claude Code rebuilds it from the token, step 2 can skip writing `.claude-<name>.json`.
+1. ~~**Single-file mounts in Apple's `container`**~~ — **answered 2026-11-28: yes.** `-v <file>:<file>` works, and an in-place write inside the container reaches the host file. Pinned normal containers use the mount. (A write by rename would fail on a mounted file; Claude Code rewrites in place, which safe mode's hard link already relies on.)
+2. ~~**Claude Code's credential lock**~~ — **answered 2026-11-28 (Claude Code's bundle): yes.** A refresh holds the lock folder `.oauth_refresh.lock` in the Claude folder (refreshed every 5 s, stale after 60 s), plus a legacy `<folder>.lock` next to it. Under the lock it re-reads `.credentials.json` and gives up its refresh if the access token there changed. It writes the file in place (`O_TRUNC`). So `cbox account use` takes `$CBOX_CLAUDE_DIR/.oauth_refresh.lock` (an atomic `mkdir`, waiting while a fresh one exists), switches, removes it. A session that still holds the old account's token then picks up the new file instead of writing the old login into it. Safe containers lock in their own folder; the lock only matters for the global login, which normal containers share.
+3. ~~**Is `oauthAccount` needed for anything but display?**~~ — **answered 2026-11-28: yes, keep writing it.** Claude Code reads `organizationUuid` and `accountUuid` from it in many places (org-specific behavior, not only the name), and updates it by itself only when `accountUuid` matches the cached one. A stale entry after a switch would describe the wrong account.
 
 ## Phases
 
-1. **Spike** (open questions 1–3), ~1 hour, on the Mac.
-2. **Global accounts:** `add`, `use`, `list`, `remove`, link-break check, safe-mode links. ~½ day incl. bats tests.
-3. **Pins:** `.cbox` key, mount or link folder, start message, reset on change, missing-alias stop. ~1 day incl. tests.
-4. **Docs:** README section, `cbox --help`.
+1. **Global accounts:** `add`, `use`, `list`, `remove`, link-break check, safe-mode links. ~½ day incl. bats tests.
+2. **Pins:** `.cbox` key, single-file mount, start message, reset on change, missing-alias stop. ~1 day incl. tests.
+3. **Docs:** README section, `cbox --help`.
 
 ## Tests (bats)
 

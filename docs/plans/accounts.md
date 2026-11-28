@@ -1,6 +1,6 @@
 # Plan: switching Claude accounts (`cbox account`)
 
-Status: phases 1–3 built 2026-11-28 on dev. Not yet tried on a Mac: a single-file mount inside a mounted folder (pinned normal containers), and `/login` inside a pinned container.
+Status: phases 1–3 built 2026-11-28 on dev. Verified on a Mac 2026-11-28: a single-file mount inside a mounted folder (pinned normal containers) reads the file and writes in place. Not yet tried: `/login` inside a pinned container.
 
 ## Goals
 

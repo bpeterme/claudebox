@@ -1,6 +1,6 @@
 # Plan: switching Claude accounts (`cbox account`)
 
-Status: rebuilt 2026-11-28 on dev with long-lived tokens (design below). The first design (hard-linked login files, a single-file mount per pinned container) was dropped after a Mac test; see "Why not shared login files".
+Status: rebuilt 2026-11-28 on dev with long-lived tokens (design below); verified on a Mac the same day: pin, default switch, and billing to the right subscription. The first design (hard-linked login files, a single-file mount per pinned container) was dropped after a Mac test; see "Why not shared login files".
 
 ## Goals
 

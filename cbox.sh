@@ -77,6 +77,8 @@ Agent:
 
 Options:
   -v, --verbose                       Show full output (updates, sync, MCP relay status)
+  --awake, --no-awake                 Keep this computer awake during the session, or not
+                                      (default: CBOX_AWAKE in cbox.env)
 
 Container Management:
   cbox list                           List cbox containers
@@ -928,6 +930,86 @@ _cbox_audio_stop() {
   echo "Stopping PulseAudio..."
   pulseaudio --kill 2>/dev/null || true
   rm -f "$dir/started-by-cbox"
+}
+
+# ---------------------------------------------------------
+# awake (CBOX_AWAKE)
+# ---------------------------------------------------------
+
+# Where Linux lists its power supplies (a variable for the tests).
+_CBOX_POWER_SUPPLY_DIR="${_CBOX_POWER_SUPPLY_DIR:-/sys/class/power_supply}"
+
+# Returns 0 on mains power, 1 on battery. A computer without a battery (a
+# desktop, a server) is on mains power. Batteries of devices (a mouse, a
+# keyboard: scope Device) do not count.
+_cbox_on_ac() {
+  local d battery=0
+  while IFS= read -r d; do
+    case "$(cat "$d/type" 2>/dev/null)" in
+      Mains|USB) [[ "$(cat "$d/online" 2>/dev/null)" == "1" ]] && return 0 ;;
+      Battery) [[ "$(cat "$d/scope" 2>/dev/null)" == "Device" ]] || battery=1 ;;
+    esac
+  done < <(find "$_CBOX_POWER_SUPPLY_DIR" -mindepth 1 -maxdepth 1 2>/dev/null)
+  (( ! battery ))
+}
+
+# Keeps this computer from sleeping during the session (CBOX_AWAKE=1, or ac:
+# only on mains power). One helper per session, watching the cbox process
+# ($$): it ends by itself when cbox does, even when cbox is killed. Sets
+# _CBOX_AWAKE_PID, for _cbox_awake_stop. Linux checks the power source once,
+# here: unplugging during the session keeps it awake until the session ends.
+_cbox_awake_start() {
+  _CBOX_AWAKE_PID=""
+  local want="${CBOX_AWAKE:-0}"
+  case "$want" in
+    0|"") return 0 ;;
+    1|ac) ;;
+    *) echo "⚠  CBOX_AWAKE=$want is not 0, 1 or ac: this computer may sleep during the session"
+       return 0 ;;
+  esac
+  if [[ "$_CBOX_RUNTIME" == "apple" ]]; then
+    # -i: no idle sleep. -s: no sleep at all, on mains power only — macOS
+    # drops it on battery and takes it up again when plugged back in.
+    local flag=-i
+    [[ "$want" == "ac" ]] && flag=-s
+    caffeinate "$flag" -w $$ >/dev/null 2>&1 </dev/null &
+    _CBOX_AWAKE_PID=$!
+  else
+    if _cbox_on_wsl; then
+      echo "ℹ  CBOX_AWAKE has no effect on WSL: Windows decides when this computer sleeps"
+      return 0
+    fi
+    if ! command -v systemd-inhibit >/dev/null 2>&1; then
+      echo "ℹ  CBOX_AWAKE needs systemd-inhibit, which this computer lacks: it may sleep during the session"
+      return 0
+    fi
+    if [[ "$want" == "ac" ]] && ! _cbox_on_ac; then
+      _cbox_log "On battery: this computer may sleep during the session (CBOX_AWAKE=ac)"
+      return 0
+    fi
+    # shellcheck disable=SC2016  # expanded by the helper's sh
+    systemd-inhibit --what=idle:sleep --who=cbox --why="cbox session" --mode=block \
+      sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 5; done' sh $$ >/dev/null 2>&1 </dev/null &
+    _CBOX_AWAKE_PID=$!
+    # Refused (no logind, or polkit says no): the helper is gone at once.
+    sleep 0.2
+    if ! kill -0 "$_CBOX_AWAKE_PID" 2>/dev/null; then
+      _CBOX_AWAKE_PID=""
+      echo "⚠  systemd-inhibit refused to keep this computer awake: it may sleep during the session"
+      return 0
+    fi
+  fi
+  if [[ "$want" == "ac" ]]; then
+    echo "Keeping this computer awake during the session while on mains power"
+  else
+    echo "Keeping this computer awake during the session"
+  fi
+}
+
+_cbox_awake_stop() {
+  [[ -n "${_CBOX_AWAKE_PID:-}" ]] && kill "$_CBOX_AWAKE_PID" 2>/dev/null
+  _CBOX_AWAKE_PID=""
+  return 0
 }
 
 # ---------------------------------------------------------
@@ -7712,6 +7794,7 @@ _cbox_enter() {
   fi
 
   _cbox_git_guard_start "$name" || true
+  _cbox_awake_start
   _cbox_session_start "$name"
   _cbox_busy_end
 
@@ -7729,6 +7812,7 @@ _cbox_enter() {
   CLAUDE_CODE_OAUTH_TOKEN="${_CBOX_ACCOUNT_TOKEN:-}" $_CBOX_CMD exec "${_exec_args[@]}" "$name" zsh -ic "$_run" || true
   [[ -z "${_CBOX_ACCOUNT_ALIAS:-}" ]] || _cbox_account_age_check "$_CBOX_ACCOUNT_ALIAS"
   trap - HUP TERM
+  _cbox_awake_stop
 
   _cbox_busy_begin "closing session..."
 
@@ -8010,6 +8094,8 @@ cbox() {
   while [[ "${1:-}" == -* ]]; do
     case "$1" in
       -v|--verbose) local CBOX_VERBOSE=1; shift ;;
+      --awake) local CBOX_AWAKE=1; shift ;;
+      --no-awake) local CBOX_AWAKE=0; shift ;;
       -h|--help) _cbox_help; return 0 ;;
       *) echo "Unknown flag: $1"; return 1 ;;
     esac
@@ -8238,10 +8324,10 @@ _cbox_list_names() {
 # drift from the commands, and values come from cbox's own configuration.
 _cbox_complete() {
   local IFS=' '  # "$*" below joins with spaces, also when called with a newline IFS
-  while [[ "${1:-}" =~ ^(-v|--verbose|oc|opencode)$ ]]; do shift; done
+  while [[ "${1:-}" =~ ^(-v|--verbose|--awake|--no-awake|oc|opencode)$ ]]; do shift; done
   case "$*" in
     "")
-      printf '%s\n' -v --verbose safe shell keepalive oc opencode list stop reset \
+      printf '%s\n' -v --verbose --awake --no-awake safe shell keepalive oc opencode list stop reset \
         prune rebuild update doctor mcp warden account version help
       ;;
     stop|reset)                     _cbox_system_down || _cbox_list_names ;;

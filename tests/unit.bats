@@ -3392,6 +3392,7 @@ _enter_safe() {
   _CBOX_CMD=_fake_runtime
   _fake_runtime() {
     echo "$*" >> "$capture"
+    [[ -z "${EXEC_MARK:-}" || "$1" != exec ]] || echo "EXEC-RAN"
     # HUP=1: the terminal closes under the session (e.g. its cmux pane is closed).
     # (No $BASHPID in macOS's bash 3.2: a child signals its parent, this shell.)
     if [[ -n "${HUP:-}" && "$1 $2" == "exec -it" ]]; then sh -c 'kill -HUP $PPID'; fi
@@ -5998,4 +5999,157 @@ PY
       [[ "$output" != *"-e CLAUDE_CODE_OAUTH_TOKEN "* ]]
     fi
   done
+}
+
+@test "account: a token near its year says how to renew it after the session, with your own notes" {
+  _acct_setup
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  MODE=normal EGRESS="" LOGIN=""
+  run _enter_safe
+  [[ "$output" != *"Renew"* ]]
+  touch -t "$(date -d '-340 days' +%Y%m%d%H%M 2>/dev/null || date -v-340d +%Y%m%d%H%M)" "$AD/personal/token"
+  CBOX_ACCOUNT_RENEW="keychain item claude-token-<name>"
+  run _cbox_account_age_check personal
+  [[ "$output" == *"saved 340 days ago"* ]]
+  EXEC_MARK=1 run _enter_safe
+  # After the session (the runtime's exec), where it stays on screen.
+  [[ "$output" == *"EXEC-RAN"*"Renew"* ]]
+  [[ "$output" == *"saved 340 days ago"* ]]
+  [[ "$output" == *"cbox account add personal"* ]]
+  [[ "$output" == *"Your notes: keychain item claude-token-personal"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# awake (CBOX_AWAKE)
+# ---------------------------------------------------------------------------
+
+# Stubs for caffeinate and systemd-inhibit: they record their arguments and
+# wait to be stopped, as the real ones do. _AWAKE_FAIL=1 makes them refuse.
+_awake_setup() {
+  AW="$BATS_TMPDIR/awake"
+  rm -rf "$AW"; mkdir -p "$AW/bin" "$AW/power"
+  local t
+  for t in caffeinate systemd-inhibit; do
+    cat > "$AW/bin/$t" <<SH
+#!/bin/bash
+echo "\$*" > "$AW/$t.args"
+[[ -n "\${_AWAKE_FAIL:-}" ]] && exit 1
+exec sleep 30
+SH
+    chmod +x "$AW/bin/$t"
+  done
+  PATH="$AW/bin:$PATH"
+  _CBOX_POWER_SUPPLY_DIR="$AW/power"
+  _cbox_on_wsl() { return 1; }
+}
+
+# A power supply in the fake sysfs folder: name, type, online (or scope).
+_awake_supply() {
+  mkdir -p "$AW/power/$1"
+  echo "$2" > "$AW/power/$1/type"
+  case "$2" in
+    Battery) echo "${3:-System}" > "$AW/power/$1/scope" ;;
+    *) echo "$3" > "$AW/power/$1/online" ;;
+  esac
+}
+
+@test "_cbox_on_ac: a computer without a battery is on mains power" {
+  _awake_setup
+  _cbox_on_ac
+}
+
+@test "_cbox_on_ac: a laptop off its charger is on battery, on it on mains power" {
+  _awake_setup
+  _awake_supply BAT0 Battery
+  _awake_supply AC Mains 0
+  ! _cbox_on_ac
+  echo 1 > "$AW/power/AC/online"
+  _cbox_on_ac
+}
+
+@test "_cbox_on_ac: a USB-C charger counts, a mouse's battery does not" {
+  _awake_setup
+  _awake_supply hid-mouse Battery Device
+  _cbox_on_ac
+  _awake_supply BAT0 Battery
+  _awake_supply ucsi-source-psy-1 USB 1
+  _cbox_on_ac
+}
+
+@test "_cbox_awake_start: off unless CBOX_AWAKE is set" {
+  _awake_setup
+  _CBOX_RUNTIME=apple
+  unset CBOX_AWAKE
+  _cbox_awake_start
+  [ -z "$_CBOX_AWAKE_PID" ]
+  [ ! -f "$AW/caffeinate.args" ]
+  CBOX_AWAKE=0 _cbox_awake_start
+  [ -z "$_CBOX_AWAKE_PID" ]
+}
+
+@test "_cbox_awake_start: macOS watches cbox with caffeinate -i (1) or -s (ac)" {
+  _awake_setup
+  _CBOX_RUNTIME=apple
+  CBOX_AWAKE=1
+  _cbox_awake_start > "$AW/out"
+  [ "$(cat "$AW/out")" = "Keeping this computer awake during the session" ]
+  sleep 0.2
+  [ "$(cat "$AW/caffeinate.args")" = "-i -w $$" ]
+  kill -0 "$_CBOX_AWAKE_PID"
+  local pid=$_CBOX_AWAKE_PID
+  _cbox_awake_stop
+  [ -z "$_CBOX_AWAKE_PID" ]
+  sleep 0.2
+  ! kill -0 "$pid" 2>/dev/null
+  CBOX_AWAKE=ac
+  _cbox_awake_start >/dev/null
+  sleep 0.2
+  [ "$(cat "$AW/caffeinate.args")" = "-s -w $$" ]
+  _cbox_awake_stop
+}
+
+@test "_cbox_awake_start: Linux blocks idle and sleep with systemd-inhibit" {
+  _awake_setup
+  _CBOX_RUNTIME=docker
+  CBOX_AWAKE=1
+  _cbox_awake_start >/dev/null
+  [ -n "$_CBOX_AWAKE_PID" ]
+  [[ "$(cat "$AW/systemd-inhibit.args")" == "--what=idle:sleep --who=cbox --why=cbox session --mode=block sh -c "*" sh $$" ]]
+  _cbox_awake_stop
+}
+
+@test "_cbox_awake_start: Linux with ac checks the power source at session start" {
+  _awake_setup
+  _CBOX_RUNTIME=docker
+  CBOX_AWAKE=ac
+  _awake_supply BAT0 Battery
+  _awake_supply AC Mains 0
+  run _cbox_awake_start
+  [ -z "$output" ]
+  [ ! -f "$AW/systemd-inhibit.args" ]
+  echo 1 > "$AW/power/AC/online"
+  _cbox_awake_start > "$AW/out"
+  [[ "$(cat "$AW/out")" == *"while on mains power"* ]]
+  [ -n "$_CBOX_AWAKE_PID" ]
+  _cbox_awake_stop
+}
+
+@test "_cbox_awake_start: says so when it cannot keep the computer awake" {
+  _awake_setup
+  _CBOX_RUNTIME=docker
+  CBOX_AWAKE=1
+  _AWAKE_FAIL=1 run _cbox_awake_start
+  [[ "$output" == *"systemd-inhibit refused"* ]]
+  _cbox_on_wsl() { return 0; }
+  run _cbox_awake_start
+  [[ "$output" == *"no effect on WSL"* ]]
+  CBOX_AWAKE=yes run _cbox_awake_start
+  [[ "$output" == *"CBOX_AWAKE=yes is not 0, 1 or ac"* ]]
+}
+
+@test "completion offers --awake and --no-awake, and completes after them" {
+  run _cbox_complete
+  [[ "$output" == *"--awake"* && "$output" == *"--no-awake"* ]]
+  run _cbox_complete --awake mcp
+  [[ "$output" == *"import"* ]]
 }

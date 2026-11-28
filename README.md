@@ -252,6 +252,7 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 | `CBOX_ZSHRC` | *(unset)* | `.zshrc` to source as `~/.zshrc.global` inside the container (**read-only**); unset = none. The container also sources `~/.zshrc.local`, but that file lives in the container only: `cbox reset` (a new container) removes it, so use it for temporary tweaks |
 | `CBOX_BUILD_DIR` | cbox.sh directory | Folder with the dockerfile for `cbox rebuild`; a dockerfile starting `FROM claudebox` adds to claudebox's (see [Your own additions](#your-own-additions-to-the-image)) |
 | `CBOX_VERBOSE` | `0` | `1` shows all output: updates, sync messages, MCP relay status (per session: `cbox -v`) |
+| `CBOX_AWAKE` | `0` | Keep this computer awake while a session runs: `1` = always, `ac` = only on mains power (a laptop on battery sleeps as usual), `0` = never (per session: `cbox --awake`, `cbox --no-awake`). macOS uses `caffeinate`, Linux `systemd-inhibit`; Linux checks the power source when the session starts, so unplugging later keeps it awake until the session ends. No effect on WSL: Windows decides. A machine setting, not a project one, so it lives here and not in `.cbox`. One `cbox.env` shared by several machines (dotfiles): `ac` suits them all, since a desktop is always on mains power |
 | `CBOX_AUDIO` | *(unset)* | Set to `1` to enable Claude Code voice mode (requires PulseAudio on host) |
 | `CBOX_MCP_CONFIG` | `~/.config/claudebox/mcp.json` | MCP servers that run on the host and are relayed into the container (see [Host MCP Servers](#host-mcp-servers)) |
 | `CBOX_WARDEN_DIR` | `$CBOX_DATA_DIR/warden` | warden resources, approvals and session tokens — host only, never mounted |
@@ -285,7 +286,7 @@ cbox account                 # list; * = default
 ```
 
 - Each session start hands Claude Code its account's token (`CLAUDE_CODE_OAUTH_TOKEN`). A switch applies from the next session start; no container is recreated.
-- Tokens from `claude setup-token` last a year and do not rotate. When one expires, run `claude setup-token` again and `cbox account add <name>` with the same name.
+- Tokens from `claude setup-token` last a year and do not rotate. From about a month before, the end of each session says how to renew one: `claude setup-token` again, then `cbox account add <name>` with the same name. Your own steps (e.g. where you keep tokens) can go into `CBOX_ACCOUNT_RENEW` in `cbox.env`; cbox shows them along.
 - Tokens are saved in `$CBOX_DATA_DIR/accounts/<name>/token`, outside every folder a container mounts. A container only gets the token of the account it uses.
 - While accounts are saved, `/login` inside a container has no effect on which account is used. Claude features that need a claude.ai sign-in (such as Claude in Chrome) do not work with these tokens.
 - Saved accounts are per machine: claudedot does not sync them. A token works on every machine, so you can keep it in a keychain and add it on each one without seeing it, e.g. `security find-generic-password -s claude-token-work -w | cbox account add work`. A token per machine instead lets you revoke one machine alone.

@@ -1004,9 +1004,9 @@ _cbox_awake_start() {
     fi
   fi
   if [[ "$want" == "ac" ]]; then
-    echo "Keeping this computer awake during the session while on mains power"
+    _cbox_log "Keeping this computer awake during the session while on mains power"
   else
-    echo "Keeping this computer awake during the session"
+    _cbox_log "Keeping this computer awake during the session"
   fi
 }
 

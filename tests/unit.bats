@@ -6091,7 +6091,11 @@ _awake_supply() {
   _awake_setup
   _CBOX_RUNTIME=apple
   CBOX_AWAKE=1
+  # Says so only with -v.
   _cbox_awake_start > "$AW/out"
+  [ ! -s "$AW/out" ]
+  _cbox_awake_stop
+  CBOX_VERBOSE=1 _cbox_awake_start > "$AW/out"
   [ "$(cat "$AW/out")" = "Keeping this computer awake during the session" ]
   sleep 0.2
   [ "$(cat "$AW/caffeinate.args")" = "-i -w $$" ]
@@ -6128,7 +6132,7 @@ _awake_supply() {
   [ -z "$output" ]
   [ ! -f "$AW/systemd-inhibit.args" ]
   echo 1 > "$AW/power/AC/online"
-  _cbox_awake_start > "$AW/out"
+  CBOX_VERBOSE=1 _cbox_awake_start > "$AW/out"
   [[ "$(cat "$AW/out")" == *"while on mains power"* ]]
   [ -n "$_CBOX_AWAKE_PID" ]
   _cbox_awake_stop

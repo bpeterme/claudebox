@@ -974,6 +974,9 @@ _cbox_awake_start() {
     [[ "$want" == "ac" ]] && flag=-s
     caffeinate "$flag" -w $$ >/dev/null 2>&1 </dev/null &
     _CBOX_AWAKE_PID=$!
+    # Out of the job list: macOS's bash 3.2 would print "Terminated" when
+    # _cbox_awake_stop ends it.
+    disown "$_CBOX_AWAKE_PID" 2>/dev/null || true
   else
     if _cbox_on_wsl; then
       echo "ℹ  CBOX_AWAKE has no effect on WSL: Windows decides when this computer sleeps"
@@ -991,6 +994,7 @@ _cbox_awake_start() {
     systemd-inhibit --what=idle:sleep --who=cbox --why="cbox session" --mode=block \
       sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 5; done' sh $$ >/dev/null 2>&1 </dev/null &
     _CBOX_AWAKE_PID=$!
+    disown "$_CBOX_AWAKE_PID" 2>/dev/null || true
     # Refused (no logind, or polkit says no): the helper is gone at once.
     sleep 0.2
     if ! kill -0 "$_CBOX_AWAKE_PID" 2>/dev/null; then

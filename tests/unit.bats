@@ -6153,3 +6153,13 @@ _awake_supply() {
   run _cbox_complete --awake mcp
   [[ "$output" == *"import"* ]]
 }
+
+@test "_cbox_awake_start: the helper is not a job, so stopping it prints nothing" {
+  _awake_setup
+  _CBOX_RUNTIME=apple
+  CBOX_AWAKE=1
+  _cbox_awake_start >/dev/null
+  [ -n "$_CBOX_AWAKE_PID" ]
+  [[ " $(jobs -p | tr '\n' ' ') " != *" $_CBOX_AWAKE_PID "* ]]
+  _cbox_awake_stop
+}

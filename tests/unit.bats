@@ -2716,7 +2716,11 @@ def serve(c):
 srv = socket.socket(socket.AF_UNIX); srv.bind(sys.argv[1]); srv.listen(8)
 while True: threading.Thread(target=serve, args=(srv.accept()[0],), daemon=True).start()
 ' "$1" "$2" </dev/null >/dev/null 2>&1 &
-  echo $!
+  local pid=$!
+  # Listening before anyone connects: a tunnel opened right after would
+  # otherwise find no agent (the tunnel logs "agent is not running").
+  for _ in $(seq 100); do [ -S "$1" ] && break; sleep 0.05; done
+  echo "$pid"
 }
 
 _ssh_setup() {
@@ -2915,6 +2919,7 @@ srv = socket.socket(socket.AF_UNIX); srv.bind(sys.argv[1]); srv.listen(16)
 while True: threading.Thread(target=echo, args=(srv.accept()[0],), daemon=True).start()
 ' "$TT/pulse" </dev/null >/dev/null 2>&1 &
   echo_pid=$!
+  for _ in $(seq 100); do [ -S "$TT/pulse" ] && break; sleep 0.05; done
   # Fake runtime: `rt exec -i box cmd...` runs cmd here.
   printf '#!/bin/sh\nshift 3\nexec "$@"\n' > "$TT/rt"; chmod +x "$TT/rt"
   _cbox_tunnel_py > "$TT/cbox-tunnel"; chmod +x "$TT/cbox-tunnel"

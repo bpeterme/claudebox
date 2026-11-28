@@ -2944,13 +2944,19 @@ h = c.recv(4); ans = c.recv(struct.unpack(">I", h)[0])
 print("ssh keys", struct.unpack(">I", ans[1:5])[0], b"warden:gh" in ans)
 ' "$TT/sock"
   echo_out="$output"
-  # Without the grant, the ssh channel closes at once.
+  # Without the grant, the ssh channel closes at once. Closed with our request
+  # still unread, the socket reports a reset instead of an end: both are closed.
   rm -f "$CBOX_WARDEN_DIR/sessions/wbox.json"
   run python3 -c '
 import socket, struct, sys
 c = socket.socket(socket.AF_UNIX); c.settimeout(10); c.connect(sys.argv[1] + "/ssh-agent.sock")
 c.sendall(struct.pack(">I", 1) + bytes([11]))
-print("closed" if c.recv(4) == b"" else "answered")
+try:
+    print("closed" if c.recv(4) == b"" else "answered")
+except ConnectionResetError:
+    print("closed")
+except OSError as e:
+    print(type(e).__name__)
 ' "$TT/sock"
   nogrant="$output"
   kill -TERM -- "-$(cat "$TT/tunnel.pid")" 2>/dev/null || true

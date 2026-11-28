@@ -1672,6 +1672,83 @@ _flux_install_setup() {
   [ ! -f "$CBOX_DATA_DIR/.flux-installed-box1" ]
 }
 
+# ---------------------------------------------------------------------------
+# _cbox_claude_wrapper / _cbox_claude_wrapper_install
+# ---------------------------------------------------------------------------
+
+# A wrapper dir ahead of a fake real claude that tells which token it got.
+_claude_wrapper_setup() {
+  [[ -r /proc/self/environ ]] || skip "needs /proc (Linux)"
+  W="$BATS_TMPDIR/cw-wrap"; R="$BATS_TMPDIR/cw-real"
+  rm -rf "$W" "$R"; mkdir -p "$W" "$R"
+  _cbox_claude_wrapper > "$W/claude"; chmod +x "$W/claude"
+  printf '#!/bin/sh\necho "token=${CLAUDE_CODE_OAUTH_TOKEN:-none} args=$*"\n' > "$R/claude"
+  chmod +x "$R/claude"
+  unset CLAUDE_CODE_OAUTH_TOKEN
+}
+
+# Runs "$@" detached from the test's process tree (reparented to init), so
+# the wrapper finds no token above it even when the tests run inside a cbox
+# session, whose claude has one. Prints the command's output.
+_cw_detached() {
+  local out="$BATS_TMPDIR/cw-out" i
+  rm -f "$out" "$out.done"
+  ( setsid sh -c '"$@" > "$0" 2>&1; echo $? > "$0.done"' "$out" "$@" </dev/null & )
+  for i in $(seq 100); do [[ -f "$out.done" ]] && break; sleep 0.05; done
+  cat "$out"
+  return "$(cat "$out.done")"
+}
+
+@test "_cbox_claude_wrapper: a child without the token gets its parent's" {
+  _claude_wrapper_setup
+  # Like Claude Code's Bash tool: the parent has the token, the child's env not.
+  run env CLAUDE_CODE_OAUTH_TOKEN=tok-a PATH="$W:$R:/usr/bin:/bin" \
+    sh -c 'env -u CLAUDE_CODE_OAUTH_TOKEN claude -p "a b"; true'
+  [ "$status" -eq 0 ]
+  [ "$output" = "token=tok-a args=-p a b" ]
+}
+
+@test "_cbox_claude_wrapper: a token of its own wins; none above leaves none" {
+  _claude_wrapper_setup
+  run env CLAUDE_CODE_OAUTH_TOKEN=tok-a PATH="$W:$R:/usr/bin:/bin" \
+    sh -c 'CLAUDE_CODE_OAUTH_TOKEN=tok-b claude; true'
+  [ "$output" = "token=tok-b args=" ]
+  run _cw_detached env PATH="$W:$R:/usr/bin:/bin" claude
+  [ "$output" = "token=none args=" ]
+}
+
+@test "_cbox_claude_wrapper: skips itself on PATH, also spelled differently" {
+  _claude_wrapper_setup
+  run _cw_detached env PATH="$W/:$W:$R:/usr/bin:/bin" "$W/claude" x
+  [ "$output" = "token=none args=x" ]
+  run sh -c 'env PATH="$1:/nonexistent" "$1/claude" 2>&1; echo "rc=$?"' sh "$W"
+  [[ "$output" == *"claude: command not found"*"rc=127" ]]
+}
+
+@test "_cbox_claude_wrapper_install: installs as root once, again after a change" {
+  rm -f "$CBOX_DATA_DIR"/.claude-wrapper-*
+  INSTALLED="$BATS_TMPDIR/installed-claude"; rm -f "$INSTALLED" "$BATS_TMPDIR/runtime-calls"
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { echo "$*" >> "$BATS_TMPDIR/runtime-calls"; cat > "$INSTALLED"; }
+  _cbox_claude_wrapper_install box1
+  _cbox_claude_wrapper_install box1
+  [ "$(grep -c . "$BATS_TMPDIR/runtime-calls")" -eq 1 ]
+  [[ "$(cat "$BATS_TMPDIR/runtime-calls")" == "exec -i --user root box1 sh -c "*"/usr/local/bin/claude"* ]]
+  cmp -s "$INSTALLED" <(_cbox_claude_wrapper)
+  echo stale > "$CBOX_DATA_DIR/.claude-wrapper-box1"
+  _cbox_claude_wrapper_install box1
+  [ "$(grep -c . "$BATS_TMPDIR/runtime-calls")" -eq 2 ]
+}
+
+@test "_cbox_claude_wrapper_install: a failed copy warns and retries next time" {
+  rm -f "$CBOX_DATA_DIR"/.claude-wrapper-*
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { cat >/dev/null; return 1; }
+  run _cbox_claude_wrapper_install box1
+  [[ "$output" == *"Could not install cbox's claude command"* ]]
+  [ ! -f "$CBOX_DATA_DIR/.claude-wrapper-box1" ]
+}
+
 @test "_cbox_flux_install: does nothing without flux on the host" {
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { echo called; }
@@ -6091,7 +6168,11 @@ _awake_supply() {
   _awake_setup
   _CBOX_RUNTIME=apple
   CBOX_AWAKE=1
+  # Says so only with -v.
   _cbox_awake_start > "$AW/out"
+  [ ! -s "$AW/out" ]
+  _cbox_awake_stop
+  CBOX_VERBOSE=1 _cbox_awake_start > "$AW/out"
   [ "$(cat "$AW/out")" = "Keeping this computer awake during the session" ]
   sleep 0.2
   [ "$(cat "$AW/caffeinate.args")" = "-i -w $$" ]
@@ -6128,7 +6209,7 @@ _awake_supply() {
   [ -z "$output" ]
   [ ! -f "$AW/systemd-inhibit.args" ]
   echo 1 > "$AW/power/AC/online"
-  _cbox_awake_start > "$AW/out"
+  CBOX_VERBOSE=1 _cbox_awake_start > "$AW/out"
   [[ "$(cat "$AW/out")" == *"while on mains power"* ]]
   [ -n "$_CBOX_AWAKE_PID" ]
   _cbox_awake_stop
@@ -6152,4 +6233,14 @@ _awake_supply() {
   [[ "$output" == *"--awake"* && "$output" == *"--no-awake"* ]]
   run _cbox_complete --awake mcp
   [[ "$output" == *"import"* ]]
+}
+
+@test "_cbox_awake_start: the helper is not a job, so stopping it prints nothing" {
+  _awake_setup
+  _CBOX_RUNTIME=apple
+  CBOX_AWAKE=1
+  _cbox_awake_start >/dev/null
+  [ -n "$_CBOX_AWAKE_PID" ]
+  [[ " $(jobs -p | tr '\n' ' ') " != *" $_CBOX_AWAKE_PID "* ]]
+  _cbox_awake_stop
 }

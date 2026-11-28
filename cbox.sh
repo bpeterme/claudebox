@@ -974,6 +974,9 @@ _cbox_awake_start() {
     [[ "$want" == "ac" ]] && flag=-s
     caffeinate "$flag" -w $$ >/dev/null 2>&1 </dev/null &
     _CBOX_AWAKE_PID=$!
+    # Out of the job list: macOS's bash 3.2 would print "Terminated" when
+    # _cbox_awake_stop ends it.
+    disown "$_CBOX_AWAKE_PID" 2>/dev/null || true
   else
     if _cbox_on_wsl; then
       echo "ℹ  CBOX_AWAKE has no effect on WSL: Windows decides when this computer sleeps"
@@ -991,6 +994,7 @@ _cbox_awake_start() {
     systemd-inhibit --what=idle:sleep --who=cbox --why="cbox session" --mode=block \
       sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 5; done' sh $$ >/dev/null 2>&1 </dev/null &
     _CBOX_AWAKE_PID=$!
+    disown "$_CBOX_AWAKE_PID" 2>/dev/null || true
     # Refused (no logind, or polkit says no): the helper is gone at once.
     sleep 0.2
     if ! kill -0 "$_CBOX_AWAKE_PID" 2>/dev/null; then
@@ -1000,9 +1004,9 @@ _cbox_awake_start() {
     fi
   fi
   if [[ "$want" == "ac" ]]; then
-    echo "Keeping this computer awake during the session while on mains power"
+    _cbox_log "Keeping this computer awake during the session while on mains power"
   else
-    echo "Keeping this computer awake during the session"
+    _cbox_log "Keeping this computer awake during the session"
   fi
 }
 
@@ -7012,7 +7016,7 @@ _cbox_create() {
   local mode="$2"
 
   # A new container still has the image's flux.
-  rm -f "$CBOX_DATA_DIR/.flux-installed-$name"
+  rm -f "$CBOX_DATA_DIR/.flux-installed-$name" "$CBOX_DATA_DIR/.claude-wrapper-$name"
 
   local config_mounts="" _cm
   if [[ "$mode" == "normal" ]]; then
@@ -7385,6 +7389,55 @@ _cbox_flux_install() {
     _cbox_log "✔ flux in the container updated to the host's version"
   else
     echo "⚠  Could not install the host's flux in the container — it keeps its own version."
+  fi
+}
+
+# The container's `claude` command (/usr/local/bin, ahead of the real one on
+# PATH). Claude Code keeps CLAUDE_CODE_OAUTH_TOKEN out of its tools' shells, so
+# a `claude -p` an agent starts would use the saved login, which may be another
+# account than the session's (cbox account). The wrapper takes the token from
+# the nearest process above it that has one, then runs the real claude. It
+# never prints the token; tools could read that process's environment anyway.
+_cbox_claude_wrapper() {
+  cat <<'EOF'
+#!/bin/sh
+# Installed by cbox: headless claude uses the account of the session that started it.
+if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+  pid=$PPID
+  while [ "${pid:-0}" -gt 1 ] 2>/dev/null; do
+    t=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' | head -n 1)
+    if [ -n "$t" ]; then
+      CLAUDE_CODE_OAUTH_TOKEN=$t
+      export CLAUDE_CODE_OAUTH_TOKEN
+      break
+    fi
+    pid=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$pid/status" 2>/dev/null)
+  done
+  unset t pid
+fi
+set -f
+IFS=:
+for d in $PATH; do
+  [ "$d/claude" -ef "$0" ] && continue
+  [ -f "$d/claude" ] && [ -x "$d/claude" ] && exec "$d/claude" "$@"
+done
+echo "claude: command not found" >&2
+exit 127
+EOF
+}
+
+# Copies the wrapper in whenever it changed (a new cbox), like flux above.
+_cbox_claude_wrapper_install() {
+  local name="$1" sum stamp
+  sum=$(_cbox_claude_wrapper | cksum | cut -d' ' -f1)
+  stamp="$CBOX_DATA_DIR/.claude-wrapper-$name"
+  [[ "$(cat "$stamp" 2>/dev/null)" == "$sum" ]] && return 0
+  if _cbox_claude_wrapper | $_CBOX_CMD exec -i --user root "$name" sh -c \
+      'cat > /usr/local/bin/claude.new && chmod 755 /usr/local/bin/claude.new && mv /usr/local/bin/claude.new /usr/local/bin/claude' \
+      >/dev/null 2>&1; then
+    printf '%s\n' "$sum" > "$stamp"
+  else
+    echo "⚠  Could not install cbox's claude command in the container: a claude -p started there may use the saved login's account."
   fi
 }
 
@@ -7785,6 +7838,7 @@ _cbox_enter() {
   fi
 
   _cbox_flux_install "$name"
+  [[ "$agent_bin" == "claude" ]] && _cbox_claude_wrapper_install "$name"
 
   echo "Entering container '$name'..."
 

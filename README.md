@@ -272,22 +272,24 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 
 ## Several Claude accounts
 
-With more than one Claude subscription, save each login once and switch all containers with one command:
+With more than one Claude subscription, save a token for each and pick one for all projects, or pin one per project:
 
 ```bash
-cbox account add personal    # saves the login containers use now
-# in cbox: /login with the other account (no /logout first: it can revoke the saved login)
-cbox account add work
-cbox account use personal    # all containers switch
-cbox account                 # list; * = in use
+cbox shell                   # in the container:
+claude setup-token           # sign in to the account in the browser, copy the token it prints
+exit
+cbox account add work        # paste the token (input is hidden)
+cbox account add personal    # same for the other account
+cbox account use personal    # the default for projects without a pin
+cbox account                 # list; * = default
 ```
 
-- Running sessions switch with their next message; safe sessions when they start again.
-- Each account is one file in `$CBOX_DATA_DIR/accounts/<name>/`; the login containers use is a hard link to it, so a token refresh in any container keeps the saved account current. Saved accounts are outside every folder a container mounts.
-- `$CBOX_DATA_DIR` and `$CBOX_CLAUDE_DIR` must be on the same disk.
-- A `/login` since the last `cbox account add` is not overwritten: `cbox account use` refuses until you save it, and cbox mentions it when a session starts.
-- Saved accounts are per machine: claudedot does not sync them (each machine's login is its own). Run `cbox account add` once per machine and account.
-- Without saved accounts, nothing changes.
+- Each session start hands Claude Code its account's token (`CLAUDE_CODE_OAUTH_TOKEN`). A switch applies from the next session start; no container is recreated.
+- Tokens from `claude setup-token` last a year and do not rotate. When one expires, run `claude setup-token` again and `cbox account add <name>` with the same name.
+- Tokens are saved in `$CBOX_DATA_DIR/accounts/<name>/token`, outside every folder a container mounts. A container only gets the token of the account it uses.
+- While accounts are saved, `/login` inside a container has no effect on which account is used. Claude features that need a claude.ai sign-in (such as Claude in Chrome) do not work with these tokens.
+- Saved accounts are per machine: claudedot does not sync them. Run `cbox account add` once per machine and account.
+- Without saved accounts, nothing changes: containers use Claude Code's own login.
 
 ### One account per project
 
@@ -298,10 +300,9 @@ A project can always use one account, whatever `cbox account use` says. In its `
   account = work
 ```
 
-- After you add, change or remove the pin, the next `cbox` start asks whether to apply it; yes recreates the container (the project folder and Claude's data stay). You answer on the Mac, so code in the container that edits `.cbox` cannot switch accounts by itself. The session start says which account a container uses.
+- A new container takes the pin. When you add, change or remove the pin later, the next `cbox` start asks whether to use it. You answer on the Mac, so code in the container that edits `.cbox` cannot switch accounts by itself. The session start says which account a container uses.
 - A machine without that account stops with what to do (`cbox account add work`). It never falls back to another account, which would bill the wrong subscription.
 - `cbox account` shows which projects pin an account; a pinned account cannot be removed.
-- A `/login` inside a pinned project changes that saved account (the session start names the new email). Use it to log in again with the same account, not to switch.
 
 ## Container Image
 

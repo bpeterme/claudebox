@@ -97,9 +97,9 @@ MCP servers on the host ($(_cbox_shown "$CBOX_MCP_CONFIG")):
   cbox mcp import                     Import servers from Claude Desktop / Claude Code
 
 Claude accounts (several subscriptions):
-  cbox account                        List saved accounts (* = in use)
-  cbox account add <name>             Save the current login as <name>
-  cbox account use <name>             Switch all containers to <name>
+  cbox account                        List saved accounts (* = default)
+  cbox account add <name>             Save a token from claude setup-token as <name>
+  cbox account use <name>             Make <name> the default for all projects
   cbox account remove <name>          Delete a saved account
 
 Credentials without exposing them (warden):
@@ -6128,7 +6128,7 @@ _cbox_safe_memory_links() {
 }
 
 _cbox_safe_claude_dir() {
-  local name="$1" pin="${2:-}" src="$CBOX_CLAUDE_DIR" dir="$CBOX_DATA_DIR/safe-claude/$1" e base want
+  local name="$1" src="$CBOX_CLAUDE_DIR" dir="$CBOX_DATA_DIR/safe-claude/$1" e base want
   mkdir -p "$dir"
   # Names of the shared folder link there; a local entry of the same name goes.
   # Claude Code's own records (_CBOX_SAFE_LOCAL) stay the container's.
@@ -6158,13 +6158,10 @@ _cbox_safe_claude_dir() {
   _cbox_safe_memory_links "$name" "$src" "$dir"
 
   local s="$src/.credentials.json" l="$dir/.credentials.json"
-  # A pinned account: its saved login, not the shared one.
-  [[ -n "$pin" ]] && s="$(_cbox_accounts_dir)/$pin/.credentials.json"
   [[ -L "$s" || -L "$l" ]] && return 0  # Claude Code would not open it anyway
   if [[ -f "$s" && ! "$s" -ef "$l" ]]; then
-    # A login made in this safe container since (it replaced its file) wins;
-    # a saved account is none (cbox account use switched away from it).
-    if [[ -f "$l" && "$l" -nt "$s" && -z "$(_cbox_account_of "$l")" ]]; then
+    # A login made in this safe container since (it replaced its file) wins.
+    if [[ -f "$l" && "$l" -nt "$s" ]]; then
       ln -f "$l" "$s" 2>/dev/null && return 0
     elif ln -f "$s" "$l" 2>/dev/null; then
       return 0
@@ -6180,17 +6177,17 @@ _cbox_safe_claude_dir() {
 
 
 # ---------------------------------------------------------
-# accounts: several Claude logins, one in use (cbox account)
+# accounts: several Claude subscriptions (cbox account)
 # ---------------------------------------------------------
-# $CBOX_DATA_DIR/accounts/<alias>/.credentials.json is the only copy of a
-# login; the login containers use ($CBOX_CLAUDE_DIR/.credentials.json) is a
-# hard link to one of them. Claude Code rewrites the file in place when it
-# refreshes the token (refresh tokens rotate: a second copy would go stale), so
-# the saved account stays current. The account in use is the one whose file
-# that is; no other state. account.json keeps the account's oauthAccount
-# (Claude Code reads its org and account IDs from each project's
-# ~/.claude.json), written into every .claude-<name>.json at a switch.
-# Without saved accounts, nothing here runs.
+# Each account is a long-lived token from `claude setup-token`, saved in
+# $CBOX_DATA_DIR/accounts/<alias>/token. Each session start hands Claude Code
+# the container's account as CLAUDE_CODE_OAUTH_TOKEN: the project's pin, else
+# the default (cbox account use, in accounts/.default). Such tokens do not
+# rotate, so nothing is linked or mounted, and a switch needs no new container.
+# A project's pin is recorded on the Mac (accounts/.pins/<container>) when its
+# container is created: the container can write .cbox, so a changed pin there
+# asks in the host terminal first. Without saved accounts, nothing here runs
+# and Claude Code uses its own login (/login).
 
 _cbox_accounts_dir() { echo "$CBOX_DATA_DIR/accounts"; }
 
@@ -6199,20 +6196,8 @@ _cbox_account_names() {
   local d
   for d in "$(_cbox_accounts_dir)"/*/; do
     d="${d%/}"
-    [[ -f "$d/.credentials.json" ]] && printf '%s\n' "${d##*/}"
+    [[ -f "$d/token" ]] && printf '%s\n' "${d##*/}"
   done
-  return 0
-}
-
-# Prints the alias whose saved login is the file $1 (empty: none).
-_cbox_account_of() {
-  local f="$1" a names
-  [[ -f "$f" ]] || return 0
-  # The whole list first: leaving a loop over a pipe early would break it.
-  names=$(_cbox_account_names)
-  while IFS= read -r a; do
-    [[ -n "$a" && "$f" -ef "$(_cbox_accounts_dir)/$a/.credentials.json" ]] && { echo "$a"; return 0; }
-  done <<< "$names"
   return 0
 }
 
@@ -6222,240 +6207,38 @@ _cbox_account_valid_name() {
   return 1
 }
 
-_cbox_account_py() {
-  cat <<'PYEOF'
-import glob, json, os, sys
+_cbox_account_saved() { [[ -n "$1" && -f "$(_cbox_accounts_dir)/$1/token" ]]; }
 
-def load(path):
-    try:
-        with open(path) as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-cmd = sys.argv[1]
-if cmd == "get":
-    # The oauthAccount of the first project file that has one.
-    for path in sys.argv[2:]:
-        acct = load(path).get("oauthAccount")
-        if isinstance(acct, dict) and acct:
-            print(json.dumps(acct))
-            break
-elif cmd == "set":
-    # Writes the saved oauthAccount into every project file, in place: each
-    # is mounted into its container as a single file, a rename would not reach it.
-    acct = load(sys.argv[2])
-    if acct:
-        for path in sys.argv[3:]:
-            data = load(path)
-            if not data or data.get("oauthAccount") == acct:
-                continue
-            data["oauthAccount"] = acct
-            with open(path, "w") as f:
-                json.dump(data, f)
-elif cmd == "sync":
-    # A session start: the project file gets the account's oauthAccount. With
-    # "known" (the project used this account before), an oauthAccount of
-    # another account in the project file means a /login there replaced the
-    # saved login; the saved account then takes that one, and says so.
-    saved_path, project, known = sys.argv[2], sys.argv[3], sys.argv[4] == "1"
-    acct, data = load(saved_path), load(project)
-    mine = data.get("oauthAccount") if isinstance(data.get("oauthAccount"), dict) else {}
-    if known and mine.get("accountUuid") and acct.get("accountUuid") and mine["accountUuid"] != acct["accountUuid"]:
-        with open(saved_path, "w") as f:
-            json.dump(mine, f)
-        print(mine.get("emailAddress", "another account"))
-    elif acct and data and mine != acct:
-        data["oauthAccount"] = acct
-        with open(project, "w") as f:
-            json.dump(data, f)
-elif cmd == "show":
-    # email<TAB>plan of a saved account.
-    d = sys.argv[2]
-    acct = load(os.path.join(d, "account.json"))
-    cred = load(os.path.join(d, ".credentials.json")).get("claudeAiOauth") or {}
-    print(f"{acct.get('emailAddress', '')}\t{cred.get('subscriptionType', '') or ''}")
-PYEOF
-}
-
-# Project files (~/.claude.json of each container): the current project's
-# first, then the most recently changed (where a /login just happened).
-_cbox_account_project_files() {
-  local own="$CBOX_DATA_DIR/.claude-$1.json" f
-  [[ -f "$own" ]] && echo "$own"
-  while IFS= read -r f; do
-    [[ -f "$f" && "$f" != "$own" ]] && echo "$f"
-  done < <(ls -t "$CBOX_DATA_DIR"/.claude-*.json 2>/dev/null)
+# The default account (cbox account use); empty when none is saved.
+_cbox_account_default() {
+  local f a
+  f="$(_cbox_accounts_dir)/.default"
+  [[ -f "$f" ]] || return 0
+  a=$(cat "$f")
+  _cbox_account_saved "$a" && printf '%s\n' "$a"
   return 0
 }
 
-# Claude Code's refresh lock, a folder in the Claude folder (kept fresh every
-# 5 s, stale after 60 s). Holding it, a switch cannot meet a refresh halfway:
-# Claude Code re-reads the login under the lock and keeps what it finds.
-_cbox_account_lock() {
-  local lock="$CBOX_CLAUDE_DIR/.oauth_refresh.lock" i said=""
-  for (( i = 0; i < 70; i++ )); do
-    mkdir "$lock" 2>/dev/null && return 0
-    if [[ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
-      rm -rf "$lock"; continue  # left by a session that ended mid-refresh
-    fi
-    [[ -n "$said" ]] || { echo "ℹ  Claude is refreshing its login, waiting..."; said=1; }
-    sleep 1
-  done
-  echo "✘ Claude's login stayed locked ($(_cbox_shown "$lock")). Try again in a minute." >&2
-  return 1
-}
+# The saved accounts as "a, b" (for messages).
+_cbox_account_list_inline() { _cbox_account_names | paste -sd, - | sed 's/,/, /g'; }
 
-_cbox_account_unlock() { rm -rf "$CBOX_CLAUDE_DIR/.oauth_refresh.lock"; }
-
-_cbox_account_disk_hint() {
-  echo "✘ Saved accounts must be on the same disk as Claude's folder:" >&2
-  echo "   $(_cbox_shown "$(_cbox_accounts_dir)") and $(_cbox_shown "$CBOX_CLAUDE_DIR")" >&2
-  echo "   Set CBOX_DATA_DIR or CBOX_CLAUDE_DIR in $(_cbox_shown "$_CBOX_ENV_FILE") so they are." >&2
-}
-
-_cbox_account_add() {
-  local alias="${1:-}" name="$2" login="$CBOX_CLAUDE_DIR/.credentials.json" dir other acct
-  [[ -n "$alias" ]] || { echo "Usage: cbox account add <name>" >&2; return 1; }
-  _cbox_account_valid_name "$alias" || return 1
-  if [[ ! -f "$login" ]]; then
-    echo "✘ No login to save: start cbox, run /login, then cbox account add $alias." >&2
-    return 1
-  fi
-  other=$(_cbox_account_of "$login")
-  if [[ -n "$other" && "$other" != "$alias" ]]; then
-    echo "✘ This login is already saved as '$other'." >&2
-    echo "   For another account: in cbox, run /login with it (no /logout first), then cbox account add $alias." >&2
-    return 1
-  fi
-  dir="$(_cbox_accounts_dir)/$alias"
-  mkdir -p "$dir"
-  chmod 700 "$(_cbox_accounts_dir)" "$dir"
-  if [[ "$other" != "$alias" ]] && ! ln -f "$login" "$dir/.credentials.json" 2>/dev/null; then
-    [[ -f "$dir/.credentials.json" ]] || rmdir "$dir" 2>/dev/null
-    _cbox_account_disk_hint
-    return 1
-  fi
-  chmod 600 "$dir/.credentials.json"
-  local files=() f
-  while IFS= read -r f; do files+=("$f"); done < <(_cbox_account_project_files "$name")
-  acct=$(python3 -c "$(_cbox_account_py)" get ${files[@]+"${files[@]}"})
-  [[ -n "$acct" ]] && printf '%s\n' "$acct" > "$dir/account.json"
-  local email
-  email=$(python3 -c "$(_cbox_account_py)" show "$dir" | cut -f1)
-  echo "✔ Saved the current login as '$alias'${email:+ ($email)}. All containers use it."
-  echo "  To add another account: in cbox, run /login with it (no /logout first), then cbox account add <name>."
-}
-
-_cbox_account_use() {
-  local alias="${1:-}" name="$2" login="$CBOX_CLAUDE_DIR/.credentials.json" saved current
-  [[ -n "$alias" ]] || { echo "Usage: cbox account use <name>" >&2; return 1; }
-  saved="$(_cbox_accounts_dir)/$alias/.credentials.json"
-  if [[ ! -f "$saved" ]]; then
-    echo "✘ No saved account '$alias'. Saved: $(_cbox_account_names | paste -sd, - | sed 's/,/, /g')" >&2
-    return 1
-  fi
-  current=$(_cbox_account_of "$login")
-  if [[ "$current" == "$alias" ]]; then
-    echo "All containers already use '$alias'."
-    return 0
-  fi
-  if [[ -f "$login" && -z "$current" ]]; then
-    echo "✘ The current login is not saved, a switch would lose it (a /login since the last cbox account add?)." >&2
-    echo "   Save it first: cbox account add <name>" >&2
-    return 1
-  fi
-  _cbox_account_lock || return 1
-  # Link to a temporary name, then rename: the login is never missing.
-  if ! ln -f "$saved" "$login.cbox-tmp" 2>/dev/null; then
-    _cbox_account_unlock
-    _cbox_account_disk_hint
-    return 1
-  fi
-  mv -f "$login.cbox-tmp" "$login"
-  _cbox_account_unlock
-  local files=() f p
-  while IFS= read -r f; do
-    p="${f##*/.claude-}"
-    [[ -n "$(_cbox_account_pin_of "${p%.json}")" ]] || files+=("$f")
-  done < <(_cbox_account_project_files "$name")
-  [[ -f "${saved%/*}/account.json" ]] &&
-    python3 -c "$(_cbox_account_py)" set "${saved%/*}/account.json" ${files[@]+"${files[@]}"}
-  local email
-  email=$(python3 -c "$(_cbox_account_py)" show "${saved%/*}" | cut -f1)
-  echo "✔ All containers now use '$alias'${email:+ ($email)}."
-  echo "  Running sessions switch with their next message; safe sessions when they start again."
-  local pinned
-  pinned=$(_cbox_account_pin_of "$name")
-  [[ -z "$pinned" ]] || echo "ℹ  This project stays on '$pinned' (account = $pinned in its container)."
-  return 0
-}
-
-_cbox_account_list() {
-  local login="$CBOX_CLAUDE_DIR/.credentials.json" current a email plan mark pins any=""
-  current=$(_cbox_account_of "$login")
-  while IFS= read -r a; do
-    any=1
-    IFS=$'\t' read -r email plan < <(python3 -c "$(_cbox_account_py)" show "$(_cbox_accounts_dir)/$a")
-    mark=" "; [[ "$a" == "$current" ]] && mark="*"
-    printf '%s %-14s %-32s %s\n' "$mark" "$a" "$email" "$plan"
-    pins=$(_cbox_account_pinned_by "$a" | paste -sd, - | sed 's/,/, /g')
-    [[ -z "$pins" ]] || printf '  %-14s pinned by: %s\n' "" "$pins"
-  done < <(_cbox_account_names)
-  if [[ -z "$any" ]]; then
-    echo "No saved accounts. Save the current login: cbox account add <name>"
-  elif [[ -f "$login" && -z "$current" ]]; then
-    echo "⚠  The current login is not saved (a /login since?). Save it: cbox account add <name>"
-  else
-    echo "(* = in use by all containers)"
-  fi
-}
-
-_cbox_account_remove() {
-  local alias="${1:-}" dir answer=""
-  [[ -n "$alias" ]] || { echo "Usage: cbox account remove <name>" >&2; return 1; }
-  _cbox_account_valid_name "$alias" || return 1
-  dir="$(_cbox_accounts_dir)/$alias"
-  [[ -f "$dir/.credentials.json" ]] || { echo "✘ No saved account '$alias'." >&2; return 1; }
-  if [[ "$(_cbox_account_of "$CBOX_CLAUDE_DIR/.credentials.json")" == "$alias" ]]; then
-    echo "✘ '$alias' is in use. Switch first: cbox account use <name>" >&2
-    return 1
-  fi
-  local pins
-  pins=$(_cbox_account_pinned_by "$alias" | paste -sd, - | sed 's/,/, /g')
-  if [[ -n "$pins" ]]; then
-    echo "✘ '$alias' is pinned by: $pins. Remove 'account = $alias' from their .cbox and run cbox reset there first." >&2
-    return 1
-  fi
-  if [[ ! -t 0 ]]; then
-    echo "✘ Run cbox account remove in a terminal to confirm." >&2
-    return 1
-  fi
-  printf "Remove the saved account '%s'? Its login is gone for cbox afterwards. [y/N] " "$alias"
-  read -r answer || answer=""
-  [[ "$answer" == [yY]* ]] || return 1
-  rm -rf "${dir:?}"
-  echo "✔ Removed '$alias'."
-}
-
-# At session start: a login that is none of the saved accounts came from a
-# /login since. Say so, so it can be saved before a switch.
-_cbox_account_check() {
-  local login="$CBOX_CLAUDE_DIR/.credentials.json"
-  [[ -n "$(_cbox_account_names)" && -f "$login" ]] || return 0
-  [[ -n "$(_cbox_account_of "$login")" ]] && return 0
-  echo "ℹ  New Claude login found, not among your saved accounts. Save it: cbox account add <name>"
-}
-
-# Pins: the account a container was created with (cbox.account label). Each
-# session start records it in accounts/.pins/<container>, so cbox account use,
-# list and remove know them without asking the runtime.
+# Pins: the account recorded for a container (accounts/.pins/<container>).
 _cbox_account_pin_of() {
   local f
   f="$(_cbox_accounts_dir)/.pins/$1"
   [[ -f "$f" ]] && cat "$f"
   return 0
+}
+
+_cbox_account_pin_set() {
+  local f
+  f="$(_cbox_accounts_dir)/.pins/$1"
+  if [[ -n "${2:-}" ]]; then
+    mkdir -p "${f%/*}"
+    printf '%s\n' "$2" > "$f"
+  else
+    rm -f "$f"
+  fi
 }
 
 _cbox_account_pinned_by() {
@@ -6466,92 +6249,214 @@ _cbox_account_pinned_by() {
   return 0
 }
 
-# Whether the pinned account $1 is saved on this machine; says what to do if not.
-_cbox_account_pin_ok() {
-  [[ -f "$(_cbox_accounts_dir)/$1/.credentials.json" ]] && return 0
+# Says how to save the pinned account $1 when this machine does not have it.
+_cbox_account_missing() {
   echo "✘ This project uses the Claude account '$1' (account = $1 in .cbox), which is not saved here." >&2
-  echo "   Save it: in cbox, /login with that account, then cbox account add $1" >&2
-  echo "   (until then, run cbox in a project without the pin, or remove the line from .cbox)" >&2
-  return 1
+  echo "   Save it: claude setup-token (signed in to that account), then cbox account add $1" >&2
+  echo "   (or remove the line from .cbox)" >&2
 }
 
-# At session start: which account the container uses, a note when .cbox pins
-# another one than the container was created with, and the account's
-# oauthAccount in the project file. Fails when the pinned account is missing.
-# Silent without saved accounts.
-_cbox_account_start() {
-  local name="$1" have want pinfile known=0 alias changed
-  have=$(_cbox_rt_label "$name" cbox.account)
-  want=$(_cbox_project_account 2>/dev/null) || want="$have"
-  [[ -n "$have" ]] && { _cbox_account_pin_ok "$have" || return 1; }
-  [[ -z "$have" && -z "$(_cbox_account_names)" ]] && return 0
-  pinfile="$(_cbox_accounts_dir)/.pins/$name"
-  if [[ -n "$have" ]]; then
-    [[ "$(_cbox_account_pin_of "$name")" == "$have" ]] && known=1
-    mkdir -p "${pinfile%/*}"
-    printf '%s\n' "$have" > "$pinfile"
-    alias="$have"
-    echo "ℹ  Claude account: $have (pinned in .cbox)"
+_cbox_account_add() {
+  local alias="${1:-}" name="${2:-}" dir token a
+  [[ -n "$alias" ]] || { echo "Usage: cbox account add <name>" >&2; return 1; }
+  _cbox_account_valid_name "$alias" || return 1
+  if [[ -t 0 ]]; then
+    echo "Paste the token that claude setup-token printed (it starts with sk-ant-)."
+    echo "   No token yet: cbox shell, then claude setup-token, signed in to the account you want."
+    printf 'Token (hidden): '
+    IFS= read -rs token || token=""
+    echo
   else
-    rm -f "$pinfile"
-    alias=$(_cbox_account_of "$CBOX_CLAUDE_DIR/.credentials.json")
-    [[ -n "$alias" ]] && echo "ℹ  Claude account: $alias (cbox account use)"
+    IFS= read -r token || [[ -n "$token" ]] || token=""
   fi
-  # With a terminal, _cbox_ensure asked before the session already.
-  if [[ "$want" != "$have" && ! -t 0 ]]; then
-    echo "⚠  .cbox pins the account ${want:-(none)}, but this container uses ${have:-the one of cbox account use}."
-    echo "   The account is set when a container is created: cbox reset"
+  token="${token//[[:space:]]/}"
+  if [[ ! "$token" =~ ^sk-ant-[A-Za-z0-9_-]+$ ]]; then
+    echo "✘ That is not a token from claude setup-token (those start with sk-ant-). Nothing saved." >&2
+    return 1
   fi
-  local saved project="$CBOX_DATA_DIR/.claude-$name.json"
-  saved="$(_cbox_accounts_dir)/$alias/account.json"
-  if [[ -n "$alias" && -f "$saved" && -f "$project" ]]; then
-    changed=$(python3 -c "$(_cbox_account_py)" sync "$saved" "$project" "$known")
-    if [[ -n "$changed" ]]; then
-      echo "⚠  A /login in this project replaced the login saved as '$alias': it is now $changed."
-      echo "   If that is wrong: /login here with the right account. Logins in a pinned project stay in its account."
+  while IFS= read -r a; do
+    [[ -n "$a" && "$a" != "$alias" ]] || continue
+    if [[ "$(cat "$(_cbox_accounts_dir)/$a/token")" == "$token" ]]; then
+      echo "✘ This token is already saved as '$a'." >&2
+      return 1
+    fi
+  done <<< "$(_cbox_account_names)"
+  dir="$(_cbox_accounts_dir)/$alias"
+  local had=""
+  _cbox_account_saved "$alias" && had=1
+  mkdir -p "$dir"
+  chmod 700 "$(_cbox_accounts_dir)" "$dir"
+  ( umask 077; printf '%s\n' "$token" > "$dir/token.cbox-tmp" ) && mv -f "$dir/token.cbox-tmp" "$dir/token"
+  if [[ -n "$had" ]]; then
+    echo "✔ Updated the token of '$alias'. Sessions use it from their next start."
+  else
+    echo "✔ Saved the Claude account '$alias'."
+  fi
+  if [[ -z "$(_cbox_account_default)" ]]; then
+    printf '%s\n' "$alias" > "$(_cbox_accounts_dir)/.default"
+    echo "   It is the default for all projects now (cbox account use <name> changes that)."
+  elif [[ "$(_cbox_account_default)" != "$alias" ]]; then
+    echo "   Use it for all projects: cbox account use $alias — or for one: account = $alias in its .cbox"
+  fi
+  [[ -z "$name" ]] || _cbox_account_pin_note "$name"
+}
+
+_cbox_account_use() {
+  local alias="${1:-}" name="${2:-}"
+  [[ -n "$alias" ]] || { echo "Usage: cbox account use <name>" >&2; return 1; }
+  if ! _cbox_account_saved "$alias"; then
+    echo "✘ No saved account '$alias'. Saved: $(_cbox_account_list_inline)" >&2
+    return 1
+  fi
+  printf '%s\n' "$alias" > "$(_cbox_accounts_dir)/.default"
+  echo "✔ Projects without a pin use '$alias' from their next session start."
+  [[ -z "$name" ]] || _cbox_account_pin_note "$name"
+}
+
+# After add/use in a project: say when its pin keeps it on another account.
+_cbox_account_pin_note() {
+  local pin
+  pin=$(_cbox_account_pin_of "$1")
+  [[ -n "$pin" && "$pin" != "$(_cbox_account_default)" ]] || return 0
+  echo "   This project is pinned to '$pin' (account = $pin in .cbox) and stays on it."
+}
+
+_cbox_account_list() {
+  local default a mark pins saved any=""
+  default=$(_cbox_account_default)
+  while IFS= read -r a; do
+    [[ -n "$a" ]] || continue
+    any=1
+    mark=" "; [[ "$a" == "$default" ]] && mark="*"
+    saved=$(date -r "$(_cbox_accounts_dir)/$a/token" +%Y-%m-%d 2>/dev/null)
+    printf '%s %-14s saved %s\n' "$mark" "$a" "$saved"
+    pins=$(_cbox_account_pinned_by "$a" | paste -sd, - | sed 's/,/, /g')
+    [[ -z "$pins" ]] || printf '  %-14s pinned by: %s\n' "" "$pins"
+  done <<< "$(_cbox_account_names)"
+  if [[ -z "$any" ]]; then
+    echo "No saved accounts: containers use Claude Code's own login (/login)."
+    echo "Add one: cbox shell, claude setup-token, then cbox account add <name>"
+  else
+    echo "(* = default for projects without a pin; tokens from claude setup-token last a year)"
+  fi
+}
+
+_cbox_account_remove() {
+  local alias="${1:-}" dir answer="" pins
+  [[ -n "$alias" ]] || { echo "Usage: cbox account remove <name>" >&2; return 1; }
+  _cbox_account_valid_name "$alias" || return 1
+  dir="$(_cbox_accounts_dir)/$alias"
+  _cbox_account_saved "$alias" || { echo "✘ No saved account '$alias'." >&2; return 1; }
+  pins=$(_cbox_account_pinned_by "$alias" | paste -sd, - | sed 's/,/, /g')
+  if [[ -n "$pins" ]]; then
+    echo "✘ '$alias' is pinned by: $pins. Remove 'account = $alias' from their .cbox first." >&2
+    return 1
+  fi
+  if [[ ! -t 0 ]]; then
+    echo "✘ Run cbox account remove in a terminal to confirm." >&2
+    return 1
+  fi
+  printf "Remove the saved account '%s'? [y/N] " "$alias"
+  read -r answer || answer=""
+  [[ "$answer" == [yY]* ]] || return 1
+  local was_default=""
+  [[ "$(_cbox_account_default)" == "$alias" ]] && was_default=1
+  rm -rf "${dir:?}"
+  echo "✔ Removed '$alias'."
+  if [[ -n "$was_default" ]]; then
+    rm -f "$(_cbox_accounts_dir)/.default"
+    if [[ -n "$(_cbox_account_names)" ]]; then
+      echo "   It was the default; projects without a pin use Claude Code's own login now. Pick another: cbox account use <name>"
+    else
+      echo "   Containers use Claude Code's own login (/login) again."
     fi
   fi
   return 0
 }
 
-# Before a session in an existing container: when .cbox pins another account
-# than the container was created with, asks in the terminal whether to apply
-# it, and removes the container on yes (the caller creates it again, which
-# reads .cbox). The question is answered on the host, so code in the container
-# that wrote .cbox cannot answer it. Succeeds only when the container is gone.
-_cbox_account_pin_ask() {
-  local name="$1" have want answer="" out=/dev/stdout
-  want=$(_cbox_project_account 2>/dev/null) || return 1
-  # No pin and no saved accounts: nothing can differ (a pin needs one).
-  [[ -z "$want" && -z "$(_cbox_account_names)" ]] && return 1
-  [[ "$(_cbox_rt_label "$name" cbox.agent)" == "claude" ]] || return 1
-  have=$(_cbox_rt_label "$name" cbox.account)
-  [[ "$want" == "$have" ]] && return 1
-  [[ -t 0 ]] || return 1  # no terminal: the session start warns instead
-  _cbox_busy_hold && out=/dev/tty
-  if [[ -n "$want" ]] && ! _cbox_account_pin_ok "$want" 2>"$out"; then
-    echo "   Keeping this container's account for now." > "$out"
-    _cbox_busy_release
-    return 1
-  fi
-  {
-    if [[ -n "$want" ]]; then
-      echo "⚠  .cbox now pins the Claude account '$want' (this container uses ${have:+"'$have'"}${have:-the one of cbox account use})."
+# Drops the cached oauthAccount (the account Claude Code shows, with its
+# org) from the project's ~/.claude.json, so Claude Code reads it anew for the
+# token it gets. In place: the file is a single-file mount.
+_cbox_account_forget_profile() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  python3 - "$f" <<'EOF' || true
+import json, sys
+p = sys.argv[1]
+try:
+    with open(p) as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    sys.exit(0)
+if not isinstance(data, dict) or "oauthAccount" not in data:
+    sys.exit(0)
+del data["oauthAccount"]
+with open(p, "r+") as fh:
+    fh.seek(0)
+    fh.write(json.dumps(data, indent=2))
+    fh.truncate()
+EOF
+}
+
+# At session start: settles the container's account and sets
+# _CBOX_ACCOUNT_TOKEN to the token to hand Claude Code (empty: its own login).
+# A pin in .cbox that differs from the recorded one asks in the terminal (the
+# host's: code in the container cannot answer). Fails when the account to use
+# is not saved here. Silent without saved accounts and pins.
+_cbox_account_start() {
+  local name="$1" have want alias how answer="" out=/dev/stdout last lastfile
+  _CBOX_ACCOUNT_TOKEN=""
+  have=$(_cbox_account_pin_of "$name")
+  want=$(_cbox_project_account 2>/dev/null) || want="$have"
+  [[ -z "$have" && -z "$want" && -z "$(_cbox_account_names)" ]] && return 0
+  if [[ "$want" != "$have" ]]; then
+    if [[ -n "$want" ]] && ! _cbox_account_saved "$want"; then
+      _cbox_account_missing "$want"
+      [[ -n "$have" ]] && echo "   Keeping '$have' for now." >&2
+    elif [[ -t 0 ]]; then
+      _cbox_busy_hold && out=/dev/tty
+      {
+        if [[ -n "$want" ]]; then
+          echo "⚠  .cbox now pins the Claude account '$want' (this project used ${have:+"'$have'"}${have:-the default})."
+          printf "   Use '%s' here from now on? [y/N] " "$want"
+        else
+          echo "⚠  .cbox no longer pins an account (this project used '$have')."
+          printf '   Use the default from now on? [y/N] '
+        fi
+      } > "$out"
+      read -r answer || answer=""
+      _cbox_busy_release
+      if [[ "$answer" == [yY]* ]]; then
+        _cbox_account_pin_set "$name" "$want"
+        have="$want"
+      else
+        echo "   Not now: cbox asks again at the next start." > "$out"
+      fi
     else
-      echo "⚠  .cbox no longer pins an account (this container is pinned to '$have')."
+      echo "⚠  .cbox pins the account ${want:-(none)}, but this project uses ${have:-the default}."
+      echo "   Start cbox in a terminal to switch."
     fi
-    echo "   Applying it recreates the container: the project folder and Claude's data stay,"
-    echo "   anything installed inside the container by hand goes."
-    printf '   Apply it now? [y/N] '
-  } > "$out"
-  read -r answer || answer=""
-  _cbox_busy_release
-  if [[ "$answer" != [yY]* ]]; then
-    echo "   Not now: cbox asks again at the next start." > "$out"
-    return 1
   fi
-  _cbox_reset_ask "$name" || return 1
-  _cbox_remove "$name"
+  if [[ -n "$have" ]]; then
+    _cbox_account_saved "$have" || { _cbox_account_missing "$have"; return 1; }
+    alias="$have" how="pinned in .cbox"
+  else
+    alias=$(_cbox_account_default) how="default"
+  fi
+  lastfile="$(_cbox_accounts_dir)/.last/$name"
+  last=""; [[ -f "$lastfile" ]] && last=$(cat "$lastfile")
+  if [[ -z "$alias" ]]; then
+    [[ -z "$last" ]] || _cbox_account_forget_profile "$CBOX_DATA_DIR/.claude-$name.json"
+    rm -f "$lastfile"
+    return 0
+  fi
+  if [[ "$last" != "$alias" ]]; then
+    _cbox_account_forget_profile "$CBOX_DATA_DIR/.claude-$name.json"
+    mkdir -p "${lastfile%/*}"
+    printf '%s\n' "$alias" > "$lastfile"
+  fi
+  _CBOX_ACCOUNT_TOKEN=$(cat "$(_cbox_accounts_dir)/$alias/token")
+  echo "ℹ  Claude account: $alias ($how)"
   return 0
 }
 
@@ -7023,10 +6928,9 @@ _cbox_create() {
   fi
   # Warnings about the .cbox came with the ports (normal mode); its errors once.
   _memory=$(_cbox_project_memory 2>/dev/null) || { _cbox_project_settings >/dev/null; return 1; }
-  local _account=""
+  # A new container takes the account .cbox pins (afterwards a change asks).
   if [[ "$agent_bin" == "claude" ]]; then
-    _account=$(_cbox_project_account)
-    if [[ -n "$_account" ]] && ! _cbox_account_pin_ok "$_account"; then return 1; fi
+    _cbox_account_pin_set "$name" "$(_cbox_project_account)"
   fi
 
   _cbox_step "Creating $mode container '$name' ($agent_bin)..."
@@ -7049,7 +6953,6 @@ _cbox_create() {
   )
   # The pin is the container's from now on: .cbox is writable from inside,
   # a change there takes effect only through cbox reset (as ports do).
-  [[ -n "$_account" ]] && args+=(--label "cbox.account=$_account")
 
   if [[ "$agent_bin" == "claude" ]]; then
     args+=(-v "$claude_json:/home/claude/.claude.json")
@@ -7127,10 +7030,6 @@ _cbox_create() {
       -v "$CBOX_SHARE_DIR:/home/claude/share"
       -v "$CBOX_PLAYWRIGHT_DIR:/opt/ms-playwright"
     )
-    # A pinned account's login over the shared one. Claude Code rewrites the
-    # file in place, so its refreshes reach the saved account.
-    [[ -n "$_account" ]] &&
-      args+=(-v "$(_cbox_accounts_dir)/$_account/.credentials.json:/home/claude/.claude/.credentials.json")
     while IFS= read -r _cm; do
       [[ -n "$_cm" ]] && args+=(-v "$_cm")
     done <<<"$config_mounts"
@@ -7147,7 +7046,7 @@ _cbox_create() {
   if [[ "$mode" == "safe" ]]; then
     local _net
     _net=$(_cbox_safe_network) || return 1
-    _cbox_safe_claude_dir "$name" "$_account"
+    _cbox_safe_claude_dir "$name"
     args+=(
       --network "$_net"
       --label "cbox.egress=allowlist"
@@ -7325,12 +7224,6 @@ _cbox_ensure() {
     echo "Container '$name' already exists in '$actual_mode' mode."
     echo "Requested mode: '$requested_mode'"
     return 1
-  fi
-
-  # .cbox pins another account than the container has: recreate it, if you say so.
-  if _cbox_account_pin_ask "$name"; then
-    _cbox_create "$name" "$requested_mode"
-    return
   fi
 
   _cbox_project_check "$name" || return 1
@@ -7702,7 +7595,7 @@ _cbox_enter() {
     while IFS= read -r _p; do _exec_args+=("$_p"); done < <(_cbox_proxy_args)
     # Telemetry and error reports would only be blocked by the proxy.
     _exec_args+=(-e "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1")
-    _cbox_safe_claude_dir "$name" "$(_cbox_rt_label "$name" cbox.account)"
+    _cbox_safe_claude_dir "$name"
     # Containers made by an older cbox lack what their labels name.
     if [[ "$(_cbox_rt_label "$name" cbox.safe-login)" != "shared" ]]; then
       echo "⚠  This safe container was created by an older cbox:"
@@ -7744,7 +7637,16 @@ _cbox_enter() {
   fi
 
   if [[ "$agent_bin" == "claude" ]]; then
-    _cbox_account_check
+    # The account's token (cbox account). Docker takes the value from its
+    # environment, not from its arguments, which other users can read on
+    # Linux; macOS shows a process's arguments only to its own user.
+    if [[ -n "${_CBOX_ACCOUNT_TOKEN:-}" ]]; then
+      if [[ "$_CBOX_RUNTIME" == "docker" ]]; then
+        _exec_args+=(-e CLAUDE_CODE_OAUTH_TOKEN)
+      else
+        _exec_args+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$_CBOX_ACCOUNT_TOKEN")
+      fi
+    fi
     [[ "$mode" != "safe" ]] && _cbox_mcp_relay_start "$name"
     _cbox_generate_claude_json "$name" "$mode" "$_warden_mcp"
     # Mail wakes the idle agent: hooks of cbox's own settings file, next to
@@ -7795,7 +7697,7 @@ _cbox_enter() {
   # The agent's exit status is irrelevant here, but under the script's
   # `set -e` a non-zero one would skip every teardown step below —
   # including stopping the container.
-  $_CBOX_CMD exec "${_exec_args[@]}" "$name" zsh -ic "$_run" || true
+  CLAUDE_CODE_OAUTH_TOKEN="${_CBOX_ACCOUNT_TOKEN:-}" $_CBOX_CMD exec "${_exec_args[@]}" "$name" zsh -ic "$_run" || true
   trap - HUP TERM
 
   _cbox_busy_begin "closing session..."

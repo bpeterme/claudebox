@@ -5693,189 +5693,108 @@ SH
 # --- accounts -------------------------------------------------------------
 
 _acct_setup() {
-  LOGIN="$CBOX_CLAUDE_DIR/.credentials.json"
   AD="$CBOX_DATA_DIR/accounts"
-  command rm -rf "$AD" "$CBOX_CLAUDE_DIR/.oauth_refresh.lock"
-  echo '{"claudeAiOauth":{"accessToken":"a1","subscriptionType":"max"}}' > "$LOGIN"
-  echo '{"oauthAccount":{"emailAddress":"one@example.com","accountUuid":"u1"},"keep":1}' \
+  command rm -rf "$AD"
+  echo '{"oauthAccount":{"emailAddress":"one@example.com"},"keep":1}' \
     > "$CBOX_DATA_DIR/.claude-proj.json"
-  echo '{"keep":2}' > "$CBOX_DATA_DIR/.claude-other.json"
 }
 
-# /login with another account in a container: Claude Code replaces the file.
-_acct_login() {
-  command rm -f "$LOGIN"
-  echo "{\"claudeAiOauth\":{\"accessToken\":\"$1\",\"subscriptionType\":\"pro\"}}" > "$LOGIN"
-  echo "{\"oauthAccount\":{\"emailAddress\":\"$2\",\"accountUuid\":\"$1\"},\"keep\":1}" \
-    > "$CBOX_DATA_DIR/.claude-proj.json"
-}
+# Saves account $1 with token $2 (as if pasted, without a terminal).
+_acct_add() { printf '%s\n' "$2" | _cbox_account_cmd proj add "$1"; }
 
 @test "account: without saved accounts nothing changes" {
   _acct_setup
   run _cbox_account_cmd proj
   [[ "$output" == *"No saved accounts"* ]]
-  run _cbox_account_check
-  [ -z "$output" ]
+  _cbox_account_start proj
+  [ -z "$_CBOX_ACCOUNT_TOKEN" ]
   [ ! -e "$AD" ]
 }
 
-@test "account add: the saved login is the login in use (one file), with its oauthAccount" {
+@test "account add: saves the token privately; the first one becomes the default" {
   _acct_setup
-  run _cbox_account_cmd proj add personal
+  run _acct_add personal sk-ant-oat01-aaa
   [ "$status" -eq 0 ]
-  [[ "$output" == *"'personal' (one@example.com)"* ]]
-  [ "$AD/personal/.credentials.json" -ef "$LOGIN" ]
+  [[ "$output" == *"Saved the Claude account 'personal'"* ]]
+  [[ "$output" == *"default for all projects now"* ]]
+  [ "$(cat "$AD/personal/token")" = sk-ant-oat01-aaa ]
+  [ "$(stat -c %a "$AD/personal/token" 2>/dev/null || stat -f %Lp "$AD/personal/token")" = 600 ]
   [ "$(stat -c %a "$AD" 2>/dev/null || stat -f %Lp "$AD")" = 700 ]
-  [ "$(stat -c %a "$LOGIN" 2>/dev/null || stat -f %Lp "$LOGIN")" = 600 ]
-  [ "$(jq -r .emailAddress "$AD/personal/account.json")" = "one@example.com" ]
-  # A refresh in a container (in place) updates the saved account.
-  echo '{"claudeAiOauth":{"accessToken":"a2"}}' > "$LOGIN"
-  [ "$(jq -r .claudeAiOauth.accessToken "$AD/personal/.credentials.json")" = "a2" ]
+  run _acct_add work sk-ant-oat01-bbb
+  [[ "$output" == *"cbox account use work"* ]]
+  [ "$(_cbox_account_default)" = personal ]
 }
 
-@test "account add: one login cannot be saved under two names; adding an alias again updates it" {
+@test "account add: refuses what is not a token, the same token twice and bad names; updates an alias" {
   _acct_setup
-  _cbox_account_cmd proj add personal >/dev/null
-  run _cbox_account_cmd proj add work
+  run _acct_add personal "not a token"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"not a token from claude setup-token"* ]]
+  [ ! -e "$AD/personal" ]
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  run _acct_add work sk-ant-oat01-aaa
   [ "$status" -eq 1 ]
   [[ "$output" == *"already saved as 'personal'"* ]]
-  [ ! -e "$AD/work" ]
-  run _cbox_account_cmd proj add personal
-  [ "$status" -eq 0 ]
-  _acct_login a9 one@example.com   # the same account, logged in again
-  _cbox_account_cmd proj add personal >/dev/null
-  [ "$AD/personal/.credentials.json" -ef "$LOGIN" ]
-  [ "$(jq -r .claudeAiOauth.accessToken "$AD/personal/.credentials.json")" = "a9" ]
-}
-
-@test "account add: outside the project, the most recently changed project names the account" {
-  _acct_setup
-  echo '{"oauthAccount":{"emailAddress":"old@example.com"}}' > "$CBOX_DATA_DIR/.claude-aaa.json"
-  touch -t 200001010000 "$CBOX_DATA_DIR/.claude-aaa.json"
-  run _cbox_account_cmd elsewhere add personal
-  [[ "$output" == *"(one@example.com)"* ]]
-}
-
-@test "account add: no login, or a bad name, is refused" {
-  _acct_setup
-  run _cbox_account_cmd proj add ../x
+  run _acct_add ../x sk-ant-oat01-ccc
   [ "$status" -eq 1 ]
-  command rm -f "$LOGIN"
-  run _cbox_account_cmd proj add personal
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"/login"* ]]
+  [[ "$output" == *"cannot be an account name"* ]]
+  run _acct_add personal sk-ant-oat01-new
+  [[ "$output" == *"Updated the token of 'personal'"* ]]
+  [ "$(cat "$AD/personal/token")" = sk-ant-oat01-new ]
 }
 
-@test "account use: switches the login of all containers and every project's oauthAccount" {
+@test "account use: sets the default; unknown names list the saved ones" {
   _acct_setup
-  _cbox_account_cmd proj add personal >/dev/null
-  _acct_login w1 two@example.com
-  _cbox_account_cmd proj add work >/dev/null
-  run _cbox_account_cmd proj use personal
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"now use 'personal' (one@example.com)"* ]]
-  [ "$LOGIN" -ef "$AD/personal/.credentials.json" ]
-  [ "$(jq -r .oauthAccount.emailAddress "$CBOX_DATA_DIR/.claude-proj.json")" = "one@example.com" ]
-  [ "$(jq -r .oauthAccount.emailAddress "$CBOX_DATA_DIR/.claude-other.json")" = "one@example.com" ]
-  [ "$(jq -r .keep "$CBOX_DATA_DIR/.claude-other.json")" = 2 ]
-  # The saved work login is untouched, and the lock is released.
-  [ "$(jq -r .claudeAiOauth.accessToken "$AD/work/.credentials.json")" = "w1" ]
-  [ ! -e "$CBOX_CLAUDE_DIR/.oauth_refresh.lock" ]
-  [ ! -e "$LOGIN.cbox-tmp" ]
-  run _cbox_account_cmd proj use personal
-  [[ "$output" == *"already use 'personal'"* ]]
-  run _cbox_account_cmd proj list
-  printf '%s\n' "$output"   # shown when the test fails
-  [[ "${lines[0]}" == "* personal"*"one@example.com"*"max" ]]
-  [[ "${lines[1]}" == "  work"*"two@example.com"*"pro"* ]]
-}
-
-@test "account use: a login that is not saved is not thrown away" {
-  _acct_setup
-  _cbox_account_cmd proj add personal >/dev/null
-  _acct_login n1 new@example.com
-  run _cbox_account_cmd proj use personal
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"not saved"* ]]
-  [ "$(jq -r .claudeAiOauth.accessToken "$LOGIN")" = "n1" ]
-  run _cbox_account_check
-  [[ "$output" == *"New Claude login found"* ]]
-  run _cbox_account_cmd proj list
-  [[ "$output" == *"not saved"* ]]
-}
-
-@test "account use: unknown name lists the saved ones" {
-  _acct_setup
-  _cbox_account_cmd proj add personal >/dev/null
-  run _cbox_account_cmd proj use nope
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"Saved: personal"* ]]
-}
-
-@test "account use: waits for Claude Code's refresh lock, takes over a stale one" {
-  _acct_setup
-  _cbox_account_cmd proj add personal >/dev/null
-  _acct_login w1 two@example.com
-  _cbox_account_cmd proj add work >/dev/null
-  mkdir "$CBOX_CLAUDE_DIR/.oauth_refresh.lock"
-  ( sleep 2; rmdir "$CBOX_CLAUDE_DIR/.oauth_refresh.lock" ) &
-  local start=$SECONDS
-  run _cbox_account_cmd proj use personal
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"waiting"* ]]
-  (( SECONDS - start >= 2 ))
-  mkdir "$CBOX_CLAUDE_DIR/.oauth_refresh.lock"
-  touch -t 200001010000 "$CBOX_CLAUDE_DIR/.oauth_refresh.lock"
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  _acct_add work sk-ant-oat01-bbb >/dev/null
   run _cbox_account_cmd proj use work
   [ "$status" -eq 0 ]
-  [[ "$output" != *"waiting"* ]]
-  [ "$LOGIN" -ef "$AD/work/.credentials.json" ]
-  [ ! -e "$CBOX_CLAUDE_DIR/.oauth_refresh.lock" ]
+  [[ "$output" == *"use 'work' from their next session start"* ]]
+  [ "$(_cbox_account_default)" = work ]
+  run _cbox_account_cmd proj use nope
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Saved: personal, work"* ]]
 }
 
-@test "account: another disk is refused with a hint, nothing half-done" {
+@test "account list: marks the default, shows pins" {
   _acct_setup
-  ln() { return 1; }
-  run _cbox_account_cmd proj add personal
-  unset -f ln
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  _acct_add work sk-ant-oat01-bbb >/dev/null
+  _cbox_account_pin_set otherproj work
+  run _cbox_account_cmd proj list
+  echo "$output"
+  [[ "$output" == *"* personal"* ]]
+  [[ "$output" == *"  work"* ]]
+  [[ "$output" == *"pinned by: otherproj"* ]]
+  [[ "$output" != *"sk-ant"* ]]
+}
+
+@test "account remove: not while pinned; asks in a terminal only; the default goes with it" {
+  _acct_setup
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  _cbox_account_pin_set otherproj personal
+  run _cbox_account_cmd proj remove personal
   [ "$status" -eq 1 ]
-  [[ "$output" == *"same disk"* ]]
+  [[ "$output" == *"pinned by: otherproj"* ]]
+  _cbox_account_pin_set otherproj ""
+  run _cbox_account_cmd proj remove personal </dev/null
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"in a terminal"* ]]
+  [ -f "$AD/personal/token" ]
+  cat > "$BATS_TMPDIR/acct-rm.sh" <<SH
+source "$CBOX_SH"
+_cbox_account_cmd proj remove personal
+SH
+  run _in_pty "$BATS_TMPDIR/acct-rm.sh" $'y\n'
+  [[ "$output" == *"Removed 'personal'"* ]]
+  [[ "$output" == *"own login (/login) again"* ]]
   [ ! -e "$AD/personal" ]
-}
-
-@test "account use: a safe container follows the switch, not its newer old login" {
-  _acct_setup
-  SD="$CBOX_DATA_DIR/safe-claude/sbox"
-  _cbox_account_cmd proj add personal >/dev/null
-  _acct_login w1 two@example.com
-  _cbox_account_cmd proj add work >/dev/null
-  _cbox_safe_claude_dir sbox
-  [ "$SD/.credentials.json" -ef "$AD/work/.credentials.json" ]
-  _cbox_account_cmd proj use personal >/dev/null
-  # The safe session refreshed work's token meanwhile: newer than personal's.
-  touch -t 200001010000 "$AD/personal/.credentials.json"
-  _cbox_safe_claude_dir sbox
-  [ "$SD/.credentials.json" -ef "$AD/personal/.credentials.json" ]
-  [ "$LOGIN" -ef "$AD/personal/.credentials.json" ]
-}
-
-@test "account remove: not the one in use; asks in a terminal only" {
-  _acct_setup
-  _cbox_account_cmd proj add personal >/dev/null
-  _acct_login w1 two@example.com
-  _cbox_account_cmd proj add work >/dev/null
-  run _cbox_account_cmd proj remove work
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"in use"* ]]
-  run _cbox_account_cmd proj remove personal < /dev/null
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"terminal"* ]]
-  [ -f "$AD/personal/.credentials.json" ]
+  [ -z "$(_cbox_account_default)" ]
 }
 
 @test "account: completions offer subcommands and saved names" {
   _acct_setup
-  _cbox_account_cmd proj add personal >/dev/null
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
   run _cbox_complete account
   [[ "$output" == *use* && "$output" == *remove* ]]
   run _cbox_complete account use
@@ -5884,15 +5803,46 @@ _acct_login() {
   [[ "$output" == *account* ]]
 }
 
+@test "account start: the default's token for Claude Code; a switch drops the cached profile" {
+  _acct_setup
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  _acct_add work sk-ant-oat01-bbb >/dev/null
+  cd "$BATS_TMPDIR"
+  _cbox_account_start proj >"$BATS_TMPDIR/acct-out"
+  [ "$_CBOX_ACCOUNT_TOKEN" = sk-ant-oat01-aaa ]
+  run cat "$BATS_TMPDIR/acct-out"
+  [[ "$output" == *"Claude account: personal (default)"* ]]
+  # First use of an account: the cached profile may be another one's.
+  run cat "$CBOX_DATA_DIR/.claude-proj.json"
+  [[ "$output" != *oauthAccount* ]]
+  [[ "$output" == *keep* ]]
+  # The same account again keeps what Claude Code cached meanwhile.
+  echo '{"oauthAccount":{"emailAddress":"p@example.com"},"keep":1}' > "$CBOX_DATA_DIR/.claude-proj.json"
+  _cbox_account_start proj >/dev/null
+  run cat "$CBOX_DATA_DIR/.claude-proj.json"
+  [[ "$output" == *oauthAccount* ]]
+  _cbox_account_cmd proj use work >/dev/null
+  _cbox_account_start proj >/dev/null
+  [ "$_CBOX_ACCOUNT_TOKEN" = sk-ant-oat01-bbb ]
+  run cat "$CBOX_DATA_DIR/.claude-proj.json"
+  [[ "$output" != *oauthAccount* ]]
+}
+
+@test "account start: without accounts or a pin, silent" {
+  _acct_setup
+  cd "$BATS_TMPDIR"
+  run _cbox_account_start proj
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
 # --- account pins -----------------------------------------------------------
 
-# Saved accounts personal (in use) and work; a project folder to cd into.
+# Saved accounts personal (default) and work; a project folder to cd into.
 _pin_setup() {
   _acct_setup
-  _cbox_account_cmd proj add personal >/dev/null
-  _acct_login w1 two@example.com
-  _cbox_account_cmd proj add work >/dev/null
-  _cbox_account_cmd proj use personal >/dev/null
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  _acct_add work sk-ant-oat01-bbb >/dev/null
   PROJ="$BATS_TMPDIR/pinproj"
   command rm -rf "$PROJ"; mkdir -p "$PROJ"
   cd "$PROJ"
@@ -5908,7 +5858,7 @@ _pin_setup() {
   [[ "$output" == *"not an account name"* ]]
 }
 
-@test "account pin: a normal container gets the pinned login mounted, and a label" {
+@test "account pin: a new container records the pin; no mount, no label" {
   _pin_setup
   printf '[container]\n  account = work\n' > .cbox
   local capture="$BATS_TMPDIR/create-pin"
@@ -5916,106 +5866,90 @@ _pin_setup() {
   _CBOX_CMD=_fake_runtime
   _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
   command rm -f "$capture"; _cbox_create pinproj normal
-  run cat "$capture"
-  [[ "$output" == *"cbox.account=work"* ]]
-  [[ "$output" == *"$AD/work/.credentials.json:/home/claude/.claude/.credentials.json"* ]]
-  # Without a pin: neither.
-  command rm -f .cbox "$capture"; _cbox_create pinproj normal
+  [ "$(_cbox_account_pin_of pinproj)" = work ]
   run cat "$capture"
   [[ "$output" != *"cbox.account"* ]]
-  [[ "$output" != *"/home/claude/.claude/.credentials.json"* ]]
+  [[ "$output" != *"accounts"* ]]
+  # Created again without a pin: the record goes.
+  command rm -f .cbox; _cbox_create pinproj normal
+  [ -z "$(_cbox_account_pin_of pinproj)" ]
 }
 
-@test "account pin: a missing account stops the create with what to do" {
-  _pin_setup
-  printf '[container]\n  account = client-a\n' > .cbox
-  _CBOX_RUNTIME=docker
-  _CBOX_CMD=_fake_runtime
-  _fake_runtime() { echo "ran"; }
-  run _cbox_create pinproj normal
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"cbox account add client-a"* ]]
-  [[ "$output" != *"ran"* ]]
-}
-
-@test "account pin: a safe container links the pinned login, and keeps it after a switch" {
-  _pin_setup
-  local SD="$CBOX_DATA_DIR/safe-claude/sbox"
-  _cbox_safe_claude_dir sbox work
-  [ "$SD/.credentials.json" -ef "$AD/work/.credentials.json" ]
-  [ "$LOGIN" -ef "$AD/personal/.credentials.json" ]
-  _cbox_account_cmd proj use work >/dev/null
-  _cbox_account_cmd proj use personal >/dev/null
-  _cbox_safe_claude_dir sbox work
-  [ "$SD/.credentials.json" -ef "$AD/work/.credentials.json" ]
-}
-
-@test "account pin: session start names the account, records the pin, writes its oauthAccount" {
+@test "account pin: the pin wins over the default" {
   _pin_setup
   printf '[container]\n  account = work\n' > .cbox
-  _cbox_rt_label() { [[ "$2" == cbox.account ]] && echo work; }
-  echo '{"oauthAccount":{"emailAddress":"one@example.com","accountUuid":"a1"}}' > "$CBOX_DATA_DIR/.claude-pinproj.json"
-  run _cbox_account_start pinproj
-  [ "$status" -eq 0 ]
+  _cbox_account_pin_set pinproj work
+  _cbox_account_start pinproj >"$BATS_TMPDIR/acct-out"
+  [ "$_CBOX_ACCOUNT_TOKEN" = sk-ant-oat01-bbb ]
+  run cat "$BATS_TMPDIR/acct-out"
   [[ "$output" == *"Claude account: work (pinned in .cbox)"* ]]
-  [ "$(cat "$AD/.pins/pinproj")" = work ]
-  [ "$(jq -r .oauthAccount.emailAddress "$CBOX_DATA_DIR/.claude-pinproj.json")" = "two@example.com" ]
-  # cbox account use leaves the pinned project alone, and says so there.
-  run _cbox_account_cmd pinproj use work
   run _cbox_account_cmd pinproj use personal
-  [[ "$output" == *"stays on 'work'"* ]]
-  [ "$(jq -r .oauthAccount.emailAddress "$CBOX_DATA_DIR/.claude-pinproj.json")" = "two@example.com" ]
-  [ "$(jq -r .oauthAccount.emailAddress "$CBOX_DATA_DIR/.claude-proj.json")" = "one@example.com" ]
-  # list and remove know the pin.
-  run _cbox_account_cmd proj list
-  [[ "$output" == *"pinned by: pinproj"* ]]
-  run _cbox_account_cmd proj remove work
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"pinned by: pinproj"* ]]
-}
-
-@test "account pin: a changed .cbox takes effect only at cbox reset" {
-  _pin_setup
-  printf '[container]\n  account = work\n' > .cbox
-  _cbox_rt_label() { :; }   # created without a pin
-  run _cbox_account_start pinproj
-  [[ "$output" == *"Claude account: personal"* ]]
-  [[ "$output" == *"cbox reset"* ]]
-  [ ! -e "$AD/.pins/pinproj" ]
-  # Pinned at create, pin removed from .cbox since: still pinned until reset.
-  command rm -f .cbox
-  _cbox_rt_label() { [[ "$2" == cbox.account ]] && echo work; }
-  run _cbox_account_start pinproj
-  [[ "$output" == *"Claude account: work (pinned"* ]]
-  [[ "$output" == *"cbox reset"* ]]
+  [[ "$output" == *"pinned to 'work'"* ]]
 }
 
 @test "account pin: session start stops when the pinned account is not saved here" {
   _pin_setup
-  _cbox_rt_label() { [[ "$2" == cbox.account ]] && echo client-a; }
+  printf '[container]\n  account = client-a\n' > .cbox
+  _cbox_account_pin_set pinproj client-a
   run _cbox_account_start pinproj
   [ "$status" -eq 1 ]
   [[ "$output" == *"cbox account add client-a"* ]]
 }
 
-@test "account pin: a /login in a pinned project renames the account, and says so" {
-  _pin_setup
-  _cbox_rt_label() { [[ "$2" == cbox.account ]] && echo work; }
-  echo '{"keep":1}' > "$CBOX_DATA_DIR/.claude-pinproj.json"
-  _cbox_account_start pinproj >/dev/null
-  # /login with another account in the container: the project file names it.
-  echo '{"oauthAccount":{"emailAddress":"three@example.com","accountUuid":"x3"}}' > "$CBOX_DATA_DIR/.claude-pinproj.json"
-  run _cbox_account_start pinproj
-  [[ "$output" == *"now three@example.com"* ]]
-  [ "$(jq -r .emailAddress "$AD/work/account.json")" = "three@example.com" ]
+# A session start in pinproj, whose recorded pin is $1 (empty: none),
+# answering $2 when asked; prints the token it would hand Claude Code.
+_pin_ask() {
+  _cbox_account_pin_set pinproj "$1"
+  cat > "$BATS_TMPDIR/pin-ask.sh" <<SH
+source "$CBOX_SH"
+_cbox_busy_hold() { return 1; }
+cd "$PROJ"
+_cbox_account_start pinproj && echo "TOKEN \$_CBOX_ACCOUNT_TOKEN" || echo "STOPPED"
+SH
+  _in_pty "$BATS_TMPDIR/pin-ask.sh" "$2"
 }
 
-@test "account pin: without saved accounts or a pin, session start is silent" {
-  _acct_setup
-  _cbox_rt_label() { :; }
-  run _cbox_account_start proj
-  [ "$status" -eq 0 ]
-  [ -z "$output" ]
+@test "account pin: a changed .cbox asks at session start; yes switches, no keeps" {
+  _pin_setup
+  printf '[container]\n  account = work\n' > .cbox
+  run _pin_ask "" $'y\n'
+  [[ "$output" == *"pins the Claude account 'work' (this project used the default)"* ]]
+  [[ "$output" == *"TOKEN sk-ant-oat01-bbb"* ]]
+  [ "$(_cbox_account_pin_of pinproj)" = work ]
+  printf '[container]\n  account = personal\n' > .cbox
+  run _pin_ask work $'\n'
+  [[ "$output" == *"asks again at the next start"* ]]
+  [[ "$output" == *"TOKEN sk-ant-oat01-bbb"* ]]
+  [ "$(_cbox_account_pin_of pinproj)" = work ]
+  # Pin removed from .cbox: asks too.
+  command rm -f .cbox
+  run _pin_ask work $'y\n'
+  [[ "$output" == *"no longer pins an account"* ]]
+  [[ "$output" == *"TOKEN sk-ant-oat01-aaa"* ]]
+  [ -z "$(_cbox_account_pin_of pinproj)" ]
+}
+
+@test "account pin: no question when nothing changed, or the new account is not saved here" {
+  _pin_setup
+  printf '[container]\n  account = work\n' > .cbox
+  run _pin_ask work $'y\n'
+  [[ "$output" != *"from now on"* ]]
+  [[ "$output" == *"TOKEN sk-ant-oat01-bbb"* ]]
+  printf '[container]\n  account = client-a\n' > .cbox
+  run _pin_ask work $'y\n'
+  [[ "$output" == *"cbox account add client-a"* ]]
+  [[ "$output" == *"Keeping 'work' for now"* ]]
+  [[ "$output" == *"TOKEN sk-ant-oat01-bbb"* ]]
+}
+
+@test "account pin: without a terminal, no question: the recorded pin stays, with a warning" {
+  _pin_setup
+  printf '[container]\n  account = work\n' > .cbox
+  _cbox_account_start pinproj </dev/null >"$BATS_TMPDIR/acct-out"
+  [ "$_CBOX_ACCOUNT_TOKEN" = sk-ant-oat01-aaa ]
+  [ -z "$(_cbox_account_pin_of pinproj)" ]
+  run cat "$BATS_TMPDIR/acct-out"
+  [[ "$output" == *"Start cbox in a terminal to switch"* ]]
 }
 
 # Runs bash script $1 in a pseudo-terminal, typing $2; prints what it shows.
@@ -6041,59 +5975,20 @@ sys.stdout.write(out.decode(errors="replace"))
 PY
 }
 
-# A session start in pinproj, whose container has the account $1 (empty:
-# none), answering $2 when asked.
-_pin_ask() {
-  cat > "$BATS_TMPDIR/pin-ask.sh" <<SH
-source "$CBOX_SH"
-_cbox_rt_label() { case "\$2" in cbox.agent) echo claude ;; cbox.account) echo "$1" ;; esac; }
-_cbox_busy_hold() { return 1; }
-_cbox_reset_ask() { return 0; }
-_cbox_remove() { echo "REMOVED \$1"; }
-cd "$PROJ"
-_cbox_account_pin_ask pinproj && echo "RECREATE" || echo "KEEP"
-SH
-  _in_pty "$BATS_TMPDIR/pin-ask.sh" "$2"
-}
-
-@test "account pin: a changed .cbox asks at session start; yes recreates the container" {
-  _pin_setup
-  printf '[container]\n  account = work\n' > .cbox
-  run _pin_ask "" $'y\n'
-  [[ "$output" == *"pins the Claude account 'work' (this container uses the one of cbox account use)"* ]]
-  [[ "$output" == *"REMOVED pinproj"* ]]
-  [[ "$output" == *"RECREATE"* ]]
-  run _pin_ask "personal" $'\n'
-  [[ "$output" == *"uses 'personal'"* ]]
-  [[ "$output" == *"asks again at the next start"* ]]
-  [[ "$output" != *"REMOVED"* ]]
-  [[ "$output" == *"KEEP"* ]]
-  # Pin removed from .cbox: asks too.
-  command rm -f .cbox
-  run _pin_ask "work" $'y\n'
-  [[ "$output" == *"no longer pins an account"* ]]
-  [[ "$output" == *"RECREATE"* ]]
-}
-
-@test "account pin: no question when nothing changed, or the new account is not saved here" {
-  _pin_setup
-  printf '[container]\n  account = work\n' > .cbox
-  run _pin_ask "work" $'y\n'
-  [[ "$output" != *"Apply"* ]]
-  [[ "$output" == *"KEEP"* ]]
-  printf '[container]\n  account = client-a\n' > .cbox
-  run _pin_ask "work" $'y\n'
-  [[ "$output" == *"cbox account add client-a"* ]]
-  [[ "$output" == *"Keeping this container's account"* ]]
-  [[ "$output" != *"REMOVED"* ]]
-}
-
-@test "account pin: without a terminal, no question (the session start warns)" {
-  _pin_setup
-  printf '[container]\n  account = work\n' > .cbox
-  _cbox_rt_label() { case "$2" in cbox.agent) echo claude ;; esac; }
-  _cbox_remove() { echo "REMOVED"; }
-  run _cbox_account_pin_ask pinproj </dev/null
-  [ "$status" -eq 1 ]
-  [ -z "$output" ]
+@test "account: the session hands Claude Code the token, never on docker's command line" {
+  _acct_setup
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  MODE=normal EGRESS="" LOGIN=""
+  for rt in docker apple; do
+    _CBOX_RUNTIME=$rt
+    run _enter_safe
+    run cat "$BATS_TMPDIR/enter-egress"
+    if [[ "$rt" == docker ]]; then
+      [[ "$output" == *"-e CLAUDE_CODE_OAUTH_TOKEN "* ]]
+      [[ "$output" != *"sk-ant-oat01-aaa"* ]]
+    else
+      [[ "$output" == *"-e CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-aaa "* ]]
+      [[ "$output" != *"-e CLAUDE_CODE_OAUTH_TOKEN "* ]]
+    fi
+  done
 }

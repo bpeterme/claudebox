@@ -5894,6 +5894,11 @@ _pin_setup() {
   run _cbox_account_start pinproj
   [ "$status" -eq 1 ]
   [[ "$output" == *"cbox account add client-a"* ]]
+  # A shell starts anyway, without a token: it is where claude setup-token runs.
+  _cbox_account_start pinproj zsh 2>"$BATS_TMPDIR/acct-err"
+  [ -z "$_CBOX_ACCOUNT_TOKEN" ]
+  run cat "$BATS_TMPDIR/acct-err"
+  [[ "$output" == *"This shell runs without it"* ]]
 }
 
 # A session start in pinproj, whose recorded pin is $1 (empty: none),

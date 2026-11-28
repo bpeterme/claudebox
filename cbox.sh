@@ -6252,7 +6252,7 @@ _cbox_account_pinned_by() {
 # Says how to save the pinned account $1 when this machine does not have it.
 _cbox_account_missing() {
   echo "✘ This project uses the Claude account '$1' (account = $1 in .cbox), which is not saved here." >&2
-  echo "   Save it: claude setup-token (signed in to that account), then cbox account add $1" >&2
+  echo "   Save it: cbox shell, claude setup-token (signed in to that account), exit, then cbox account add $1" >&2
   echo "   (or remove the line from .cbox)" >&2
 }
 
@@ -6402,9 +6402,10 @@ EOF
 # _CBOX_ACCOUNT_TOKEN to the token to hand Claude Code (empty: its own login).
 # A pin in .cbox that differs from the recorded one asks in the terminal (the
 # host's: code in the container cannot answer). Fails when the account to use
-# is not saved here. Silent without saved accounts and pins.
+# is not saved here, except for a shell ($2 not claude), where claude
+# setup-token makes the missing token. Silent without saved accounts and pins.
 _cbox_account_start() {
-  local name="$1" have want alias how answer="" out=/dev/stdout last lastfile
+  local name="$1" command="${2:-claude}" have want alias how answer="" out=/dev/stdout last lastfile
   _CBOX_ACCOUNT_TOKEN=""
   have=$(_cbox_account_pin_of "$name")
   want=$(_cbox_project_account 2>/dev/null) || want="$have"
@@ -6438,7 +6439,12 @@ _cbox_account_start() {
     fi
   fi
   if [[ -n "$have" ]]; then
-    _cbox_account_saved "$have" || { _cbox_account_missing "$have"; return 1; }
+    if ! _cbox_account_saved "$have"; then
+      _cbox_account_missing "$have"
+      [[ "$command" == "claude" ]] && return 1
+      echo "   This shell runs without it." >&2
+      return 0
+    fi
     alias="$have" how="pinned in .cbox"
   else
     alias=$(_cbox_account_default) how="default"
@@ -7583,7 +7589,7 @@ _cbox_enter() {
   _cbox_mask_check "$name" "$mode"
   _cbox_ports_check "$name" "$mode"
   _cbox_memory_check "$name"
-  if [[ "$agent_bin" == "claude" ]]; then _cbox_account_start "$name" || return 1; fi
+  if [[ "$agent_bin" == "claude" ]]; then _cbox_account_start "$name" "$command" || return 1; fi
   # Several agents can share a container: say so before one more would not fit.
   _run="$(_cbox_low_memory_note); $_run"
   local _egress=""

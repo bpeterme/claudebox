@@ -56,7 +56,7 @@ Each project's `~/.claude.json` caches `oauthAccount` (the account Claude Code s
 ### 5. Across Macs (claudedot)
 
 - Nothing changes in cdot: `$CBOX_DATA_DIR/accounts/` is outside `$CBOX_CLAUDE_DIR`.
-- Saved accounts are per Mac (`cbox account add` once per Mac and account). A pin travels with the project's repo, so a new Mac hits the "run `cbox account add`" stop once.
+- Saved accounts are per Mac (`cbox account add` once per Mac and account; one token can serve all Macs, e.g. piped from a keychain). A pin travels with the project's repo, so a new Mac hits the "run `cbox account add`" stop once.
 
 ### 6. Limits
 

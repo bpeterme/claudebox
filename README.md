@@ -288,7 +288,7 @@ cbox account                 # list; * = default
 - Tokens from `claude setup-token` last a year and do not rotate. When one expires, run `claude setup-token` again and `cbox account add <name>` with the same name.
 - Tokens are saved in `$CBOX_DATA_DIR/accounts/<name>/token`, outside every folder a container mounts. A container only gets the token of the account it uses.
 - While accounts are saved, `/login` inside a container has no effect on which account is used. Claude features that need a claude.ai sign-in (such as Claude in Chrome) do not work with these tokens.
-- Saved accounts are per machine: claudedot does not sync them. Run `cbox account add` once per machine and account.
+- Saved accounts are per machine: claudedot does not sync them. A token works on every machine, so you can keep it in a keychain and add it on each one without seeing it, e.g. `security find-generic-password -s claude-token-work -w | cbox account add work`. A token per machine instead lets you revoke one machine alone.
 - Without saved accounts, nothing changes: containers use Claude Code's own login.
 
 ### One account per project

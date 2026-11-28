@@ -6283,7 +6283,13 @@ _cbox_account_add() {
   done <<< "$(_cbox_account_names)"
   dir="$(_cbox_accounts_dir)/$alias"
   local had=""
-  _cbox_account_saved "$alias" && had=1
+  if _cbox_account_saved "$alias"; then
+    if [[ "$(cat "$dir/token")" == "$token" ]]; then
+      echo "✔ '$alias' already has this token: unchanged."
+      return 0
+    fi
+    had=1
+  fi
   mkdir -p "$dir"
   chmod 700 "$(_cbox_accounts_dir)" "$dir"
   ( umask 077; printf '%s\n' "$token" > "$dir/token.cbox-tmp" ) && mv -f "$dir/token.cbox-tmp" "$dir/token"

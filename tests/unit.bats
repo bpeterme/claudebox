@@ -5738,6 +5738,8 @@ _acct_add() { printf '%s\n' "$2" | _cbox_account_cmd proj add "$1"; }
   run _acct_add ../x sk-ant-oat01-ccc
   [ "$status" -eq 1 ]
   [[ "$output" == *"cannot be an account name"* ]]
+  run _acct_add personal sk-ant-oat01-aaa
+  [[ "$output" == *"already has this token: unchanged"* ]]
   run _acct_add personal sk-ant-oat01-new
   [[ "$output" == *"Updated the token of 'personal'"* ]]
   [ "$(cat "$AD/personal/token")" = sk-ant-oat01-new ]

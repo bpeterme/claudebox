@@ -3392,6 +3392,7 @@ _enter_safe() {
   _CBOX_CMD=_fake_runtime
   _fake_runtime() {
     echo "$*" >> "$capture"
+    [[ -z "${EXEC_MARK:-}" || "$1" != exec ]] || echo "EXEC-RAN"
     # HUP=1: the terminal closes under the session (e.g. its cmux pane is closed).
     # (No $BASHPID in macOS's bash 3.2: a child signals its parent, this shell.)
     if [[ -n "${HUP:-}" && "$1 $2" == "exec -it" ]]; then sh -c 'kill -HUP $PPID'; fi
@@ -5998,4 +5999,22 @@ PY
       [[ "$output" != *"-e CLAUDE_CODE_OAUTH_TOKEN "* ]]
     fi
   done
+}
+
+@test "account: a token near its year says how to renew it after the session, with your own notes" {
+  _acct_setup
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  MODE=normal EGRESS="" LOGIN=""
+  run _enter_safe
+  [[ "$output" != *"Renew"* ]]
+  touch -t "$(date -d '-340 days' +%Y%m%d%H%M 2>/dev/null || date -v-340d +%Y%m%d%H%M)" "$AD/personal/token"
+  CBOX_ACCOUNT_RENEW="keychain item claude-token-<name>"
+  run _cbox_account_age_check personal
+  [[ "$output" == *"saved 340 days ago"* ]]
+  EXEC_MARK=1 run _enter_safe
+  # After the session (the runtime's exec), where it stays on screen.
+  [[ "$output" == *"EXEC-RAN"*"Renew"* ]]
+  [[ "$output" == *"saved 340 days ago"* ]]
+  [[ "$output" == *"cbox account add personal"* ]]
+  [[ "$output" == *"Your notes: keychain item claude-token-personal"* ]]
 }

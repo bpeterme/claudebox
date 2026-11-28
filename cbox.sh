@@ -6404,15 +6404,31 @@ with open(p, "r+") as fh:
 EOF
 }
 
+# Tokens from claude setup-token last a year: from 335 days after the token
+# was saved, the end of each session says how to renew it (there it stays on
+# screen) (and CBOX_ACCOUNT_RENEW,
+# your own steps, <name> replaced by the account's name).
+_cbox_account_age_check() {
+  local alias="$1" saved days
+  saved=$(date -r "$(_cbox_accounts_dir)/$alias/token" +%s 2>/dev/null) || return 0
+  days=$(( ($(date +%s) - saved) / 86400 ))
+  (( days >= 335 )) || return 0
+  echo "⚠  The token of '$alias' was saved $days days ago; tokens from claude setup-token last a year."
+  echo "   Renew: cbox shell, claude setup-token (signed in to that account), exit, then cbox account add $alias"
+  [[ -z "${CBOX_ACCOUNT_RENEW:-}" ]] || echo "   Your notes: ${CBOX_ACCOUNT_RENEW//<name>/$alias}"
+  return 0
+}
+
 # At session start: settles the container's account and sets
-# _CBOX_ACCOUNT_TOKEN to the token to hand Claude Code (empty: its own login).
+# _CBOX_ACCOUNT_TOKEN to the token to hand Claude Code (empty: its own login)
+# and _CBOX_ACCOUNT_ALIAS to its name.
 # A pin in .cbox that differs from the recorded one asks in the terminal (the
 # host's: code in the container cannot answer). Fails when the account to use
 # is not saved here, except for a shell ($2 not claude), where claude
 # setup-token makes the missing token. Silent without saved accounts and pins.
 _cbox_account_start() {
   local name="$1" command="${2:-claude}" have want alias how answer="" out=/dev/stdout last lastfile
-  _CBOX_ACCOUNT_TOKEN=""
+  _CBOX_ACCOUNT_TOKEN="" _CBOX_ACCOUNT_ALIAS=""
   have=$(_cbox_account_pin_of "$name")
   want=$(_cbox_project_account 2>/dev/null) || want="$have"
   [[ -z "$have" && -z "$want" && -z "$(_cbox_account_names)" ]] && return 0
@@ -6468,6 +6484,7 @@ _cbox_account_start() {
     printf '%s\n' "$alias" > "$lastfile"
   fi
   _CBOX_ACCOUNT_TOKEN=$(cat "$(_cbox_accounts_dir)/$alias/token")
+  _CBOX_ACCOUNT_ALIAS="$alias"
   echo "ℹ  Claude account: $alias ($how)"
   return 0
 }
@@ -7710,6 +7727,7 @@ _cbox_enter() {
   # `set -e` a non-zero one would skip every teardown step below —
   # including stopping the container.
   CLAUDE_CODE_OAUTH_TOKEN="${_CBOX_ACCOUNT_TOKEN:-}" $_CBOX_CMD exec "${_exec_args[@]}" "$name" zsh -ic "$_run" || true
+  [[ -z "${_CBOX_ACCOUNT_ALIAS:-}" ]] || _cbox_account_age_check "$_CBOX_ACCOUNT_ALIAS"
   trap - HUP TERM
 
   _cbox_busy_begin "closing session..."

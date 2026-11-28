@@ -2716,7 +2716,11 @@ def serve(c):
 srv = socket.socket(socket.AF_UNIX); srv.bind(sys.argv[1]); srv.listen(8)
 while True: threading.Thread(target=serve, args=(srv.accept()[0],), daemon=True).start()
 ' "$1" "$2" </dev/null >/dev/null 2>&1 &
-  echo $!
+  local pid=$!
+  # Listening before anyone connects: a tunnel opened right after would
+  # otherwise find no agent (the tunnel logs "agent is not running").
+  for _ in $(seq 100); do [ -S "$1" ] && break; sleep 0.05; done
+  echo "$pid"
 }
 
 _ssh_setup() {
@@ -2915,6 +2919,7 @@ srv = socket.socket(socket.AF_UNIX); srv.bind(sys.argv[1]); srv.listen(16)
 while True: threading.Thread(target=echo, args=(srv.accept()[0],), daemon=True).start()
 ' "$TT/pulse" </dev/null >/dev/null 2>&1 &
   echo_pid=$!
+  for _ in $(seq 100); do [ -S "$TT/pulse" ] && break; sleep 0.05; done
   # Fake runtime: `rt exec -i box cmd...` runs cmd here.
   printf '#!/bin/sh\nshift 3\nexec "$@"\n' > "$TT/rt"; chmod +x "$TT/rt"
   _cbox_tunnel_py > "$TT/cbox-tunnel"; chmod +x "$TT/cbox-tunnel"
@@ -2944,13 +2949,19 @@ h = c.recv(4); ans = c.recv(struct.unpack(">I", h)[0])
 print("ssh keys", struct.unpack(">I", ans[1:5])[0], b"warden:gh" in ans)
 ' "$TT/sock"
   echo_out="$output"
-  # Without the grant, the ssh channel closes at once.
+  # Without the grant, the ssh channel closes at once. Closed with our request
+  # still unread, the socket reports a reset instead of an end: both are closed.
   rm -f "$CBOX_WARDEN_DIR/sessions/wbox.json"
   run python3 -c '
 import socket, struct, sys
 c = socket.socket(socket.AF_UNIX); c.settimeout(10); c.connect(sys.argv[1] + "/ssh-agent.sock")
 c.sendall(struct.pack(">I", 1) + bytes([11]))
-print("closed" if c.recv(4) == b"" else "answered")
+try:
+    print("closed" if c.recv(4) == b"" else "answered")
+except ConnectionResetError:
+    print("closed")
+except OSError as e:
+    print(type(e).__name__)
 ' "$TT/sock"
   nogrant="$output"
   kill -TERM -- "-$(cat "$TT/tunnel.pid")" 2>/dev/null || true
@@ -5336,7 +5347,7 @@ SH
   printf '[container]\ncolour = blue\nports = 3000\n' > .cbox
   run _cbox_project_ports
   [ "$status" -eq 0 ]
-  [[ "$output" == *"unknown setting 'colour' in [container] ignored (known: ports, memory)"* ]]
+  [[ "$output" == *"unknown setting 'colour' in [container] ignored (known: ports, memory, account)"* ]]
   [[ "$output" == *"3000"* ]]
 }
 
@@ -5677,4 +5688,314 @@ SH
   # look cbox up on PATH (flux, scripts) run that file, so it needs the exec bit.
   run git -C "$BATS_TEST_DIRNAME/.." ls-files -s cbox.sh
   [[ "$output" == 100755* ]]
+}
+
+# --- accounts -------------------------------------------------------------
+
+_acct_setup() {
+  AD="$CBOX_DATA_DIR/accounts"
+  command rm -rf "$AD"
+  echo '{"oauthAccount":{"emailAddress":"one@example.com"},"keep":1}' \
+    > "$CBOX_DATA_DIR/.claude-proj.json"
+}
+
+# Saves account $1 with token $2 (as if pasted, without a terminal).
+_acct_add() { printf '%s\n' "$2" | _cbox_account_cmd proj add "$1"; }
+
+@test "account: without saved accounts nothing changes" {
+  _acct_setup
+  run _cbox_account_cmd proj
+  [[ "$output" == *"No saved accounts"* ]]
+  _cbox_account_start proj
+  [ -z "$_CBOX_ACCOUNT_TOKEN" ]
+  [ ! -e "$AD" ]
+}
+
+@test "account add: saves the token privately; the first one becomes the default" {
+  _acct_setup
+  run _acct_add personal sk-ant-oat01-aaa
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Saved the Claude account 'personal'"* ]]
+  [[ "$output" == *"default for all projects now"* ]]
+  [ "$(cat "$AD/personal/token")" = sk-ant-oat01-aaa ]
+  [ "$(stat -c %a "$AD/personal/token" 2>/dev/null || stat -f %Lp "$AD/personal/token")" = 600 ]
+  [ "$(stat -c %a "$AD" 2>/dev/null || stat -f %Lp "$AD")" = 700 ]
+  run _acct_add work sk-ant-oat01-bbb
+  [[ "$output" == *"cbox account use work"* ]]
+  [ "$(_cbox_account_default)" = personal ]
+}
+
+@test "account add: refuses what is not a token, the same token twice and bad names; updates an alias" {
+  _acct_setup
+  run _acct_add personal "not a token"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"not a token from claude setup-token"* ]]
+  [ ! -e "$AD/personal" ]
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  run _acct_add work sk-ant-oat01-aaa
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"already saved as 'personal'"* ]]
+  run _acct_add ../x sk-ant-oat01-ccc
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cannot be an account name"* ]]
+  run _acct_add personal sk-ant-oat01-aaa
+  [[ "$output" == *"already has this token: unchanged"* ]]
+  run _acct_add personal sk-ant-oat01-new
+  [[ "$output" == *"Updated the token of 'personal'"* ]]
+  [ "$(cat "$AD/personal/token")" = sk-ant-oat01-new ]
+}
+
+@test "account use: sets the default; unknown names list the saved ones" {
+  _acct_setup
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  _acct_add work sk-ant-oat01-bbb >/dev/null
+  run _cbox_account_cmd proj use work
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"use 'work' from their next session start"* ]]
+  [ "$(_cbox_account_default)" = work ]
+  run _cbox_account_cmd proj use nope
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Saved: personal, work"* ]]
+}
+
+@test "account list: marks the default, shows pins" {
+  _acct_setup
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  _acct_add work sk-ant-oat01-bbb >/dev/null
+  _cbox_account_pin_set otherproj work
+  run _cbox_account_cmd proj list
+  echo "$output"
+  [[ "$output" == *"* personal"* ]]
+  [[ "$output" == *"  work"* ]]
+  [[ "$output" == *"pinned by: otherproj"* ]]
+  [[ "$output" != *"sk-ant"* ]]
+}
+
+@test "account remove: not while pinned; asks in a terminal only; the default goes with it" {
+  _acct_setup
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  _cbox_account_pin_set otherproj personal
+  run _cbox_account_cmd proj remove personal
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"pinned by: otherproj"* ]]
+  _cbox_account_pin_set otherproj ""
+  run _cbox_account_cmd proj remove personal </dev/null
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"in a terminal"* ]]
+  [ -f "$AD/personal/token" ]
+  cat > "$BATS_TMPDIR/acct-rm.sh" <<SH
+source "$CBOX_SH"
+_cbox_account_cmd proj remove personal
+SH
+  run _in_pty "$BATS_TMPDIR/acct-rm.sh" $'y\n'
+  [[ "$output" == *"Removed 'personal'"* ]]
+  [[ "$output" == *"own login (/login) again"* ]]
+  [ ! -e "$AD/personal" ]
+  [ -z "$(_cbox_account_default)" ]
+}
+
+@test "account: completions offer subcommands and saved names" {
+  _acct_setup
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  run _cbox_complete account
+  [[ "$output" == *use* && "$output" == *remove* ]]
+  run _cbox_complete account use
+  [ "$output" = "personal" ]
+  run _cbox_complete
+  [[ "$output" == *account* ]]
+}
+
+@test "account start: the default's token for Claude Code; a switch drops the cached profile" {
+  _acct_setup
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  _acct_add work sk-ant-oat01-bbb >/dev/null
+  cd "$BATS_TMPDIR"
+  _cbox_account_start proj >"$BATS_TMPDIR/acct-out"
+  [ "$_CBOX_ACCOUNT_TOKEN" = sk-ant-oat01-aaa ]
+  run cat "$BATS_TMPDIR/acct-out"
+  [[ "$output" == *"Claude account: personal (default)"* ]]
+  # First use of an account: the cached profile may be another one's.
+  run cat "$CBOX_DATA_DIR/.claude-proj.json"
+  [[ "$output" != *oauthAccount* ]]
+  [[ "$output" == *keep* ]]
+  # The same account again keeps what Claude Code cached meanwhile.
+  echo '{"oauthAccount":{"emailAddress":"p@example.com"},"keep":1}' > "$CBOX_DATA_DIR/.claude-proj.json"
+  _cbox_account_start proj >/dev/null
+  run cat "$CBOX_DATA_DIR/.claude-proj.json"
+  [[ "$output" == *oauthAccount* ]]
+  _cbox_account_cmd proj use work >/dev/null
+  _cbox_account_start proj >/dev/null
+  [ "$_CBOX_ACCOUNT_TOKEN" = sk-ant-oat01-bbb ]
+  run cat "$CBOX_DATA_DIR/.claude-proj.json"
+  [[ "$output" != *oauthAccount* ]]
+}
+
+@test "account start: without accounts or a pin, silent" {
+  _acct_setup
+  cd "$BATS_TMPDIR"
+  run _cbox_account_start proj
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+# --- account pins -----------------------------------------------------------
+
+# Saved accounts personal (default) and work; a project folder to cd into.
+_pin_setup() {
+  _acct_setup
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  _acct_add work sk-ant-oat01-bbb >/dev/null
+  PROJ="$BATS_TMPDIR/pinproj"
+  command rm -rf "$PROJ"; mkdir -p "$PROJ"
+  cd "$PROJ"
+}
+
+@test "account pin: .cbox account is parsed and checked" {
+  _pin_setup
+  printf '[container]\n  account = work\n' > .cbox
+  [ "$(_cbox_project_account)" = work ]
+  printf '[container]\n  account = ../x\n' > .cbox
+  run _cbox_project_settings
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"not an account name"* ]]
+}
+
+@test "account pin: a new container records the pin; no mount, no label" {
+  _pin_setup
+  printf '[container]\n  account = work\n' > .cbox
+  local capture="$BATS_TMPDIR/create-pin"
+  _CBOX_RUNTIME=docker
+  _CBOX_CMD=_fake_runtime
+  _fake_runtime() { printf '%s\n' "$@" >> "$capture"; }
+  command rm -f "$capture"; _cbox_create pinproj normal
+  [ "$(_cbox_account_pin_of pinproj)" = work ]
+  run cat "$capture"
+  [[ "$output" != *"cbox.account"* ]]
+  [[ "$output" != *"accounts"* ]]
+  # Created again without a pin: the record goes.
+  command rm -f .cbox; _cbox_create pinproj normal
+  [ -z "$(_cbox_account_pin_of pinproj)" ]
+}
+
+@test "account pin: the pin wins over the default" {
+  _pin_setup
+  printf '[container]\n  account = work\n' > .cbox
+  _cbox_account_pin_set pinproj work
+  _cbox_account_start pinproj >"$BATS_TMPDIR/acct-out"
+  [ "$_CBOX_ACCOUNT_TOKEN" = sk-ant-oat01-bbb ]
+  run cat "$BATS_TMPDIR/acct-out"
+  [[ "$output" == *"Claude account: work (pinned in .cbox)"* ]]
+  run _cbox_account_cmd pinproj use personal
+  [[ "$output" == *"pinned to 'work'"* ]]
+}
+
+@test "account pin: session start stops when the pinned account is not saved here" {
+  _pin_setup
+  printf '[container]\n  account = client-a\n' > .cbox
+  _cbox_account_pin_set pinproj client-a
+  run _cbox_account_start pinproj
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cbox account add client-a"* ]]
+  # A shell starts anyway, without a token: it is where claude setup-token runs.
+  _cbox_account_start pinproj zsh 2>"$BATS_TMPDIR/acct-err"
+  [ -z "$_CBOX_ACCOUNT_TOKEN" ]
+  run cat "$BATS_TMPDIR/acct-err"
+  [[ "$output" == *"This shell runs without it"* ]]
+}
+
+# A session start in pinproj, whose recorded pin is $1 (empty: none),
+# answering $2 when asked; prints the token it would hand Claude Code.
+_pin_ask() {
+  _cbox_account_pin_set pinproj "$1"
+  cat > "$BATS_TMPDIR/pin-ask.sh" <<SH
+source "$CBOX_SH"
+_cbox_busy_hold() { return 1; }
+cd "$PROJ"
+_cbox_account_start pinproj && echo "TOKEN \$_CBOX_ACCOUNT_TOKEN" || echo "STOPPED"
+SH
+  _in_pty "$BATS_TMPDIR/pin-ask.sh" "$2"
+}
+
+@test "account pin: a changed .cbox asks at session start; yes switches, no keeps" {
+  _pin_setup
+  printf '[container]\n  account = work\n' > .cbox
+  run _pin_ask "" $'y\n'
+  [[ "$output" == *"pins the Claude account 'work' (this project used the default)"* ]]
+  [[ "$output" == *"TOKEN sk-ant-oat01-bbb"* ]]
+  [ "$(_cbox_account_pin_of pinproj)" = work ]
+  printf '[container]\n  account = personal\n' > .cbox
+  run _pin_ask work $'\n'
+  [[ "$output" == *"asks again at the next start"* ]]
+  [[ "$output" == *"TOKEN sk-ant-oat01-bbb"* ]]
+  [ "$(_cbox_account_pin_of pinproj)" = work ]
+  # Pin removed from .cbox: asks too.
+  command rm -f .cbox
+  run _pin_ask work $'y\n'
+  [[ "$output" == *"no longer pins an account"* ]]
+  [[ "$output" == *"TOKEN sk-ant-oat01-aaa"* ]]
+  [ -z "$(_cbox_account_pin_of pinproj)" ]
+}
+
+@test "account pin: no question when nothing changed, or the new account is not saved here" {
+  _pin_setup
+  printf '[container]\n  account = work\n' > .cbox
+  run _pin_ask work $'y\n'
+  [[ "$output" != *"from now on"* ]]
+  [[ "$output" == *"TOKEN sk-ant-oat01-bbb"* ]]
+  printf '[container]\n  account = client-a\n' > .cbox
+  run _pin_ask work $'y\n'
+  [[ "$output" == *"cbox account add client-a"* ]]
+  [[ "$output" == *"Keeping 'work' for now"* ]]
+  [[ "$output" == *"TOKEN sk-ant-oat01-bbb"* ]]
+}
+
+@test "account pin: without a terminal, no question: the recorded pin stays, with a warning" {
+  _pin_setup
+  printf '[container]\n  account = work\n' > .cbox
+  _cbox_account_start pinproj </dev/null >"$BATS_TMPDIR/acct-out"
+  [ "$_CBOX_ACCOUNT_TOKEN" = sk-ant-oat01-aaa ]
+  [ -z "$(_cbox_account_pin_of pinproj)" ]
+  run cat "$BATS_TMPDIR/acct-out"
+  [[ "$output" == *"Start cbox in a terminal to switch"* ]]
+}
+
+# Runs bash script $1 in a pseudo-terminal, typing $2; prints what it shows.
+_in_pty() {
+  python3 - "$1" "$2" <<'PY'
+import os, pty, sys
+script, answer = sys.argv[1], sys.argv[2]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp("bash", ["bash", script])
+os.write(fd, answer.encode())
+out = b""
+while True:
+    try:
+        d = os.read(fd, 1024)
+    except OSError:
+        break
+    if not d:
+        break
+    out += d
+os.waitpid(pid, 0)
+sys.stdout.write(out.decode(errors="replace"))
+PY
+}
+
+@test "account: the session hands Claude Code the token, never on docker's command line" {
+  _acct_setup
+  _acct_add personal sk-ant-oat01-aaa >/dev/null
+  MODE=normal EGRESS="" LOGIN=""
+  for rt in docker apple; do
+    _CBOX_RUNTIME=$rt
+    run _enter_safe
+    run cat "$BATS_TMPDIR/enter-egress"
+    if [[ "$rt" == docker ]]; then
+      [[ "$output" == *"-e CLAUDE_CODE_OAUTH_TOKEN "* ]]
+      [[ "$output" != *"sk-ant-oat01-aaa"* ]]
+    else
+      [[ "$output" == *"-e CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-aaa "* ]]
+      [[ "$output" != *"-e CLAUDE_CODE_OAUTH_TOKEN "* ]]
+    fi
+  done
 }

@@ -119,6 +119,7 @@ cbox oc safe   # opencode in safe mode
 | `cbox doctor` | Run environment diagnostics: where your settings, data and logs are, companion tool status and, on macOS, whether Apple container is up to date |
 | `cbox mcp` | Show host MCP servers and relay status |
 | `cbox mcp import` | Import MCP servers from Claude Desktop / Claude Code on the host |
+| `cbox account` | List saved Claude accounts; `add <name>`, `use <name>`, `remove <name>` (see [Several Claude accounts](#several-claude-accounts)) |
 | `cbox warden` | List credential resources (APIs, storage, ssh keys, MCP servers, WhatsApp chats, mail groups) and what this project gets (see [Credentials (warden)](#credentials-warden)) |
 | `cbox warden edit` | Define resources the container may use |
 | `cbox warden secret set <resource>` | Store a resource's secret in the macOS Keychain (Linux: keyring) |
@@ -268,6 +269,40 @@ Create `~/.config/claudebox/cbox.env` to override defaults. See [`cbox.env.examp
 > **Do not place `CBOX_CLAUDE_DIR` (default `~/.config/claudebox/.claude`) or your project directories on iCloud Drive, Dropbox Smart Sync, Google Drive Stream, or any on-demand cloud storage.** These services evict file contents to stubs when not recently accessed. A container mounting an evicted path will fail to read files that appear to exist on disk — a subtle failure that is hard to diagnose.
 >
 > **Do not use continuous sync tools (Syncthing, rsync daemons, etc.) on `CBOX_CLAUDE_DIR`.** They can write into the directory while Claude is actively appending to a conversation file, risking corruption or lost writes. If you need to sync it across machines, use [claudedot](https://github.com/bpeterme/claudedot) — it only touches the directory at explicit session boundaries.
+
+## Several Claude accounts
+
+With more than one Claude subscription, save a token for each and pick one for all projects, or pin one per project:
+
+```bash
+cbox shell                   # in the container:
+claude setup-token           # sign in to the account in the browser, copy the token it prints
+exit
+cbox account add work        # paste the token (input is hidden)
+cbox account add personal    # same for the other account
+cbox account use personal    # the default for projects without a pin
+cbox account                 # list; * = default
+```
+
+- Each session start hands Claude Code its account's token (`CLAUDE_CODE_OAUTH_TOKEN`). A switch applies from the next session start; no container is recreated.
+- Tokens from `claude setup-token` last a year and do not rotate. When one expires, run `claude setup-token` again and `cbox account add <name>` with the same name.
+- Tokens are saved in `$CBOX_DATA_DIR/accounts/<name>/token`, outside every folder a container mounts. A container only gets the token of the account it uses.
+- While accounts are saved, `/login` inside a container has no effect on which account is used. Claude features that need a claude.ai sign-in (such as Claude in Chrome) do not work with these tokens.
+- Saved accounts are per machine: claudedot does not sync them. A token works on every machine, so you can keep it in a keychain and add it on each one without seeing it, e.g. `security find-generic-password -s claude-token-work -w | cbox account add work`. A token per machine instead lets you revoke one machine alone.
+- Without saved accounts, nothing changes: containers use Claude Code's own login.
+
+### One account per project
+
+A project can always use one account, whatever `cbox account use` says. In its `.cbox`:
+
+```ini
+[container]
+  account = work
+```
+
+- A new container takes the pin. When you add, change or remove the pin later, the next `cbox` start asks whether to use it. You answer on the Mac, so code in the container that edits `.cbox` cannot switch accounts by itself. The session start says which account a container uses.
+- A machine without that account stops with what to do (`cbox account add work`). It never falls back to another account, which would bill the wrong subscription.
+- `cbox account` shows which projects pin an account; a pinned account cannot be removed.
 
 ## Container Image
 

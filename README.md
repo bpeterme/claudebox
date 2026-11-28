@@ -286,6 +286,7 @@ cbox account                 # list; * = default
 ```
 
 - Each session start hands Claude Code its account's token (`CLAUDE_CODE_OAUTH_TOKEN`). A switch applies from the next session start; no container is recreated.
+- A `claude -p` that the agent starts (e.g. from its Bash tool) uses the same account as the session. Claude Code keeps the token out of its tools' shells, so cbox's `claude` command in the container takes it from the session.
 - Tokens from `claude setup-token` last a year and do not rotate. From about a month before, the end of each session says how to renew one: `claude setup-token` again, then `cbox account add <name>` with the same name. Your own steps (e.g. where you keep tokens) can go into `CBOX_ACCOUNT_RENEW` in `cbox.env`; cbox shows them along.
 - Tokens are saved in `$CBOX_DATA_DIR/accounts/<name>/token`, outside every folder a container mounts. A container only gets the token of the account it uses.
 - While accounts are saved, `/login` inside a container has no effect on which account is used. Claude features that need a claude.ai sign-in (such as Claude in Chrome) do not work with these tokens.

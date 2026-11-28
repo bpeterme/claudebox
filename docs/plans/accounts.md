@@ -24,6 +24,7 @@ $CBOX_DATA_DIR/accounts/            (700)
 
 - `claude setup-token` makes a long-lived OAuth token (a year) for a subscription. It does not rotate, so copies stay valid: nothing is linked or mounted.
 - Each session start hands Claude Code the container's token as `CLAUDE_CODE_OAUTH_TOKEN` (`container exec -e`). Claude Code prefers it over its login file.
+- Claude Code strips `CLAUDE_CODE_OAUTH_TOKEN` from its tools' shells, so a headless `claude -p` started there fell back to the saved login, which can be another account. cbox installs a `claude` wrapper in `/usr/local/bin` at session start (ahead of the real one on PATH): without a token of its own, it takes the one of the nearest process above it that has one, then execs the real claude. This exposes nothing new: a tool runs as the same user and can read that process's environment anyway. A process detached from the session (reparented to init) finds no token and uses the saved login.
 - Docker gets the value from its environment (`-e NAME`), not its arguments, which other users can read on Linux. macOS shows a process's arguments only to its own user.
 - Saved tokens sit outside every folder a container mounts: a container only gets the token of the account it uses.
 
